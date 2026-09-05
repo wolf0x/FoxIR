@@ -1119,22 +1119,6 @@ input:checked+.slider:before{transform:translateX(20px)}
       <div class="settings-scroll modern-page">
         <div class="settings-section">
           <h3>&#128218; Knowledge Management</h3>
-          <p style="font-size:12px;color:var(--t2);margin:4px 0 12px">
-            Browse the local knowledge base. Toggle a file as <b>Preferred</b> so it is
-            prioritized for per-turn retrieval; create or delete documents below.
-          </p>
-
-          <div class="form-card" style="margin-bottom:14px">
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-              <input type="text" id="knRel" placeholder="filename.md (or sub/folder.md)" style="flex:1;min-width:180px">
-              <input type="text" id="knTitle" placeholder="Title (default from filename)" style="flex:1;min-width:180px">
-              <button class="btn btn-p" onclick="createKnowledge()">+ New Document</button>
-            </div>
-            <div style="margin-top:8px">
-              <textarea id="knContent" rows="5" placeholder="Document body in Markdown (starts with a ## heading)." style="width:100%;box-sizing:border-box"></textarea>
-            </div>
-          </div>
-
           <div style="font-size:12px;color:var(--t2);margin:4px 0 10px">
             Routing: <code>knowledge/routing.json</code> routes a request to the right file; all distilled entries flow into <code>experience.md</code>.
           </div>
@@ -2579,22 +2563,7 @@ async function refreshKnowledge(){
     loadKnowledge();
   }catch(e){alert('Refresh error')}
 }
-async function createKnowledge(){
-  const rel=document.getElementById('knRel').value.trim();
-  const content=document.getElementById('knContent').value;
-  const title=document.getElementById('knTitle').value.trim();
-  if(!rel||!content){alert('Filename and content are required');return;}
-  if(!/.md$/i.test(rel)){alert('Filename must end in .md');return;}
-  try{
-    const r=await fetch('/api/knowledge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rel,title,content})});
-    const d=await r.json();
-    if(!d.success){alert('Failed: '+(d.error||'unknown'));return;}
-    document.getElementById('knRel').value='';
-    document.getElementById('knTitle').value='';
-    document.getElementById('knContent').value='';
-    loadKnowledge();
-  }catch(e){alert('Failed to create knowledge file')}
-}
+
 async function deleteKnowledge(rel){
   if(!confirm('Delete knowledge file "'+rel+'"?'))return;
   try{
