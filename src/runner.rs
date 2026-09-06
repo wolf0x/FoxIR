@@ -35,6 +35,7 @@ pub struct Runner {
     checkpointer: Option<ATaskCheckpointer>,
     trim_redundant_tool_calls: Arc<AtomicBool>,
     knowledge_pre_retrieval: Arc<AtomicBool>,
+    sop_replay: Arc<AtomicBool>,
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
     skill_listing_strategy: Arc<AtomicUsize>,
@@ -51,6 +52,7 @@ pub struct RunnerBuilder {
     app_name: String,
     checkpointer: Option<ATaskCheckpointer>,
     knowledge_pre_retrieval: Arc<AtomicBool>,
+    sop_replay: Arc<AtomicBool>,
     trim_redundant_tool_calls: Arc<AtomicBool>,
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
@@ -70,6 +72,7 @@ impl RunnerBuilder {
             checkpointer: None,
             trim_redundant_tool_calls: Arc::new(AtomicBool::new(true)),
             knowledge_pre_retrieval: Arc::new(AtomicBool::new(true)),
+            sop_replay: Arc::new(AtomicBool::new(true)),
             enable_context_scaling: Arc::new(AtomicBool::new(true)),
             max_inline_chars: Arc::new(AtomicUsize::new(120_000)),
             skill_listing_strategy: Arc::new(AtomicUsize::new(0)),
@@ -111,6 +114,10 @@ impl RunnerBuilder {
 
     pub fn knowledge_pre_retrieval(mut self, v: Arc<AtomicBool>) -> Self {
         self.knowledge_pre_retrieval = v;
+        self
+    }
+    pub fn sop_replay(mut self, v: Arc<AtomicBool>) -> Self {
+        self.sop_replay = v;
         self
     }
 
@@ -159,6 +166,7 @@ impl RunnerBuilder {
             checkpointer: self.checkpointer,
             trim_redundant_tool_calls: self.trim_redundant_tool_calls,
             knowledge_pre_retrieval: self.knowledge_pre_retrieval,
+            sop_replay: self.sop_replay,
             enable_context_scaling: self.enable_context_scaling,
             max_inline_chars: self.max_inline_chars,
             skill_listing_strategy: self.skill_listing_strategy,
@@ -219,6 +227,7 @@ impl Runner {
          .with_rabbit_hole_threshold(rabbit_hole_threshold)
          .with_trim_redundant_tool_calls(self.trim_redundant_tool_calls.load(Ordering::SeqCst))
          .with_knowledge_pre_retrieval(self.knowledge_pre_retrieval.load(Ordering::SeqCst))
+         .with_sop_replay(self.sop_replay.load(Ordering::SeqCst))
          .with_context_window(context_window)
          .with_context_window_threshold(context_window_threshold)
          .with_enable_context_scaling(self.enable_context_scaling.load(Ordering::SeqCst))
@@ -288,6 +297,7 @@ impl Runner {
             .with_rabbit_hole_threshold(params.rabbit_hole_threshold)
             .with_trim_redundant_tool_calls(self.trim_redundant_tool_calls.load(Ordering::SeqCst))
             .with_knowledge_pre_retrieval(self.knowledge_pre_retrieval.load(Ordering::SeqCst))
+            .with_sop_replay(self.sop_replay.load(Ordering::SeqCst))
             .with_context_window(params.context_window)
             .with_context_window_threshold(params.context_window_threshold)
             .with_enable_context_scaling(self.enable_context_scaling.load(Ordering::SeqCst))
@@ -341,3 +351,4 @@ pub struct SubAgentRunParams {
 }
 
 use futures::StreamExt;
+

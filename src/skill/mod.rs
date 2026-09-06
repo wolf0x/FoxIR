@@ -259,18 +259,19 @@ impl SkillManager {
         max_inline_chars: usize,
         catalog_max: usize,
         hot_top_k: usize,
-    ) -> Option<String> {
+    ) -> (Option<String>, bool) {
         if matches!(strategy, SkillListingStrategy::DiscoverToolOnly) {
-            return None;
+            return (None, false);
         }
 
         let skills = self.skills.read().unwrap();
         let enabled: Vec<&Skill> = skills.iter().filter(|s| s.metadata.enabled).collect();
         if enabled.is_empty() {
-            return None;
+            return (None, false);
         }
 
         let mut out = String::new();
+        let mut task_skill_active = false;
         out.push_str("## Active Skills Context\n");
         out.push_str(
             "The following skill(s) are available. Hot skills have their instructions \
@@ -304,6 +305,9 @@ impl SkillManager {
                     .collect();
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 scored.truncate(hot_top_k);
+                // A task-matched (non-always) skill body was inlined → the current task
+                // is driven by a SKILL. Used to suppress SOP replay in the same turn.
+                task_skill_active = !scored.is_empty();
 
                 let mut seen = std::collections::HashSet::new();
                 if !hot.is_empty() || !scored.is_empty() {
@@ -362,7 +366,7 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
             }
         }
 
-        Some(out)
+        (Some(out), task_skill_active)
     }
 
     /// Render a hot skill body for injection, truncating at a char boundary.
@@ -1195,8 +1199,8 @@ mod tests {
 
         let mgr = SkillManager::new(tmp.to_str().unwrap());
 
-        let q = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 20_000, 40, 3)
-            .expect("query section present");
+        let (q_opt, q_act) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 20_000, 40, 3);
+        let q = q_opt.expect("query section present");
         let ql = q.to_lowercase();
         assert!(ql.contains("# always body"), "always body should be inlined: {}", q);
         assert!(ql.contains("# process body"), "matched body should be inlined: {}", q);
@@ -1205,19 +1209,23 @@ mod tests {
         // explicit-activation model), but should remain listable on demand.
         assert!(!ql.contains("# noisy body"), "weak skill body must not be auto-inlined: {}", q);
         assert!(ql.contains("noisyskill"), "weak skill should still be catalogued: {}", q);
+        assert!(q_act, "non-always matched skill should mark task_skill_active");
 
-        let n = mgr.build_skills_prompt("process", SkillListingStrategy::NamesOnly, 20_000, 40, 3)
-            .expect("names section present");
+        let (n_opt, _) = mgr.build_skills_prompt("process", SkillListingStrategy::NamesOnly, 20_000, 40, 3);
+        let n = n_opt.expect("names section present");
         assert!(n.contains("AlwaysSkill"));
         assert!(!n.contains("# always body"), "names-only must not inline bodies: {}", n);
 
-        assert!(mgr.build_skills_prompt("x", SkillListingStrategy::DiscoverToolOnly, 0, 0, 0).is_none());
+        assert!(mgr.build_skills_prompt("x", SkillListingStrategy::DiscoverToolOnly, 0, 0, 0).0.is_none());
 
-        let t = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 5, 40, 3)
-            .expect("truncated section present");
+        let (t_opt, _) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 5, 40, 3);
+        let t = t_opt.expect("truncated section present");
         assert!(t.contains("truncated for context budget"), "expected truncation note: {}", t);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
 }
+
+
+

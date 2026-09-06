@@ -262,6 +262,7 @@ impl MemoryStore {
             conn: Mutex::new(conn),
         };
         store.migrate()?;
+        store.ensure_two_tier_schema()?;
         info!("Memory store initialized: {}", db_path);
         Ok(store)
     }
@@ -1222,3 +1223,571 @@ impl MemoryStore {
         }))
     }
 }
+
+// ───────────────────────────────────────────────────────────────
+// 双层记忆（深层 + 浅层）后端
+// 见 output/memory-two-tier-spec.md
+// ───────────────────────────────────────────────────────────────
+
+impl MemoryStore {
+    /// 幂等创建双层记忆 schema（v8）。不动旧表，可逆。
+    pub fn ensure_two_tier_schema(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+
+        // ── 迁移：旧表名(lambda_memories / engram_facts) → 新表名(浅层/深层)，保留既有数据 ──
+        {
+            let migrate = |c: &rusqlite::Connection, old: &str, new: &str| {
+                let exists = |name: &str| {
+                    c.query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                        params![name],
+                        |_| Ok(()),
+                    ).is_ok()
+                };
+                if exists(old) && !exists(new) {
+                    let _ = c.execute_batch(&format!("ALTER TABLE {old} RENAME TO {new};"));
+                }
+            };
+            let rc = &*conn;
+            migrate(rc, "lambda_memories", "shallow_memories");
+            migrate(rc, "lambda_memories_fts", "shallow_memories_fts");
+            migrate(rc, "engram_facts", "deep_facts");
+            // 旧索引名(指向已改名表)清理；由下方 CREATE INDEX 用新名重建。
+            for idx in ["idx_lm_importance","idx_lm_last_accessed","idx_lm_explicit",
+                        "idx_eg_scope","idx_eg_subject","idx_eg_importance"] {
+                let _ = conn.execute_batch(&format!("DROP INDEX IF EXISTS {idx};"));
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS shallow_memories (
+                hash            TEXT PRIMARY KEY,
+                created_at      INTEGER NOT NULL,
+                last_accessed   INTEGER NOT NULL,
+                access_count    INTEGER NOT NULL DEFAULT 0,
+                importance      REAL NOT NULL DEFAULT 1.0,
+                explicit_save   INTEGER NOT NULL DEFAULT 0,
+                full_text       TEXT NOT NULL,
+                summary_text    TEXT NOT NULL,
+                essence_text    TEXT NOT NULL,
+                tags            TEXT NOT NULL DEFAULT '[]',
+                memory_type     TEXT NOT NULL DEFAULT 'conversation',
+                session_id      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shm_importance ON shallow_memories(importance);
+            CREATE INDEX IF NOT EXISTS idx_shm_last_accessed ON shallow_memories(last_accessed);
+            CREATE INDEX IF NOT EXISTS idx_shm_explicit ON shallow_memories(explicit_save);
+            CREATE VIRTUAL TABLE IF NOT EXISTS shallow_memories_fts
+                USING fts5(summary_text, essence_text, tags, content='');
+            CREATE TABLE IF NOT EXISTS deep_facts (
+                id            TEXT PRIMARY KEY,
+                content       TEXT NOT NULL,
+                summary       TEXT NOT NULL,
+                essence       TEXT NOT NULL,
+                fact_type     TEXT NOT NULL DEFAULT 'reference',
+                scope         TEXT NOT NULL DEFAULT 'global',
+                pinned_by     TEXT NOT NULL DEFAULT 'none',
+                subject_key   TEXT,
+                importance    REAL NOT NULL DEFAULT 1.0,
+                created_at    INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL,
+                tags          TEXT NOT NULL DEFAULT '[]',
+                links         TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS idx_df_scope ON deep_facts(scope);
+            CREATE INDEX IF NOT EXISTS idx_df_subject ON deep_facts(subject_key);
+            CREATE INDEX IF NOT EXISTS idx_df_importance ON deep_facts(importance);",
+        )
+        .map_err(|e| format!("Two-tier schema failed: {e}"))?;
+        // recall_boost 列（v4.6.0 自学习增强；已存在则 no-op）
+        let _ = conn.execute_batch(
+            "ALTER TABLE shallow_memories ADD COLUMN recall_boost REAL NOT NULL DEFAULT 0.0;",
+        );
+        Ok(())
+    }
+
+    // ── 浅层记忆 ──────────────────────────────────────────────
+
+    /// 存储（INSERT OR REPLACE）+ 同步 FTS5。
+    pub fn shallow_store(&self, e: &crate::shallow_memory::ShallowEntry) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let tags = serde_json::to_string(&e.tags).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO shallow_memories
+               (hash, created_at, last_accessed, access_count, importance, explicit_save,
+                full_text, summary_text, essence_text, tags, memory_type, session_id, recall_boost)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                e.hash,
+                e.created_at as i64,
+                e.last_accessed as i64,
+                e.access_count as i64,
+                e.importance,
+                e.explicit_save as i64,
+                e.full_text,
+                e.summary_text,
+                e.essence_text,
+                tags,
+                e.memory_type.as_str(),
+                e.session_id,
+                e.recall_boost,
+            ],
+        )
+        .map_err(|err| format!("shallow_store: {err}"))?;
+        // 同步 FTS：按 rowid 删旧插新（外部内容表，自行管理）
+        let rowid: Option<i64> = conn
+            .query_row("SELECT rowid FROM shallow_memories WHERE hash = ?1", params![e.hash], |r| r.get(0))
+            .ok();
+        if let Some(rid) = rowid {
+            let _ = conn.execute(
+                "INSERT INTO shallow_memories_fts(shallow_memories_fts, rowid, summary_text, essence_text, tags)
+                 VALUES ('delete', ?1, '', '', '')",
+                params![rid],
+            );
+            let _ = conn.execute(
+                "INSERT INTO shallow_memories_fts(rowid, summary_text, essence_text, tags) VALUES (?1,?2,?3,?4)",
+                params![rid, e.summary_text, e.essence_text, e.tags.join(" ")],
+            );
+        }
+        Ok(())
+    }
+
+    /// 候选：按 importance 降序取前 limit 条。
+    pub fn shallow_query_candidates(&self, limit: usize) -> Result<Vec<crate::shallow_memory::ShallowEntry>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT hash, created_at, last_accessed, access_count, importance, explicit_save,
+                        full_text, summary_text, essence_text, tags, memory_type, session_id, recall_boost
+                 FROM shallow_memories ORDER BY importance DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("shallow candidates prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![limit as i64], shallow_row)
+            .map_err(|e| format!("shallow candidates query: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("shallow candidate row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// 按 hash 前缀召回（用于“淡出 hash 按需召回”）。
+    pub fn shallow_recall(&self, hash_prefix: &str) -> Result<Option<crate::shallow_memory::ShallowEntry>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT hash, created_at, last_accessed, access_count, importance, explicit_save,
+                        full_text, summary_text, essence_text, tags, memory_type, session_id, recall_boost
+                 FROM shallow_memories WHERE hash LIKE ?1 LIMIT 1",
+            )
+            .map_err(|e| format!("shallow recall prepare: {e}"))?;
+        let mut rows = stmt
+            .query_map(params![format!("{hash_prefix}%")], shallow_row)
+            .map_err(|e| format!("shallow recall query: {e}"))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| format!("shallow recall row: {e}"))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 召回触达：刷新时间、access_count+1、recall_boost+0.3(cap 2.0)。
+    pub fn shallow_touch(&self, hash: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let now = crate::shallow_memory::now_secs();
+        conn.execute(
+            "UPDATE shallow_memories
+             SET last_accessed = ?1, access_count = access_count + 1,
+                 recall_boost = MIN(recall_boost + 0.3, 2.0)
+             WHERE hash = ?2",
+            params![now as i64, hash],
+        )
+        .map_err(|e| format!("shallow_touch: {e}"))?;
+        Ok(())
+    }
+
+    /// FTS5 BM25 搜索，返回 (hash, rank)。rank 为负、越小越相关。
+    pub fn shallow_fts_search(&self, query: &str, limit: usize) -> Result<Vec<(String, f64)>, String> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let sanitized = query.replace('"', "\"\"");
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, rank FROM shallow_memories_fts
+                 WHERE shallow_memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )
+            .map_err(|e| format!("shallow fts prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![format!("\"{sanitized}\""), limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map_err(|e| format!("shallow fts query: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (rowid, rank) = r.map_err(|e| format!("shallow fts row: {e}"))?;
+            let hash: Option<String> = conn
+                .query_row("SELECT hash FROM shallow_memories WHERE rowid = ?1", params![rowid], |r| r.get(0))
+                .ok();
+            if let Some(h) = hash {
+                out.push((h, rank));
+            }
+        }
+        Ok(out)
+    }
+
+    /// GC（忠实复刻：会物理删除低重要度过期项）。
+    /// `max_age_secs=0` 表示禁用删除（只做 boost 削弱）。
+    pub fn shallow_gc(&self, now_epoch: u64, max_age_secs: u64) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now_epoch.saturating_sub(max_age_secs) as i64;
+        let _ = conn.execute(
+            "UPDATE shallow_memories
+             SET recall_boost = MAX(recall_boost - 0.1, 0.0)
+             WHERE explicit_save = 0 AND recall_boost > 0.0 AND last_accessed < ?1",
+            params![cutoff],
+        );
+        if max_age_secs == 0 {
+            return Ok(0);
+        }
+        let count = conn
+            .execute(
+                "DELETE FROM shallow_memories
+                 WHERE explicit_save = 0 AND last_accessed < ?1 AND importance < 3.0",
+                params![cutoff],
+            )
+            .map_err(|e| format!("shallow_gc: {e}"))?;
+        Ok(count)
+    }
+
+    /// 删除一条浅层记忆。
+    pub fn shallow_delete(&self, hash: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM shallow_memories WHERE hash = ?1", params![hash])
+            .map_err(|e| format!("shallow_delete: {e}"))?;
+        Ok(())
+    }
+
+    // ── Deep ────────────────────────────────────────────────
+
+    /// 存储 Deep（同 subject_key 者先被覆盖）。
+    pub fn deep_store(&self, f: &crate::deep_memory::DeepFact) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(k) = &f.subject_key {
+            let _ = conn.execute(
+                "DELETE FROM deep_facts WHERE subject_key = ?1 AND id != ?2",
+                params![k, f.id],
+            );
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO deep_facts
+               (id, content, summary, essence, fact_type, scope, pinned_by, subject_key,
+                importance, created_at, last_accessed, tags, links)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                f.id,
+                f.content,
+                f.summary,
+                f.essence,
+                f.fact_type.as_str(),
+                f.scope.as_key(),
+                match f.pinned_by {
+                    crate::deep_memory::PinnedBy::User => "user",
+                    crate::deep_memory::PinnedBy::Agent => "agent",
+                    crate::deep_memory::PinnedBy::None => "none",
+                },
+                f.subject_key,
+                f.importance,
+                f.created_at as i64,
+                f.last_accessed as i64,
+                serde_json::to_string(&f.tags).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&f.links).unwrap_or_else(|_| "[]".to_string()),
+            ],
+        )
+        .map_err(|e| format!("deep_store: {e}"))?;
+        Ok(())
+    }
+
+    /// 按可见范围列出（global 恒可见；scope 等于给定 key 也可见）。
+    pub fn deep_list(&self, scope_key: &str) -> Result<Vec<crate::deep_memory::DeepFact>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM deep_facts WHERE scope = 'global' OR scope = ?1")
+            .map_err(|e| format!("deep_list prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![scope_key], deep_row)
+            .map_err(|e| format!("deep_list query: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("deep row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// 按 id 取单条。
+    pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM deep_facts WHERE id = ?1")
+            .map_err(|e| format!("deep_get prepare: {e}"))?;
+        let mut rows = stmt
+            .query_map(params![id], deep_row)
+            .map_err(|e| format!("deep_get query: {e}"))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| format!("deep row: {e}"))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 删除一条 Deep。返回是否命中。
+    pub fn deep_forget(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("DELETE FROM deep_facts WHERE id = ?1", params![id])
+            .map_err(|e| format!("deep_forget: {e}"))?;
+        Ok(n > 0)
+    }
+
+    // ── 双层上下文装配（调纯算法）────────────────────────────
+
+    /// 组装浅层记忆块（纯 `assemble` + 后端候选/FTS）。
+    pub fn build_shallow_context(
+        &self,
+        query: &str,
+        budget: usize,
+        max_budget: usize,
+        decay_rate: f32,
+    ) -> (String, usize) {
+        let now = crate::shallow_memory::now_secs();
+        let candidates = match self.shallow_query_candidates(500) {
+            Ok(c) => c,
+            Err(_) => return (String::new(), 0),
+        };
+        if candidates.is_empty() {
+            return (String::new(), 0);
+        }
+        let fts_rank = match self.shallow_fts_search(query, 20) {
+            Ok(r) => r.into_iter().collect::<std::collections::HashMap<String, f64>>(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+        crate::shallow_memory::assemble(
+            &candidates,
+            &fts_rank,
+            budget,
+            max_budget,
+            2.0,
+            1.0,
+            0.3,
+            decay_rate,
+            now,
+        )
+    }
+
+    /// 组装 Deep 常驻块（照抄 render_permanent_block）。
+    pub fn deep_permanent_block(
+        &self,
+        scope_key: &str,
+        p_max: usize,
+        tau_days: f32,
+    ) -> (String, usize) {
+        use crate::deep_memory::{DeepParams, PinnedBy};
+        let now = crate::shallow_memory::now_secs();
+        let params = DeepParams { tau_days, ..Default::default() };
+        let facts = match self.deep_list(scope_key) {
+            Ok(f) => f,
+            Err(_) => return (String::new(), 0),
+        };
+        let mut lines: Vec<(String, f32, usize)> = Vec::new();
+        for f in &facts {
+            let pin_user = f.pinned_by == PinnedBy::User;
+            let pin_agent = f.pinned_by == PinnedBy::Agent;
+            let i_eff = crate::deep_memory::effective_importance(
+                f.importance,
+                f.last_accessed,
+                now,
+                pin_user,
+                tau_days,
+            );
+            if !crate::deep_memory::is_visible_permanent(i_eff, pin_user, pin_agent, &params) {
+                continue;
+            }
+            let body = if f.summary.trim().is_empty() { f.content.trim() } else { f.summary.trim() };
+            let line = format!("- [{}] {}", f.fact_type.as_str(), body);
+            let cost = crate::shallow_memory::estimate_tokens(&line);
+            // 上下文预算内按「统一工件价值 V=Q²·R·U」排序，优先级：重要、近期、常用。
+            lines.push((line, f.value(now) as f32, cost));
+        }
+        if lines.is_empty() {
+            return (String::new(), 0);
+        }
+        let header = "## Permanent Memory (Deep) — durable facts about this user/project\n";
+        let header_cost = crate::shallow_memory::estimate_tokens(header);
+        let body_budget = p_max.saturating_sub(header_cost);
+        let items: Vec<(f32, usize)> = lines.iter().map(|(_, i, c)| (*i, *c)).collect();
+        let picked = crate::deep_memory::pack_by_budget(&items, body_budget);
+        if picked.is_empty() {
+            return (String::new(), 0);
+        }
+        let mut out = String::from(header);
+        let mut toks = header_cost;
+        for idx in &picked {
+            out.push_str(&lines[*idx].0);
+            out.push('\n');
+            toks += lines[*idx].2;
+        }
+        (out, toks)
+    }
+}
+
+/// sqlite row → ShallowEntry
+fn shallow_row(r: &rusqlite::Row) -> rusqlite::Result<crate::shallow_memory::ShallowEntry> {
+    use crate::shallow_memory::{ShallowEntry, ShallowMemoryType};
+    let tags_raw: String = r.get(9)?;
+    let tags: Vec<String> = serde_json::from_str(&tags_raw).unwrap_or_default();
+    Ok(ShallowEntry {
+        hash: r.get(0)?,
+        created_at: r.get::<_, i64>(1)? as u64,
+        last_accessed: r.get::<_, i64>(2)? as u64,
+        access_count: r.get::<_, i64>(3)? as u32,
+        importance: r.get(4)?,
+        explicit_save: r.get::<_, i64>(5)? != 0,
+        full_text: r.get(6)?,
+        summary_text: r.get(7)?,
+        essence_text: r.get(8)?,
+        tags,
+        memory_type: ShallowMemoryType::from_str(&r.get::<_, String>(10)?),
+        session_id: r.get(11)?,
+        recall_boost: r.get(12)?,
+    })
+}
+
+/// sqlite row → DeepFact
+fn deep_row(r: &rusqlite::Row) -> rusqlite::Result<crate::deep_memory::DeepFact> {
+    use crate::deep_memory::{DeepFact, FactType, MemoryScope, PinnedBy};
+    let pinned = r.get::<_, String>(6)?;
+    Ok(DeepFact {
+        id: r.get(0)?,
+        content: r.get(1)?,
+        summary: r.get(2)?,
+        essence: r.get(3)?,
+        fact_type: match r.get::<_, String>(4)?.as_str() {
+            "identity" => FactType::Identity,
+            "preference" => FactType::Preference,
+            "project" => FactType::Project,
+            "constraint" => FactType::Constraint,
+            _ => FactType::Reference,
+        },
+        scope: MemoryScope::from_key(&r.get::<_, String>(5)?),
+        pinned_by: match pinned.as_str() {
+            "user" => PinnedBy::User,
+            "agent" => PinnedBy::Agent,
+            _ => PinnedBy::None,
+        },
+        subject_key: r.get(7)?,
+        importance: r.get(8)?,
+        created_at: r.get::<_, i64>(9)? as u64,
+        last_accessed: r.get::<_, i64>(10)? as u64,
+        tags: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
+        links: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+    })
+}
+
+
+
+
+#[cfg(test)]
+mod tests_two_tier {
+    use super::*;
+    use crate::shallow_memory::{ShallowEntry, ShallowMemoryType};
+
+    fn tmp_store() -> MemoryStore {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mem.db").to_str().unwrap().to_string();
+        std::mem::forget(dir); // keep tempdir alive for the test duration (Windows: file handle)
+        MemoryStore::new(&p).unwrap()
+    }
+
+    fn entry(hash: &str, importance: f32) -> ShallowEntry {
+        let now = crate::shallow_memory::now_secs();
+        ShallowEntry {
+            hash: hash.into(),
+            created_at: now,
+            last_accessed: now,
+            access_count: 0,
+            importance,
+            explicit_save: false,
+            full_text: "full text".into(),
+            summary_text: "summary".into(),
+            essence_text: "ess".into(),
+            tags: vec!["tag".into()],
+            memory_type: ShallowMemoryType::Conversation,
+            session_id: "s".into(),
+            recall_boost: 0.0,
+        }
+    }
+
+    #[test]
+    fn schema_created() {
+        let s = tmp_store();
+        s.ensure_two_tier_schema().unwrap();
+    }
+
+    #[test]
+    fn shallow_roundtrip_and_touch_and_gc() {
+        let s = tmp_store();
+        let mut e = entry("abc123def456", 3.0);
+        e.summary_text = "scan network connections".into();
+        s.shallow_store(&e).unwrap();
+        let cands = s.shallow_query_candidates(100).unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].hash, "abc123def456");
+
+        let rec = s.shallow_recall("abc").unwrap().unwrap();
+        assert_eq!(rec.hash, "abc123def456");
+
+        s.shallow_touch("abc123def456").unwrap();
+        let rec = s.shallow_recall("abc").unwrap().unwrap();
+        assert_eq!(rec.access_count, 1);
+        assert!((rec.recall_boost - 0.3).abs() < 1e-4);
+
+        // gc with max_age=0 must NOT delete (protect by default)
+        let n = s.shallow_gc(s.shallow_query_candidates(10).unwrap()[0].last_accessed, 0).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(s.shallow_query_candidates(100).unwrap().len(), 1);
+
+        // fts search finds it
+        let hits = s.shallow_fts_search("network", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn deep_roundtrip() {
+        let s = tmp_store();
+        use crate::deep_memory::{DeepFact, FactType, MemoryScope, PinnedBy};
+        let f = DeepFact {
+            id: "eng1".into(),
+            content: "user prefers Chinese UI".into(),
+            summary: "prefers Chinese".into(),
+            essence: "Chinese UI".into(),
+            fact_type: FactType::Preference,
+            scope: MemoryScope::Global,
+            pinned_by: PinnedBy::User,
+            subject_key: None,
+            importance: 5.0,
+            created_at: crate::shallow_memory::now_secs(),
+            last_accessed: crate::shallow_memory::now_secs(),
+            tags: vec![],
+            links: vec![],
+        };
+        s.deep_store(&f).unwrap();
+        let list = s.deep_list("global").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pinned_by, PinnedBy::User);
+        assert_eq!(s.deep_get("eng1").unwrap().unwrap().importance, 5.0);
+        assert!(s.deep_forget("eng1").unwrap());
+        assert_eq!(s.deep_list("global").unwrap().len(), 0);
+    }
+}
+
+

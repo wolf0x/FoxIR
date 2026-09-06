@@ -6,13 +6,14 @@ mod callbacks;
 mod checkpoint;
 mod config;
 mod crypto;
-mod distill;
 #[allow(dead_code)]
 mod forensics;
 #[allow(dead_code)]
 mod context;
 #[allow(dead_code)]
 mod error;
+mod deep_memory;
+mod shallow_memory;
 mod event_log;
 mod external_tools;
 mod heartbeat;
@@ -34,9 +35,14 @@ mod server;
 #[allow(dead_code)]
 mod session;
 mod skill;
+mod sop;
 mod security;
 #[allow(dead_code)]
 mod tool;
+mod value;
+
+#[cfg(test)]
+mod tests_recall;
 mod web;
 
 use std::sync::Arc;
@@ -468,6 +474,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browser_session = crate::tool::browser_cdp::BrowserSession::new(workspace_dir.clone());
 
     // Build agent using builder pattern (ADK-RUST style)
+    // Per-session skill-usage tracking (shared with AppState so SOP authoring can skip
+    // skill-driven sessions). Per-session SOP replay is independent of knowledge retrieval.
+    let skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
+
     let agent = LlmAgent::builder()
         .name("RustAgent")
         .description("Local AI agent with Windows system tools")
@@ -479,6 +491,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .workspace_dir(&workspace_dir)
         .parallel_ir_tools(config.agent.parallel_ir_tools)
         .user_given_name(&user_given_name)
+        .two_tier_memory(config.agent.two_tier_memory)
+        .skill_used_sessions(skill_used_sessions.clone())
+        .sop_replay(sop_replay.clone())
         .cleanup_session(browser_session.clone())
         .build()
         .map_err(|e| format!("Failed to build agent: {}", e))?;
@@ -490,6 +505,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trim_redundant_tool_calls = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.trim_redundant_tool_calls));
     // Per-turn knowledge pre-retrieval pointer injection (Settings toggle).
     let knowledge_pre_retrieval = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.knowledge_pre_retrieval));
+    // 双层记忆（深层 + 浅层）注入开关（Settings，默认开）。
+    let two_tier_memory = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.two_tier_memory));
 
     // Shared hot-reloadable settings for context-scaled inline result caps. Mirrored
     // into the RunnerBuilder and AppState so Settings changes apply at runtime.
@@ -512,6 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .app_name("RustAgent")
         .trim_redundant_tool_calls(trim_redundant_tool_calls.clone())
         .knowledge_pre_retrieval(knowledge_pre_retrieval.clone())
+        .sop_replay(sop_replay.clone())
         .enable_context_scaling(enable_context_scaling.clone())
         .max_inline_chars(max_inline_chars.clone())
         .skill_listing_strategy(skill_listing_strategy.clone())
@@ -589,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut reg = shared_tools.write().await;
         reg.register(Arc::new(crate::tool::cron_manage::CronManageTool::new(scheduler.clone())));
         reg.register(Arc::new(crate::tool::memory_md::MemoryMdTool::new(workspace_dir.clone())));
+        reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
         reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_ingest::KnowledgeIngestTool::new(workspace_dir.clone())));
@@ -671,6 +690,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tool_retries: Arc::new(AtomicUsize::new(config.agent.max_tool_retries)),
         trim_redundant_tool_calls: trim_redundant_tool_calls.clone(),
         knowledge_pre_retrieval: knowledge_pre_retrieval.clone(),
+        sop_replay: sop_replay.clone(),
+        skill_used_sessions: skill_used_sessions.clone(),
+        two_tier_memory: two_tier_memory.clone(),
         enable_context_scaling: enable_context_scaling.clone(),
         max_inline_chars: max_inline_chars.clone(),
         skill_listing_strategy: skill_listing_strategy.clone(),
@@ -725,3 +747,5 @@ fn get_local_ip() -> String {
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "0.0.0.0".to_string())
 }
+
+

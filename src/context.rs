@@ -216,6 +216,9 @@ pub struct InvocationContext {
     /// user turn and injects them so it answers from stored knowledge without
     /// having to remember to call knowledge_search first (default on).
     pub knowledge_pre_retrieval: bool,
+    /// Independent SOP replay switch (default on). Unlike knowledge_pre_retrieval,
+    /// toggling knowledge off does not disable SOP replay.
+    pub sop_replay: bool,
     /// Model context window size in tokens
     pub context_window: usize,
     /// Context usage threshold percentage (e.g. 80 = trim at 80%)
@@ -285,6 +288,7 @@ impl InvocationContext {
             rabbit_hole_threshold: 5,
             trim_redundant_tool_calls: false, // Off by default; opt in via Settings to avoid dropping legitimate follow-up tool calls
             knowledge_pre_retrieval: true,
+            sop_replay: true,
             context_window: 128000,
             context_window_threshold: 80,
             enable_context_scaling: true,
@@ -352,6 +356,12 @@ impl InvocationContext {
     /// Enable/disable per-turn knowledge pre-retrieval pointer injection.
     pub fn with_knowledge_pre_retrieval(mut self, v: bool) -> Self {
         self.knowledge_pre_retrieval = v;
+        self
+    }
+
+    /// Independently enable/disable SOP replay.
+    pub fn with_sop_replay(mut self, v: bool) -> Self {
+        self.sop_replay = v;
         self
     }
 
@@ -476,3 +486,4 @@ impl InvocationContext {
         self.ended.load(Ordering::SeqCst)
     }
 }
+

@@ -32,7 +32,6 @@ use crate::tool::subagent::SharedJobs;
 use crate::tool::ToolRegistry;
 use crate::web::StaticServer;
 use crate::model::openai::OpenAiProvider;
-use crate::distill;
 
 /// Reduce the distilled handoff to a single concise line (<= 100 chars) for the
 /// Expert continue prompt, instead of showing the full raw findings dump.
@@ -155,6 +154,12 @@ pub struct AppState {
     pub rabbit_hole_threshold: Arc<AtomicUsize>,
     pub trim_redundant_tool_calls: Arc<AtomicBool>,
     pub knowledge_pre_retrieval: Arc<AtomicBool>,
+    /// 独立 SOP 回放开关（默认开；与 knowledge_pre_retrieval 解耦）。
+    pub sop_replay: Arc<AtomicBool>,
+    /// 发生过 task-matched SKILL 驱动的会话集合（SOP 蒸馏门控）。
+    pub skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 双层记忆（深层 + 浅层）注入开关（默认开）。
+    pub two_tier_memory: Arc<AtomicBool>,
     pub enable_context_scaling: Arc<AtomicBool>,
     pub max_inline_chars: Arc<AtomicUsize>,
     pub skill_listing_strategy: Arc<AtomicUsize>,
@@ -764,6 +769,8 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "rabbit_hole_threshold": state.rabbit_hole_threshold.load(Ordering::SeqCst),
         "trim_redundant_tool_calls": state.trim_redundant_tool_calls.load(Ordering::SeqCst),
         "knowledge_pre_retrieval": state.knowledge_pre_retrieval.load(Ordering::SeqCst),
+        "sop_replay": state.sop_replay.load(Ordering::SeqCst),
+        "two_tier_memory": state.two_tier_memory.load(Ordering::SeqCst),
         "enable_context_scaling": state.enable_context_scaling.load(Ordering::SeqCst),
         "max_inline_chars": state.max_inline_chars.load(Ordering::SeqCst),
         "skill_listing_strategy": crate::skill::SkillListingStrategy::from_index(state.skill_listing_strategy.load(Ordering::SeqCst)).as_str().to_string(),
@@ -1501,6 +1508,22 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             }
 
                             // Run via Runner (managed mode dispatches to ManagedRunner)
+
+                            // 双层记忆（深层 + 浅层）：开启时注入常驻深层永久块与弹性浅层块。
+                            // 两者均为纯读取；默认开启。
+                            if state.two_tier_memory.load(Ordering::SeqCst) {
+                                let (eg_block, _eg_tok) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+                                if !eg_block.trim().is_empty() {
+                                    info!("注入深层永久块 ({} chars)", eg_block.len());
+                                    history.insert(0, ChatMessage::system(&eg_block));
+                                }
+                                let (lam_block, _lam_tok) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
+                                if !lam_block.trim().is_empty() {
+                                    info!("注入浅层记忆块 ({} chars)", lam_block.len());
+                                    history.insert(0, ChatMessage::system(&lam_block));
+                                }
+                            }
+
                             // Managed mode is activated PER-TASK via the 'managed' field —
                             // NOT a global setting. When true, the task runs through the
                             // Manager-Executor-Auditor loop for long-horizon IR tasks.
@@ -1882,6 +1905,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     }
 
+                                    two_tier_write(&state, &mut assistant_text, &session_id, content.as_str());
                                     // Update session history
                                     if !assistant_text.is_empty() {
                                         let mut sessions = state.sessions.lock().await;
@@ -2064,6 +2088,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     }
 
+                                    two_tier_write(&state, &mut assistant_text, &session_id, &cp.user_message);
                                     // Store in memory (SQLite)
                                     if !assistant_text.is_empty() {
                                         let _ = state.memory_store.store_entry(&session_id, "user", &cp.user_message, None);
@@ -2153,17 +2178,27 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // ── End-of-session knowledge distillation ──
+    // ── End-of-session SOP authoring ──
+    // experience 由“蒸馏经验条目”改为“动态 SOP”：会话若含可复用的多步骤过程，
+    // 经 LLM 作者判定后固化为可回放、可评分、可自动迭代的 SOP（sops.json）。
+    // 用户手动挂接的 knowledge 不变。
     let history = state.sessions.lock().await.get(&session_id).cloned().unwrap_or_default();
-    if history.len() >= 4 {
+    // Skill-driven sessions must NOT spawn a redundant SOP — the skill already
+    // bundled the procedure. Skip authoring for those.
+    let skill_driven = state.skill_used_sessions.lock().unwrap().contains(&session_id);
+    if skill_driven {
+        info!("Session {} was skill-driven; skipping SOP authoring", &session_id[..8.min(session_id.len())]);
+    }
+    if history.len() >= 4 && !skill_driven {
         let provider = state.provider.clone();
         let model_name = state.model_configs.read().await.first().map(|m| m.name.clone()).unwrap_or_default();
         let workspace_dir = state.workspace_dir.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
-            match distill::distill_session(&sid, &history, provider, &model_name, &workspace_dir).await {
-                Ok(n) => info!("Session {} distilled {} knowledge entries", &sid[..8.min(sid.len())], n),
-                Err(e) => warn!("Session {} distillation failed: {}", &sid[..8.min(sid.len())], e),
+            match crate::sop::author_sop_from_session(&history, provider, &model_name, &workspace_dir).await {
+                Ok(Some(sop)) => info!("Session {} authored SOP '{}' ({} phases)", &sid[..8.min(sid.len())], sop.name, sop.phases.len()),
+                Ok(None) => info!("Session {} no SOP-worthy procedure", &sid[..8.min(sid.len())]),
+                Err(e) => warn!("Session {} SOP authoring failed: {}", &sid[..8.min(sid.len())], e),
             }
         });
     }
@@ -2437,6 +2472,12 @@ async fn agent_settings_save_handler(
     let knowledge_pre_retrieval = body.get("knowledge_pre_retrieval")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.knowledge_pre_retrieval.load(Ordering::SeqCst));
+    let sop_replay = body.get("sop_replay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.sop_replay.load(Ordering::SeqCst));
+    let two_tier_memory = body.get("two_tier_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.two_tier_memory.load(Ordering::SeqCst));
     let enable_context_scaling = body.get("enable_context_scaling")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.enable_context_scaling.load(Ordering::SeqCst));
@@ -2472,6 +2513,7 @@ async fn agent_settings_save_handler(
         max_tool_retries,
         trim_redundant_tool_calls,
         knowledge_pre_retrieval,
+        two_tier_memory,
         enable_context_scaling,
         max_inline_chars,
         skill_listing_strategy.as_str().to_string(),
@@ -2488,6 +2530,8 @@ async fn agent_settings_save_handler(
             state.max_tool_retries.store(max_tool_retries, Ordering::SeqCst);
             state.trim_redundant_tool_calls.store(trim_redundant_tool_calls, Ordering::SeqCst);
             state.knowledge_pre_retrieval.store(knowledge_pre_retrieval, Ordering::SeqCst);
+            state.sop_replay.store(sop_replay, Ordering::SeqCst);
+        state.two_tier_memory.store(two_tier_memory, Ordering::SeqCst);
             state.enable_context_scaling.store(enable_context_scaling, Ordering::SeqCst);
             state.max_inline_chars.store(max_inline_chars, Ordering::SeqCst);
             state.skill_listing_strategy.store(skill_listing_strategy.index(), Ordering::SeqCst);
@@ -2506,6 +2550,8 @@ async fn agent_settings_save_handler(
                 "max_tool_retries": max_tool_retries,
                 "trim_redundant_tool_calls": trim_redundant_tool_calls,
                 "knowledge_pre_retrieval": knowledge_pre_retrieval,
+                "sop_replay": sop_replay,
+                "two_tier_memory": two_tier_memory,
                 "enable_context_scaling": enable_context_scaling,
                 "max_inline_chars": max_inline_chars,
                 "skill_listing_strategy": skill_listing_strategy.as_str().to_string(),
@@ -2815,4 +2861,46 @@ async fn usage_today_handler(
         Err(e) => Json(json!({ "error": e })),
     }
 }
+
+
+
+
+
+
+/// 双层记忆写入路径：从 assistant 文本提取可选的 <memory> 块，持久化进浅层记忆，
+/// 并从展示/存储的文本里剥离该块。仅当双层记忆开关开启时生效（默认开）。
+fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &str, user_text: &str) {
+    if !state.two_tier_memory.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(pb) = crate::shallow_memory::parse_memory_block(assistant_text) {
+        let now = crate::shallow_memory::now_secs();
+        let assist_clean = crate::shallow_memory::strip_memory_blocks(assistant_text);
+        let trunc = |s: &str| s.chars().take(500).collect::<String>();
+        // Faithful to temm1e runtime.rs: full_text = truncated User/Assistant pair.
+        let full_text = format!("User: {}\nAssistant: {}", trunc(user_text), trunc(&assist_clean));
+        let hash = crate::shallow_memory::make_hash(session_id, assist_clean.len(), now);
+        let is_explicit = user_text.to_lowercase().contains("remember");
+        let entry = crate::shallow_memory::ShallowEntry::new(
+            hash,
+            full_text,
+            pb.summary,
+            pb.essence,
+            pb.tags,
+            pb.importance,
+            is_explicit,
+            session_id.to_string(),
+            now,
+        );
+        if let Err(e) = state.memory_store.shallow_store(&entry) {
+            tracing::warn!("双层浅层记忆存储失败: {e}");
+        }
+    }
+    *assistant_text = crate::shallow_memory::strip_memory_blocks(assistant_text);
+}
+
+
+
+
+
 

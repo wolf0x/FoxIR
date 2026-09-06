@@ -11,6 +11,7 @@ pub mod mcp_client;
 pub mod web_fetch;
 pub mod cron_manage;
 pub mod memory_md;
+pub mod deep_memory;
 pub mod knowledge_search;
 pub mod knowledge_ingest;
 pub mod todo_update;

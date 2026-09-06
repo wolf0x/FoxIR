@@ -8,13 +8,13 @@
 - `SOUL.md` — 你是谁：人格、身份、边界、风格
 - `AGENTS.md` — 你怎么工作（本文件）
 - `TOOLS.md` — 本地环境与工具约定
-- `MEMORY.md` — curated 长期记忆
+- `MEMORY.md` — curated 记忆（两层开启时作 fallback 参考）
 
 ## 会话启动
 
 优先使用运行时提供的启动上下文。该上下文可能已包含：
 - `AGENTS.md`、`SOUL.md`、`TOOLS.md`、`USER.md`
-- 主会话中的 `MEMORY.md`
+- 主会话中的 MEMORY.md（fallback）
 - 自动 SQLite 记忆（[Memory Context] / [Memory Recall]）
 
 **不要**手动重新读取启动文件，除非：
@@ -30,33 +30,28 @@ USER.md 是用户级别配置，优先级最高；与本文档或 `SOUL.md` 冲�
 
 ## 记忆（操作流程）
 
-每次会话你都是全新启动。你有三层记忆：
+每次会话你都是全新启动。记忆由两层引擎 + 自动落库组成：
+
 - **自动记忆（memory.db）**：每轮对话自动持久化，摘要自动注入到 context 中。无需任何操作。
-- **长期记忆**：`MEMORY.md` — 你 curated 的记忆，就像人类的长期记忆
-- **用户偏好**：`USER.md` — 沟通偏好和用户身份，每次会话自动加载
+- **永久记忆（Engram）**：长期、自固化的持久事实（偏好、约定、约束、身份、决策）。每轮以
+  permanent block 形式注入 context。当用户说“记住 / 忘了 / 保存这个”或一条持久事实确立时，
+  用 `engram` 工具（action `remember` 等）写入，**绝不**只写进临时回复。用户陈述的事实会被
+  pin（永不自动遗忘）。
+- **短期记忆（λ-Memory）**：随访问衰减的会话记忆，每轮注入一个有界的 λ 块；你可在回复末尾
+  可选地发出 `<memory>` 块，由系统自动抽取存储。
+- **用户偏好**：`USER.md` — 沟通偏好和用户身份，每次会话自动加载。
 
-**使用 `memory_md` 工具**来读写 MEMORY.md：
-- `memory_md` action=`read_memory` → 读取长期记忆
-- `memory_md` action=`write_memory` content=`...` → 覆写长期记忆
-
-记录重要的事：决策、上下文、需要记住的东西。除非被要求，否则跳过秘密。
-
-### MEMORY.md — 你的长期记忆
-- **仅在主会话中加载**（与主人的直接对话）
-- 这是出于安全考虑 — 包含不应泄露给陌生人的个人上下文
-- 你可以在主会话中自由读取、编辑和更新 `MEMORY.md`
-- 记录重要事件、想法、决策、观点、经验教训
-- 这是你的 curated 记忆 — 提炼后的精华，而不是原始日志
-- 定期回顾日常文件，将值得保留的内容更新到 `MEMORY.md`
+### MEMORY.md（fallback 参考）
+- 当两层记忆引擎开启时，`MEMORY.md` 仅是回退参考文件，不再作为主要写入目标；持久的长期事实
+  应写入 Engram，而非 MEMORY.md。
+- 只有当两层记忆关闭（fallback 模式）时才作为 curated 长期记忆主动加载。
+- 你可通过 `memory_md` 工具读写它（`read_memory` / `write_memory`）。
 
 ### 写下来
-- 没有"脑内笔记"这回事！
-- 记忆是有限的 — 如果你想记住什么，**用 `memory_md` 工具写到文件里去**
-- "脑内笔记"在会话重启后不会存活。文件会。
-- 写入记忆前，**先用 `memory_md` action=`read_memory` 读取它们**；只写入具体的更新，绝不要空占位符
-- 当有人说"记住这个" → `memory_md` action=`write_memory`（更新到 MEMORY.md）
-- 当你学到教训 → 更新 `AGENTS.md`、`TOOLS.md` 或相关技能（SKILLS）
-- 当你犯了错误 → 记录下来，让未来的你不会重蹈覆辙
+- 没有“脑内笔记”这回事！记忆有限 — 想记住什么就写。
+- 链上的持久事实 → 用 `engram` 工具（remember）；会话细节 → 交给自动落库 / λ 块。
+- 写入前先读取现有内容，只做具体更新，绝不要空占位符。
+- 当你学到教训 → 更新 `AGENTS.md`、`TOOLS.md` 或相关技能（SKILLS）。
 - **文本 > 大脑**
 
 ## 工作区结构
@@ -67,7 +62,7 @@ workspace/
 ├── SOUL.md            # 人格与边界
 ├── TOOLS.md           # 工具使用约定
 ├── USER.md            # 用户沟通偏好
-├── MEMORY.md          # 长期记忆（仅主会话加载）
+├── MEMORY.md          # curated 记忆（两层开启时作 fallback）
 ├── output/            # 所有产出物（报告、截图、分析结果）
 ├── Expert/            # Expert 任务 HTML 报告
 ├── skills/            # 技能目录
@@ -205,17 +200,17 @@ workspace/
 - 检查项目状态（`git.exe status` 等）
 - 更新文档
 - 提交和推送你自己的更改
-- 回顾和更新 `MEMORY.md`
+- 回顾并维护记忆（Engram 持久事实 与 MEMORY.md fallback）
 
 ### 记忆维护（心跳期间）
 
 定期（每隔几天），用心跳来做：
 - 回顾最近的对话内容（通过自动记忆的 [Memory Recall] 了解近期历史）
 - 识别值得长期保留的重要事件、教训或见解
-- 用 `memory_md` action=`write_memory` 将提炼后的内容更新到 `MEMORY.md`
-- 从 `MEMORY.md` 中移除不再相关的过时信息
+- 将提炼出的持久事实用 `engram` 工具（remember）写入 Engram；仅在两层关闭时用 `memory_md` 写 MEMORY.md
+- 对不再相关的持久事实用 `engram` action=`forget` 清理
 
-就像一个人回顾经历、更新自己的心智模型一样。`MEMORY.md` 是 curated 的智慧。
+就像一个人回顾经历、更新自己的心智模型一样。Engram 是你的持久事实层。
 
 **目标**：有用但不烦人。每天主动联系几次，做一些有用的后台工作，但也尊重安静时间。
 
@@ -224,7 +219,7 @@ workspace/
 ## 成长（操作）
 
 你不是静态的。把学到的沉淀到文件里：
-- 发现新的模式 → 记录到 `MEMORY.md`
+- 发现新的持久模式 → 记录到 Engram（`engram` remember）
 - 犯错误 → 更新 `AGENTS.md` 或 `TOOLS.md`，让未来的你不再重蹈覆辙
 - 学到新技能 → 创建或更新 Skill
 - 用户偏好变化 → 更新 `USER.md`

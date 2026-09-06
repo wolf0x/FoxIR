@@ -174,6 +174,13 @@ pub struct LlmAgent {
     parallel_ir_tools: bool,
     /// User's given name (auto-detected from Windows at startup).
     user_given_name: String,
+    /// Whether two-tier memory is enabled. When on, MEMORY.md replaced by 深层/浅层 memory injection (server).
+    two_tier_memory: bool,
+    /// Sessions in which a task-matched SKILL drove a turn (used to skip SOP
+    /// authoring for skill-driven sessions). Shared with AppState.
+    skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Independent SOP replay switch (default on; independent of knowledge_pre_retrieval).
+    sop_replay: Arc<std::sync::atomic::AtomicBool>,
     /// Sessions to clean up after the agent loop completes.
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
 }
@@ -193,6 +200,9 @@ pub struct LlmAgentBuilder {
     tool_execution_strategy: ToolExecutionStrategy,
     parallel_ir_tools: bool,
     user_given_name: String,
+    two_tier_memory: bool,
+    skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    sop_replay: Arc<std::sync::atomic::AtomicBool>,
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
 }
 
@@ -212,6 +222,9 @@ impl LlmAgentBuilder {
             tool_execution_strategy: ToolExecutionStrategy::Sequential,
             parallel_ir_tools: true,
             user_given_name: "User".to_string(),
+            two_tier_memory: true,
+            skill_used_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            sop_replay: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cleanup_sessions: Vec::new(),
         }
     }
@@ -237,7 +250,9 @@ impl LlmAgentBuilder {
     pub fn user_given_name(mut self, name: &str) -> Self {
         self.user_given_name = name.to_string(); self
     }
-    /// Register a browser session to be closed after the agent loop completes.
+    pub fn two_tier_memory(mut self, enabled: bool) -> Self { self.two_tier_memory = enabled; self }
+    pub fn skill_used_sessions(mut self, v: Arc<std::sync::Mutex<std::collections::HashSet<String>>>) -> Self { self.skill_used_sessions = v; self }
+    pub fn sop_replay(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.sop_replay = v; self }
     pub fn cleanup_session(mut self, session: Arc<crate::tool::browser_cdp::BrowserSession>) -> Self {
         self.cleanup_sessions.push(session); self
     }
@@ -262,6 +277,9 @@ impl LlmAgentBuilder {
             tool_execution_strategy: self.tool_execution_strategy,
             parallel_ir_tools: self.parallel_ir_tools,
             user_given_name: self.user_given_name,
+            two_tier_memory: self.two_tier_memory,
+            skill_used_sessions: self.skill_used_sessions,
+            sop_replay: self.sop_replay,
             cleanup_sessions: self.cleanup_sessions,
         })
     }
@@ -438,7 +456,15 @@ impl LlmAgent {
         ))
     }
 
-    fn build_system_prompt(&self, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> String {
+    /// SOP replay (dynamic procedural knowledge): match the user message against the
+    /// stored SOP library (sops.json) and, if a verified one applies, inject it as a
+    /// step-by-step guide so the model replays it instead of re-deriving the procedure.
+    /// Gated by the same per-turn knowledge pre-retrieval toggle (default on).
+    fn build_sop_reminder(&self, query: &str, task_skill_active: bool) -> Option<String> {
+        sop_reminder_for(query, task_skill_active, &self.workspace_dir)
+    }
+
+    fn build_system_prompt(&self, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> (String, bool) {
         let today = chrono::Local::now().format("%Y-%m-%d (%A)").to_string();
         
         // Determine user's preferred name: USER.md explicit > detected given name > Master
@@ -651,6 +677,10 @@ Example:\n\
             ];
             let mut injected = Vec::new();
             for (filename, description) in &config_files {
+                // Skip MEMORY.md when two-tier memory is active (it becomes a fallback).
+                if self.two_tier_memory && *filename == "MEMORY.md" {
+                    continue;
+                }
                 if let Some((content, was_truncated)) = Self::read_workspace_file(workspace, filename, MAX_FILE_CHARS) {
                     let mut section = format!("\n## {} ({})\n", description, filename);
                     section.push_str(&content);
@@ -670,7 +700,38 @@ The following files are loaded from your workspace. They define your behavior, p
             }
 
             // ── Memory System Documentation ──
-            prompt.push_str(
+            let memory_system_note = if self.two_tier_memory {
+                // 双层记忆：深层(Deep)为持久永久层，浅层(Shallow)为弹性衰减层。
+                // 服务端每轮以 SYSTEM 消息注入深层永久块与浅层衰减块。
+                "\n# 记忆系统（双层）\n\
+你由两层记忆自动管理：\n\n\
+## 深层记忆（持久永久层 Deep Memory）\n\
+- 持久化长期事实每轮以常驻块注入上下文\n\
+- 用户说 'remember' / 'forget that' / 'save this'，或出现持久性事实\n\
+  （偏好、项目约定、约束、身份）时，用 `deep_memory` 工具 action 'remember' 持久化，\n\
+  **绝不要**只写在回复里。\n\
+- 需要不在当前上下文里的事实，用 `deep_memory` action 'recall'。\n\
+- 用户陈述的事实被钉住（永不自动遗忘）；用 `deep_memory` 更新/删除。\n\n\
+## 浅层记忆（弹性衰减层 Shallow Memory）\n\
+- Fading conversational memory; the server injects a bounded summary block each turn.\n\
+- You may optionally emit a `<memory>` block at the END of a reply to capture a\n\
+  notable turn. Format:\n\
+  <memory>\n\
+  summary: (one sentence)\n\
+  essence: (5 words max)\n\
+  importance: (1-5, 3=decision, 5=critical)\n\
+  tags: (up to 5, comma-separated)\n\
+  </memory>\n\
+  It is extracted and stored automatically; do not show it to the user.\n\n\
+## Automatic Memory (memory.db — SQLite)\n\
+- Every conversation is automatically persisted; recent summaries are injected as\n\
+  [Memory Context] / [Memory Recall]. You do NOT need to do anything for this.\n\n\
+## Manual Reference: MEMORY.md (fallback)\n\
+- MEMORY.md is only used as a fallback curated file when the two-tier engine is off.\n\
+- When it appears in your context, treat it as authoritative facts. You may update it\n\
+  via the `memory_md` tool if present.\n"
+            } else {
+                // Two-tier disabled → legacy MEMORY.md behavior (status quo).
                 "\n# Memory System\n\
 You have two layers of memory:\n\n\
 ## Automatic Memory (memory.db — SQLite)\n\
@@ -687,9 +748,9 @@ You have two layers of memory:\n\n\
 ## Guidelines\n\
 - When you notice patterns or lasting preferences from conversations, distill them into MEMORY.md\n\
 - MEMORY.md is curated — quality over quantity\n\
-- The automatic SQLite memory handles day-to-day recall; MEMORY.md is for lasting insights\n",
-            );
-
+- The automatic SQLite memory handles day-to-day recall; MEMORY.md is for lasting insights\n"
+            };
+            prompt.push_str(memory_system_note);
             // ── Computer Use (GUI Control) Routing ──
             prompt.push_str(
                 "\n## Computer Use (GUI Control) Tools\n\
@@ -718,17 +779,23 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         // skill_read_file. Matching uses a bounded window so an earlier-turn
         // activation stays "sticky" across follow-up turns.
         let matching_context = Self::build_skill_matching_context(history, user_message);
-        if let Some(skills_section) = self.skill_manager.build_skills_prompt(
+        // build_skills_prompt returns (Option<String>, bool); the bool reports whether
+        // a task-matched (non-always) skill body was inlined — this turn is driven by a
+        // SKILL. Used to suppress a competing SOP replay at the injection point below.
+        let (skills_opt, skill_activated) = self.skill_manager.build_skills_prompt(
             &matching_context,
             skill_strategy,
             skill_max_inline_chars,
             skill_catalog_max,
             skill_hot_top_k,
-        ) {
+        );
+        let mut task_skill_active = false;
+        if let Some(skills_section) = skills_opt {
+            task_skill_active = skill_activated;
             prompt.push_str(&skills_section);
         }
 
-        prompt
+        (prompt, task_skill_active)
     }
 
     /// Build the text used for skill matching: a bounded window of recent
@@ -987,18 +1054,24 @@ impl Agent for LlmAgent {
         let (tx, rx) = tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(200);
 
         // Build system prompt and history in the spawned task
-        let mut system_prompt = match &ctx.system_prompt_override {
+        let (system_prompt, task_skill_active) = match &ctx.system_prompt_override {
             Some(p) if !p.trim().is_empty() => {
                 let lang_rule = self.resolve_language_rule(user_message);
                 let norms = self.sub_agent_norms_section();
-                format!("{}\n\n## LANGUAGE RULE (STRICT)\n{}\n{}", p, lang_rule, norms)
+                (format!("{}\n\n## LANGUAGE RULE (STRICT)\n{}\n{}", p, lang_rule, norms), false)
             }
             _ => self.build_system_prompt(user_message, &ctx.conversation_history, skill_strategy, skill_max_inline_chars, skill_catalog_max, skill_hot_top_k),
         };
+        // system_prompt is mutated below (TODO block); keep it mutable via a rebind.
+        let mut system_prompt = system_prompt;
         // Inject the active TODO list as the main-session task contract.
         // Gated to main sessions only — sub/cron write to session-scoped files
         // and must not see/pollute the main `todos.json`.
         let session_id = ctx.base.session_id.clone();
+        // Record skill-driven sessions so end-of-session SOP authoring can skip them.
+        if task_skill_active && !session_id.is_empty() {
+            self.skill_used_sessions.lock().unwrap().insert(session_id.clone());
+        }
         let todo_item_timeout_secs = ctx.todo_item_timeout_secs;
         let is_main_session = !session_id.is_empty()
             && !session_id.starts_with("sub-")
@@ -1088,6 +1161,11 @@ impl Agent for LlmAgent {
         } else {
             None
         };
+        let sop_reminder: Option<String> = if ctx.sop_replay {
+            self.build_sop_reminder(&user_message, task_skill_active)
+        } else {
+            None
+        };
         let tool_timeout_secs = ctx.tool_timeout_secs;
         let max_tool_retries = ctx.max_tool_retries;
         let context_window = ctx.context_window;
@@ -1169,6 +1247,11 @@ impl Agent for LlmAgent {
             if let Some(ref kblock) = knowledge_reminder {
                 info!("[session:{}] Injected knowledge pre-retrieval pointers", session_id);
                 effective_system_prompt.push_str(kblock);
+            }
+            // ── SOP replay (dynamic procedural knowledge) ──
+            if let Some(ref sblock) = sop_reminder {
+                info!("[session:{}] Injected guided SOP replay", session_id);
+                effective_system_prompt.push_str(sblock);
             }
 
             // Account for system prompt size in the token budget.
@@ -2622,6 +2705,37 @@ fn generate_static_summary(history: &[ChatMessage], iterations: usize) -> String
     parts.join("\n")
 }
 
+/// Layered-routing core (no `self`, unit-testable). When a task-matched SKILL is already
+/// driving this turn, do NOT inject a competing SOP (the skill wins). Otherwise match SOP
+/// tags and replay the best one.
+fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -> Option<String> {
+    if task_skill_active {
+        return None;
+    }
+    let q: String = query.trim().chars().take(300).collect();
+    if q.chars().count() < 4 {
+        return None;
+    }
+    let sops = crate::sop::load_sops(workspace_dir);
+    if sops.is_empty() {
+        return None;
+    }
+    let candidates = crate::sop::match_sops(&sops, &q);
+    if candidates.is_empty() {
+        return None;
+    }
+    let now = crate::sop::now_secs();
+    let best = crate::sop::select_best(&candidates, now, 12000)?;
+    let ctx = crate::sop::format_sop_context(&best);
+    Some(format!(
+        "\n\n## Guided SOP (auto-matched — replay this verified procedure)\n\
+         A stored SOP matches this task. Follow its Phases in order instead of re-deriving \
+         the procedure; only deviate where current conditions differ. After completing, note \
+         any observed deviation/success so the SOP can be refined.\n\n{}",
+        ctx
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2736,4 +2850,45 @@ mod tests {
         assert!(LlmAgent::build_todo_reminder(&ws).is_none());
         let _ = std::fs::remove_dir_all(&ws);
     }
-}
+
+    #[test]
+    fn sop_reminder_suppressed_when_skill_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_str().unwrap().to_string();
+        let sop = crate::sop::Sop {
+            id: "s1".to_string(),
+            name: "Cleanup Run".to_string(),
+            description: "Guided cleanup procedure".to_string(),
+            semantic_tags: vec!["cleanup".to_string(), "rm".to_string()],
+            phases: vec!["枚举".to_string(), "删除".to_string(), "验证".to_string()],
+            version: 1,
+            created: 1,
+            updated: 1,
+            times_executed: 2,
+            times_succeeded: 2,
+            times_failed: 0,
+            last_executed_at: Some(1),
+            avg_tool_calls: 3.0,
+            avg_duration_secs: 10.0,
+        };
+        crate::sop::register_sop(&ws, sop).unwrap();
+
+        let task = "please cleanup temp dir and remove leftover files";
+        // No task-matched SKILL driving the turn → SOP is replayed.
+        let reminded = sop_reminder_for(task, false, &ws)
+            .expect("SOP should replay when no skill is active");
+        assert!(reminded.contains("Phase 3"), "expected 3 phases, got: {}", reminded);
+        // A task-matched SKILL driving the turn → SOP is fully suppressed (layered routing).
+        assert!(sop_reminder_for(task, true, &ws).is_none(),
+            "SOP must not inject when a skill is in control");
+        // Non-matching task → no replay.
+        assert!(sop_reminder_for("do something unrelated entirely", false, &ws).is_none());
+    }}
+
+
+
+
+
+
+
+
