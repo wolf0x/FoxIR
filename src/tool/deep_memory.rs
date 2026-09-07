@@ -230,6 +230,11 @@ impl Tool for DeepMemoryTool {
                     });
                 }
                 facts.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+                // 召回触达（A2）：对本次显式召回的事实刷新 last_accessed（reheat）。
+                let touched_ids: Vec<String> = facts.iter().take(limit).map(|f| f.id.clone()).collect();
+                if !touched_ids.is_empty() {
+                    let _ = self.memory_store.deep_touch(&touched_ids);
+                }
                 let out: Vec<Value> = facts.into_iter().take(limit).map(|f| {
                     json!({
                         "id": f.id,

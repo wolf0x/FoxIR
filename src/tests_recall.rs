@@ -59,7 +59,7 @@ fn shallow_recall_rate() {
     for i in 0..20 {
         let q = format!("alpha{}", i);
         // 大预算、近期（decay ~1.0），应能容纳所有 high-importance。
-        let (block, _) = s.build_shallow_context(&q, 8000, 8000, 0.01);
+        let (block, _, _) = s.build_shallow_context(&q, 8000, 8000, 0.01);
         if block.contains(&format!("alpha{}", i)) {
             hit += 1;
         }
@@ -86,7 +86,7 @@ fn shallow_importance_floor_and_explicit() {
         let e = shallow_entry(&format!("lamcold{:02}", i), "noise about X", "noise content", 1.0, now);
         s.shallow_store(&e).unwrap();
     }
-    let (block, _) = s.build_shallow_context("X", 8000, 8000, 0.01);
+    let (block, _, _) = s.build_shallow_context("X", 8000, 8000, 0.01);
     assert!(block.contains("explicit save request about X"), "explicit-save fact missing");
     cleanup(s, dir);
 }
@@ -138,7 +138,7 @@ fn two_tier_composite_recall() {
             &format!("composite record c{} with detail token cc{}", i, i), 4.0, now);
         s.shallow_store(&e).unwrap();
         total += 1;
-        let (block, _) = s.build_shallow_context(&format!("cc{}", i), 8000, 8000, 0.01);
+        let (block, _, _) = s.build_shallow_context(&format!("cc{}", i), 8000, 8000, 0.01);
         if block.contains(&format!("cc{}", i)) { hit += 1; }
     }
     // Deep 层
@@ -317,3 +317,53 @@ fn migration_legacy_db_and_sops_json() {
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+/// A2：召回注入路径把实际选中的浅层记忆写回（touch），让 access_count / recall_boost /
+/// last_accessed 随真实使用更新（而不是冻结）。build_shallow_context 返回本次注入的 hash 集合。
+#[test]
+fn shallow_touch_write_back_updates_usage() {
+    let (s, dir) = isolated_store();
+    let now = now_secs();
+    let e = shallow_entry("lamtouch01", "scan network connections", "network scan detail", 3.0, now);
+    s.shallow_store(&e).unwrap();
+    // 召回：查询命中 → block 注入，并返回被选中的 hash。
+    let (block, _, hashes) = s.build_shallow_context("network", 8000, 8000, 0.01);
+    assert!(block.contains("network scan detail"), "memory should be injected");
+    assert!(hashes.iter().any(|h| h == "lamtouch01"), "returned hashes must include the injected one, got {hashes:?}");
+    // 写回：对注入集合 touch → access_count 与 recall_boost 变化。
+    let n = s.shallow_touch_batch(&hashes).unwrap();
+    assert!(n >= 1);
+    let rec = s.shallow_recall("lamtouch").unwrap().unwrap();
+    assert_eq!(rec.access_count, 1);
+    assert!((rec.recall_boost - 0.3).abs() < 1e-4, "recall_boost={}", rec.recall_boost);
+    cleanup(s, dir);
+}
+
+/// A2：深度事实的显式召回会 reheat —— 刷新 last_accessed（保留时间退火遗忘的入口）。
+#[test]
+fn deep_touch_refreshes_last_accessed() {
+    let (s, dir) = isolated_store();
+    let now = now_secs();
+    let f = DeepFact {
+        id: "egtouch1".into(),
+        content: "deploy app via runbook".into(),
+        summary: "deploy".into(),
+        essence: "deploy".into(),
+        fact_type: FactType::Reference,
+        scope: MemoryScope::Global,
+        pinned_by: PinnedBy::Agent,
+        subject_key: None,
+        importance: 4.0,
+        created_at: now,
+        last_accessed: now - 86_400, // 1 day ago (aged, would otherwise anneal)
+        tags: vec![],
+        links: vec![],
+    };
+    s.deep_store(&f).unwrap();
+    let n = s.deep_touch(&["egtouch1".to_string()]).unwrap();
+    assert_eq!(n, 1);
+    let got = s.deep_get("egtouch1").unwrap().unwrap();
+    assert!(got.last_accessed > now - 86_400, "deep last_accessed not refreshed: {}", got.last_accessed);
+    cleanup(s, dir);
+}
+

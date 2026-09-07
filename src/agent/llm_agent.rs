@@ -73,78 +73,164 @@ fn estimate_tokens(text: &str) -> usize {
     ((cjk_count as f64 / 1.5) + (other_count as f64 / 4.0)).ceil() as usize
 }
 
-/// Trim history messages to fit within a token budget using priority-based strategy:
-/// - System prompt (not in history) is always preserved
-/// - Recent messages (last 6) are never trimmed
-/// - Phase 1: Trim old tool results to 100 chars
-/// - Phase 2: Trim old assistant responses to 200 chars
-/// - Phase 3: Trim old user messages to 100 chars
-/// - Phase 4: Trim old tool results further to 50 chars
-fn trim_history_to_budget(history: &mut Vec<ChatMessage>, max_tokens: usize) {
-    let calc_tokens = |h: &[ChatMessage]| -> usize {
+/// 是否含 64/32 位十六进制哈希串（证据完整性标记，不可再生）。
+fn has_hash_token(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_hexdigit()).any(|t| t.len() >= 32)
+}
+
+/// 是否含文件路径指针（盘符 `?:\` / `?:/`，或 output 目录）——证据/产物的落盘位置。
+fn has_file_path(text: &str) -> bool {
+    let b = text.as_bytes();
+    for i in 0..b.len().saturating_sub(2) {
+        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/') {
+            return true;
+        }
+    }
+    text.contains("output\\") || text.contains("output/")
+}
+
+/// 判断一条历史消息是否为「不可再生证据」：`ir_*` 取证工具结果、含文件路径 / 哈希 / 明确落盘
+/// 陈述的内容。裁剪时须保护——只可降级为「指针」保留引用，绝不整体丢弃，
+/// 对齐铁律「never lose completed work」。见 SDD §12.6。
+fn is_non_reproducible_evidence(name: Option<&str>, text: &str) -> bool {
+    if let Some(n) = name {
+        let nl = n.to_ascii_lowercase();
+        if nl.starts_with("ir_") || nl.starts_with("forensic") {
+            return true;
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    has_hash_token(text)
+        || has_file_path(text)
+        || lower.contains("written to")
+        || lower.contains("saved to")
+        || lower.contains("sha256")
+        || lower.contains("md5")
+}
+
+/// 把证据消息降级为紧凑「指针」：保留哈希 / 文件路径引用 + 极短头部摘要，
+/// 正文省略。即便被压缩也保留可追溯的引用，而非删除。
+fn evidence_pointer(name: &str, text: &str) -> String {
+    let mut refs: Vec<String> = Vec::new();
+    for tok in text.split_whitespace() {
+        let clean = tok.trim_matches(|c: char| !c.is_ascii_graphic());
+        let cb = clean.as_bytes();
+        let is_hex = clean.len() >= 32 && clean.chars().all(|c| c.is_ascii_hexdigit());
+        let is_path = cb.len() > 4 && cb[1] == b':' && (cb[2] == b'\\' || cb[2] == b'/');
+        if (is_hex || is_path) && !refs.iter().any(|r| r == clean) {
+            refs.push(clean.to_string());
+            if refs.len() >= 4 {
+                break;
+            }
+        }
+    }
+    let head: String = text.chars().take(120).collect();
+    if refs.is_empty() {
+        format!("[{} evidence pointer: {}...]", name, head)
+    } else {
+        format!("[{} evidence pointer — refs: {} | {}...]", name, refs.join(", "), head)
+    }
+}
+
+/// 一条旧历史消息的保留价值：角色权重 + 近因加成 + 不可再生证据强加权。
+/// 返回 (value, is_evidence)。value 为排序标量，供 `context_arbiter::rank_key` 融合相关性。
+fn history_retain_value(i: usize, keep_recent: usize, role: &str, name: Option<&str>, text: &str) -> (f64, bool) {
+    let evidence = is_non_reproducible_evidence(name, text);
+    let role_w = match role {
+        "user" => 1.6,       // 用户意图最珍贵
+        "tool" => 1.2,       // 工具结果携带数据
+        "system" => 1.0,
+        "assistant" => 0.8,  // 推理可再生
+        _ => 0.6,
+    };
+    let recency = if keep_recent > 0 { (i as f64 / keep_recent as f64).clamp(0.0, 1.0) } else { 0.0 };
+    let ev = if evidence { 2.0 } else { 0.0 };
+    (role_w + recency * 0.5 + ev, evidence)
+}
+
+/// 对单条历史消息应用某个降级档。仅改写 `content`，保留 `role`/`tool_calls`/`tool_call_id`
+/// 结构（不破坏 assistant↔tool 配对）。
+fn apply_history_degrade(history: &mut [ChatMessage], i: usize, evidence: bool, level: u8) {
+    let name = history[i].name.clone().unwrap_or_else(|| history[i].role.clone());
+    let text = history[i].content_as_text().unwrap_or_default();
+    if evidence {
+        // 不可再生证据：降级为「指针」，保留哈希/路径引用，绝不整体丢弃。
+        history[i].content = Some(Value::String(evidence_pointer(&name, &text)));
+        return;
+    }
+    match level {
+        1 => {
+            let cap = if history[i].role == "assistant" { 200 } else { 100 };
+            let preview: String = text.chars().take(cap).collect();
+            history[i].content = Some(Value::String(format!(
+                "[earlier {} truncated: {}...]", history[i].role, preview)));
+        }
+        2 => {
+            history[i].content = Some(Value::String(format!(
+                "[earlier {} result elided: {}]", history[i].role, name)));
+        }
+        _ => {}
+    }
+}
+
+/// 价值导向裁剪（有限脑 §12.6，替换旧的价值盲裁剪）：
+/// 从「按角色/近因截断」改为「按保留价值降级」，与「never lose completed work」对齐。
+///
+/// - 保护最近 6 条（永不裁剪）。
+/// - 反复挑选 `rank_key = value×(0.5+relevance)` 最低、尚可降级的旧消息降一档：
+///   非证据 全文→摘要→占位指针；证据 全文→指针（保留哈希/路径，永不丢弃）。
+/// - 降级反应式 → 但每步用统一排序键决策，先压可再生的低价值旧工具结果，保护不可再生证据。
+fn trim_history_by_value(history: &mut Vec<ChatMessage>, max_tokens: usize) {
+    let calc = |h: &[ChatMessage]| -> usize {
         h.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum()
     };
 
-    if calc_tokens(history.as_slice()) <= max_tokens { return; }
-
-    let keep_recent = (history.len().saturating_sub(6)).max(3).min(history.len());
-
-    // Phase 1: Trim old tool results to 100 chars
-    for i in 0..keep_recent {
-        if history[i].role == "tool" {
-            let content = history[i].content_as_text().unwrap_or_default();
-            if content.len() > 100 {
-                let name = history[i].name.as_deref().unwrap_or("tool");
-                let preview: String = content.chars().take(100).collect();
-                history[i].content = Some(Value::String(
-                    format!("[Earlier {} result truncated: {}...]", name, preview)));
-            }
-        }
-    }
-    if calc_tokens(history.as_slice()) <= max_tokens { return; }
-
-    // Phase 2: Trim old assistant responses to 200 chars
-    for i in 0..keep_recent {
-        if history[i].role == "assistant" {
-            let content = history[i].content_as_text().unwrap_or_default();
-            if content.len() > 200 {
-                let preview: String = content.chars().take(200).collect();
-                history[i].content = Some(Value::String(
-                    format!("[Earlier assistant response truncated: {}...]", preview)));
-            }
-        }
-    }
-    if calc_tokens(history.as_slice()) <= max_tokens { return; }
-
-    // Phase 3: Trim old user messages to 100 chars
-    for i in 0..keep_recent {
-        if history[i].role == "user" {
-            let content = history[i].content_as_text().unwrap_or_default();
-            if content.len() > 100 {
-                let preview: String = content.chars().take(100).collect();
-                history[i].content = Some(Value::String(
-                    format!("[Earlier user message truncated: {}...]", preview)));
-            }
-        }
-    }
-    if calc_tokens(history.as_slice()) <= max_tokens { return; }
-
-    // Phase 4: Aggressive — trim old tool results to 50 chars
-    for i in 0..keep_recent {
-        if history[i].role == "tool" {
-            let content = history[i].content_as_text().unwrap_or_default();
-            if content.len() > 50 {
-                let name = history[i].name.as_deref().unwrap_or("tool");
-                let preview: String = content.chars().take(50).collect();
-                history[i].content = Some(Value::String(
-                    format!("[{} summary: {}...]", name, preview)));
-            }
-        }
+    if calc(history.as_slice()) <= max_tokens {
+        return;
     }
 
-    let final_tokens = calc_tokens(history.as_slice());
+    let len = history.len();
+    let keep_recent = (len.saturating_sub(6)).max(3).min(len);
+
+    #[derive(Clone, Copy)]
+    struct Plan { key: f64, evidence: bool, level: u8 }
+    let mut plans: Vec<Plan> = Vec::with_capacity(len);
+    for (i, m) in history.iter().enumerate() {
+        if i >= keep_recent {
+            plans.push(Plan { key: f64::INFINITY, evidence: false, level: u8::MAX });
+            continue;
+        }
+        let text = m.content_as_text().unwrap_or_default();
+        let (value, evidence) = history_retain_value(i, keep_recent, &m.role, m.name.as_deref(), &text);
+        let relevance = (i as f64 / keep_recent.max(1) as f64).clamp(0.0, 1.0);
+        let key = crate::context_arbiter::rank_key(value, relevance);
+        plans.push(Plan { key, evidence, level: 0 });
+    }
+
+    let mut guard = 0usize;
+    while calc(history.as_slice()) > max_tokens && guard < 4 * len + 16 {
+        guard += 1;
+        // 选最低 rank_key 且尚可降级者（证据至多降到指针 level=1）。
+        let mut pick: Option<usize> = None;
+        for i in 0..keep_recent {
+            let max_level = if plans[i].evidence { 1 } else { 2 };
+            if plans[i].level >= max_level {
+                continue;
+            }
+            match pick {
+                None => pick = Some(i),
+                Some(j) if plans[i].key < plans[j].key => pick = Some(i),
+                _ => {}
+            }
+        }
+        let Some(i) = pick else { break; };
+        plans[i].level += 1;
+        apply_history_degrade(history, i, plans[i].evidence, plans[i].level);
+    }
+
+    let final_tokens = calc(history.as_slice());
     if final_tokens > max_tokens {
-        warn!("History still exceeds budget after all trimming phases: {} tokens (limit: {})", final_tokens, max_tokens);
+        warn!("History still exceeds budget after value-oriented trim: {} tokens (limit: {})", final_tokens, max_tokens);
     }
 }
 
@@ -460,8 +546,11 @@ impl LlmAgent {
     /// stored SOP library (sops.json) and, if a verified one applies, inject it as a
     /// step-by-step guide so the model replays it instead of re-deriving the procedure.
     /// Gated by the same per-turn knowledge pre-retrieval toggle (default on).
-    fn build_sop_reminder(&self, query: &str, task_skill_active: bool) -> Option<String> {
-        sop_reminder_for(query, task_skill_active, &self.workspace_dir)
+    fn build_sop_reminder(&self, query: &str, task_skill_active: bool) -> (Option<String>, Option<String>) {
+        match sop_reminder_for(query, task_skill_active, &self.workspace_dir) {
+            Some((ctx, id)) => (Some(ctx), Some(id)),
+            None => (None, None),
+        }
     }
 
     fn build_system_prompt(&self, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> (String, bool) {
@@ -1156,15 +1245,17 @@ impl Agent for LlmAgent {
         let rabbit_hole_threshold = ctx.rabbit_hole_threshold;
         let trim_redundant_tool_calls = ctx.trim_redundant_tool_calls;
         let knowledge_pre_retrieval = ctx.knowledge_pre_retrieval;
+        let budget_dashboard_enabled = ctx.budget_dashboard;
+        let budget_sink = ctx.budget_sink.clone();
         let knowledge_reminder: Option<String> = if knowledge_pre_retrieval {
             self.build_knowledge_reminder(&user_message)
         } else {
             None
         };
-        let sop_reminder: Option<String> = if ctx.sop_replay {
+        let (sop_reminder, active_sop_id): (Option<String>, Option<String>) = if ctx.sop_replay {
             self.build_sop_reminder(&user_message, task_skill_active)
         } else {
-            None
+            (None, None)
         };
         let tool_timeout_secs = ctx.tool_timeout_secs;
         let max_tool_retries = ctx.max_tool_retries;
@@ -1257,13 +1348,54 @@ impl Agent for LlmAgent {
             // Account for system prompt size in the token budget.
             // System prompt is NOT part of history but consumes context window.
             let system_tokens = estimate_tokens(&effective_system_prompt);
-            let history_budget = max_history_tokens.saturating_sub(system_tokens);
+            let mut history_budget = max_history_tokens.saturating_sub(system_tokens);
             if system_tokens > max_history_tokens / 2 {
                 warn!("[session:{}] System prompt uses {} tokens ({}% of budget {}), history budget reduced to {} tokens",
                       session_id, system_tokens, system_tokens * 100 / max_history_tokens, max_history_tokens, history_budget);
             }
             info!("[session:{}] Context budget: system={} tokens, history_budget={} tokens (model={} tokens @ {}%)",
                   session_id, system_tokens, history_budget, context_window, context_window_threshold);
+
+            // ── 有限脑预算自省（CONTEXT BUDGET）：让模型「知道自己的颅骨」以自我调节。 ──
+            // 不作为正确性依赖（模型常忽略此类提示），硬仲裁/裁剪始终是权威（§12.7/§12.9）。
+            if budget_dashboard_enabled {
+                // 逐分类实测真实 token（temm1e 口径：used = 实际塞进上下文的各分类之和）。
+                let base_system = estimate_tokens(&system_prompt);
+                let memory_toks: usize = memory_blocks.iter().map(|b| estimate_tokens(b)).sum();
+                let knowledge_toks = knowledge_reminder.as_ref().map(|k| estimate_tokens(k)).unwrap_or(0);
+                let sop_toks = sop_reminder.as_ref().map(|x| estimate_tokens(x)).unwrap_or(0);
+                let tools_toks: usize = core_tool_defs.iter()
+                    .map(|d| estimate_tokens(&serde_json::to_string(d).unwrap_or_default()))
+                    .sum();
+                let history_toks: usize = history.iter()
+                    .map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("")))
+                    .sum();
+                // 预留 = 输出预留（skull/10）+ 安全守卫（skull/50），沿用 temm1e lambda_budget 约定。
+                let output_reserve = context_window / 10 + context_window / 50;
+                let report = crate::context_arbiter::budget_report(
+                    context_window,
+                    output_reserve,
+                    &[
+                        ("System", base_system),
+                        ("Tools", tools_toks),
+                        ("Memory", memory_toks),
+                        ("Knowledge", knowledge_toks),
+                        ("SOP", sop_toks),
+                        ("History", history_toks),
+                    ],
+                );
+                effective_system_prompt.push_str(&format!(
+                    "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Tools: {} | Memory: {} | Knowledge: {} | SOP: {} | History: {}\nPrioritize high-value content and trim/stop before exceeding the window.\n=== END BUDGET ===",
+                    report.window, report.used, report.free,
+                    base_system, tools_toks, memory_toks, knowledge_toks, sop_toks, history_toks,
+                ));
+                // 追加自省块后重算 system/history 预算，确保后续裁决基于真实尺寸。
+                history_budget = max_history_tokens.saturating_sub(estimate_tokens(&effective_system_prompt));
+                // 写共享快照供 /api/budget（与系统提示同源）。
+                if let Some(sink) = &budget_sink {
+                    *sink.lock().unwrap() = Some(report);
+                }
+            }
 
             if !is_resumed {
                 if !images.is_empty() {
@@ -1294,6 +1426,12 @@ impl Agent for LlmAgent {
             let mut used_fallback = false;
             let mut has_executed_tools = false;
             let mut reprompt_count = 0u32;
+            // SOP 结果记录（A1）运行级状态
+            let mut active_sop_id = active_sop_id;
+            let run_started = std::time::Instant::now();
+            let mut run_tool_calls: u32 = 0u32;
+            let mut run_has_error = false;
+            let mut sop_gc_counter: u32 = 0u32;
 
             let start_iter = resume_iteration.unwrap_or(0);
             for iteration in start_iter..max_iter {
@@ -1340,9 +1478,9 @@ impl Agent for LlmAgent {
                 // Trim history if approaching context limit using token-based budget
                 let total_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
                 if total_tokens > history_budget {
-                    warn!("[session:{}] History too large ({} est. tokens, budget: {} tokens), trimming with priority strategy",
+                    warn!("[session:{}] History too large ({} est. tokens, budget: {} tokens), trimming with value-oriented strategy",
                           session_id, total_tokens, history_budget);
-                    trim_history_to_budget(&mut history, history_budget);
+                    trim_history_by_value(&mut history, history_budget);
                     let new_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
                     info!("[session:{}] History trimmed from {} to {} est. tokens", session_id, total_tokens, new_tokens);
                 }
@@ -1527,6 +1665,28 @@ impl Agent for LlmAgent {
                             info!("[session:{}] COMPLETE_PROBE finish_reason={:?} content={}chars reasoning={}chars stub={} has_executed_tools={} reprompt_count={}",
                                   session_id, finish_reason, _probe_clen, _probe_rlen, _probe_stub, has_executed_tools, reprompt_count);
                             info!("[session:{}] Agent completed with text response ({} chars, {} tool calls)", session_id, content.len(), tool_calls.len());
+                            // 记录 SOP 执行结果（A1）：若本次自动加载了 SOP，则将结局写回
+                            // times_executed/succeeded/failed，驱动 Q/R/U 学习与周期 GC。
+                            if let Some(id) = active_sop_id.take() {
+                                let success = !run_has_error;
+                                let tc = run_tool_calls;
+                                let dur = run_started.elapsed().as_secs().min(u32::MAX as u64) as u32;
+                                let ws = workspace_dir.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::sop::record_result(&ws, &id, success, tc, dur) {
+                                        warn!("[sop] record_result: {}", e);
+                                    }
+                                });
+                                sop_gc_counter += 1;
+                                if sop_gc_counter % 25 == 0 {
+                                    let ws2 = workspace_dir.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(n) = crate::sop::gc_sops(&ws2) {
+                                            info!("[sop] GC removed {} low-value/proven-bad SOP(s)", n);
+                                        }
+                                    });
+                                }
+                            }
                             if content.len() < 100 {
                                 info!("[session:{}] Short response content: {}", session_id, content);
                             }
@@ -1759,6 +1919,21 @@ impl Agent for LlmAgent {
                                             &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, event_log.as_mut(),
                                         ).await;
                                         history.push(msg);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── SOP 结果记录（A1）──
+                        // 统计本轮工具调用数，并从本轮 tool 结果中探测错误/被拒信号。
+                        run_tool_calls += tool_calls.len() as u32;
+                        if !run_has_error {
+                            for m in &history[hist_start..] {
+                                if let Some(t) = m.content_as_text() {
+                                    let tl = t.to_lowercase();
+                                    if tl.contains("error") || tl.contains("denied") || tl.contains("failed") {
+                                        run_has_error = true;
+                                        break;
                                     }
                                 }
                             }
@@ -2708,7 +2883,7 @@ fn generate_static_summary(history: &[ChatMessage], iterations: usize) -> String
 /// Layered-routing core (no `self`, unit-testable). When a task-matched SKILL is already
 /// driving this turn, do NOT inject a competing SOP (the skill wins). Otherwise match SOP
 /// tags and replay the best one.
-fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -> Option<String> {
+fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -> Option<(String, String)> {
     if task_skill_active {
         return None;
     }
@@ -2727,18 +2902,71 @@ fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -
     let now = crate::sop::now_secs();
     let best = crate::sop::select_best(&candidates, now, 12000)?;
     let ctx = crate::sop::format_sop_context(&best);
-    Some(format!(
-        "\n\n## Guided SOP (auto-matched — replay this verified procedure)\n\
-         A stored SOP matches this task. Follow its Phases in order instead of re-deriving \
-         the procedure; only deviate where current conditions differ. After completing, note \
-         any observed deviation/success so the SOP can be refined.\n\n{}",
-        ctx
+    Some((
+        format!(
+            "\n\n## Guided SOP (auto-matched — replay this verified procedure)\n\
+             A stored SOP matches this task. Follow its Phases in order instead of re-deriving \
+             the procedure; only deviate where current conditions differ. After completing, note \
+             any observed deviation/success so the SOP can be refined.\n\n{}",
+            ctx
+        ),
+        best.id.clone(),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hist_tokens(h: &[ChatMessage]) -> usize {
+        h.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("") )).sum()
+    }
+
+    /// 有限脑 §12.6：价值导向裁剪必须把不可再生证据降级为「指针」并保留哈希/路径，
+    /// 而可再生的旧 chatter 才被激进压缩；最近 6 条永不触碰。
+    #[test]
+    fn value_trim_protects_evidence() {
+        let hash = "a".repeat(64);
+        let evidence = format!("Process list dump C:\\ir\\mem.raw {} {}", hash, "x".repeat(600));
+        let mut history: Vec<ChatMessage> = Vec::new();
+        // 6 条旧消息：一条 ir_ 证据工具结果 + 可再生的 assistant chatter
+        history.push(ChatMessage::tool_result("c1", "ir_scan", &evidence));
+        for _ in 0..5 {
+            history.push(ChatMessage::assistant(&"filler chatter ".repeat(60)));
+        }
+        // 6 条最近消息（应受保护）
+        for i in 0..6 {
+            history.push(ChatMessage::assistant(&format!("recent {}", i)));
+        }
+        let before = hist_tokens(&history);
+        let budget = before / 3; // 强制激进裁剪
+        trim_history_by_value(&mut history, budget);
+
+        // 证据以指针形式存活，路径与哈希均保留
+        let ev_text = history[0].content_as_text().unwrap();
+        assert!(ev_text.contains("C:\\ir\\mem.raw"), "evidence file path must survive: {}", ev_text);
+        assert!(ev_text.contains(&hash), "evidence hash must survive: {}", ev_text);
+        assert!(ev_text.contains("pointer"), "evidence should degrade to pointer, not be elided: {}", ev_text);
+        // 最近消息未被触碰
+        assert_eq!(history[history.len() - 1].content_as_text().unwrap(), "recent 5");
+        // 总体降到预算以内
+        let after = hist_tokens(&history);
+        assert!(after <= budget, "after {} should be <= budget {}", after, budget);
+    }
+
+    /// 有限脑 §12.6：无需裁剪时不改变任何消息。
+    #[test]
+    fn value_trim_noop_under_budget() {
+        let mut history: Vec<ChatMessage> = Vec::new();
+        for i in 0..4 {
+            history.push(ChatMessage::assistant(&format!("short {}", i)));
+        }
+        let snapshot: Vec<Option<Value>> = history.iter().map(|m| m.content.clone()).collect();
+        trim_history_by_value(&mut history, usize::MAX);
+        for (i, m) in history.iter().enumerate() {
+            assert_eq!(m.content, snapshot[i], "message {} must be untouched when under budget", i);
+        }
+    }
 
     fn tmp_ws(tag: &str) -> String {
         let dir = std::env::temp_dir().join(format!("rustagent_llm_todo_{}_{}", tag, std::process::id()));
@@ -2875,7 +3103,7 @@ mod tests {
 
         let task = "please cleanup temp dir and remove leftover files";
         // No task-matched SKILL driving the turn → SOP is replayed.
-        let reminded = sop_reminder_for(task, false, &ws)
+        let (reminded, _sop_id) = sop_reminder_for(task, false, &ws)
             .expect("SOP should replay when no skill is active");
         assert!(reminded.contains("Phase 3"), "expected 3 phases, got: {}", reminded);
         // A task-matched SKILL driving the turn → SOP is fully suppressed (layered routing).

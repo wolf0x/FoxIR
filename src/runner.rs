@@ -36,6 +36,8 @@ pub struct Runner {
     trim_redundant_tool_calls: Arc<AtomicBool>,
     knowledge_pre_retrieval: Arc<AtomicBool>,
     sop_replay: Arc<AtomicBool>,
+    budget_dashboard: Arc<AtomicBool>,
+    budget_sink: Option<std::sync::Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>>,
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
     skill_listing_strategy: Arc<AtomicUsize>,
@@ -53,6 +55,8 @@ pub struct RunnerBuilder {
     checkpointer: Option<ATaskCheckpointer>,
     knowledge_pre_retrieval: Arc<AtomicBool>,
     sop_replay: Arc<AtomicBool>,
+    budget_dashboard: Arc<AtomicBool>,
+    budget_sink: Option<std::sync::Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>>,
     trim_redundant_tool_calls: Arc<AtomicBool>,
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
@@ -73,6 +77,8 @@ impl RunnerBuilder {
             trim_redundant_tool_calls: Arc::new(AtomicBool::new(true)),
             knowledge_pre_retrieval: Arc::new(AtomicBool::new(true)),
             sop_replay: Arc::new(AtomicBool::new(true)),
+            budget_dashboard: Arc::new(AtomicBool::new(true)),
+            budget_sink: None,
             enable_context_scaling: Arc::new(AtomicBool::new(true)),
             max_inline_chars: Arc::new(AtomicUsize::new(120_000)),
             skill_listing_strategy: Arc::new(AtomicUsize::new(0)),
@@ -118,6 +124,14 @@ impl RunnerBuilder {
     }
     pub fn sop_replay(mut self, v: Arc<AtomicBool>) -> Self {
         self.sop_replay = v;
+        self
+    }
+    pub fn budget_dashboard(mut self, v: Arc<AtomicBool>) -> Self {
+        self.budget_dashboard = v;
+        self
+    }
+    pub fn budget_sink(mut self, v: Option<std::sync::Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>>) -> Self {
+        self.budget_sink = v;
         self
     }
 
@@ -167,6 +181,8 @@ impl RunnerBuilder {
             trim_redundant_tool_calls: self.trim_redundant_tool_calls,
             knowledge_pre_retrieval: self.knowledge_pre_retrieval,
             sop_replay: self.sop_replay,
+            budget_dashboard: self.budget_dashboard,
+            budget_sink: self.budget_sink,
             enable_context_scaling: self.enable_context_scaling,
             max_inline_chars: self.max_inline_chars,
             skill_listing_strategy: self.skill_listing_strategy,
@@ -228,6 +244,8 @@ impl Runner {
          .with_trim_redundant_tool_calls(self.trim_redundant_tool_calls.load(Ordering::SeqCst))
          .with_knowledge_pre_retrieval(self.knowledge_pre_retrieval.load(Ordering::SeqCst))
          .with_sop_replay(self.sop_replay.load(Ordering::SeqCst))
+.with_budget_dashboard(self.budget_dashboard.load(Ordering::SeqCst))
+.with_budget_sink(self.budget_sink.clone())
          .with_context_window(context_window)
          .with_context_window_threshold(context_window_threshold)
          .with_enable_context_scaling(self.enable_context_scaling.load(Ordering::SeqCst))
@@ -298,6 +316,8 @@ impl Runner {
             .with_trim_redundant_tool_calls(self.trim_redundant_tool_calls.load(Ordering::SeqCst))
             .with_knowledge_pre_retrieval(self.knowledge_pre_retrieval.load(Ordering::SeqCst))
             .with_sop_replay(self.sop_replay.load(Ordering::SeqCst))
+.with_budget_dashboard(self.budget_dashboard.load(Ordering::SeqCst))
+.with_budget_sink(self.budget_sink.clone())
             .with_context_window(params.context_window)
             .with_context_window_threshold(params.context_window_threshold)
             .with_enable_context_scaling(self.enable_context_scaling.load(Ordering::SeqCst))

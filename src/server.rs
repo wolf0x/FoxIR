@@ -156,6 +156,10 @@ pub struct AppState {
     pub knowledge_pre_retrieval: Arc<AtomicBool>,
     /// 独立 SOP 回放开关（默认开；与 knowledge_pre_retrieval 解耦）。
     pub sop_replay: Arc<AtomicBool>,
+    /// 统一上下文预算仪表盘（有限脑）开关（默认开）。
+    pub budget_dashboard: Arc<AtomicBool>,
+    /// 有限脑实测预算快照：agent 每次组装上下文时写入，`/api/budget` 读取。
+    pub context_budget: Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>,
     /// 发生过 task-matched SKILL 驱动的会话集合（SOP 蒸馏门控）。
     pub skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// 双层记忆（深层 + 浅层）注入开关（默认开）。
@@ -267,6 +271,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/history", get(history_handler))
         .route("/api/usage", get(usage_handler))
         .route("/api/usage/today", get(usage_today_handler))
+        .route("/api/budget", get(budget_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/tools/{name}/toggle", post(tools_toggle_handler))
         .route("/api/tools/{name}/description", post(tools_desc_handler))
@@ -770,6 +775,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "trim_redundant_tool_calls": state.trim_redundant_tool_calls.load(Ordering::SeqCst),
         "knowledge_pre_retrieval": state.knowledge_pre_retrieval.load(Ordering::SeqCst),
         "sop_replay": state.sop_replay.load(Ordering::SeqCst),
+        "budget_dashboard": state.budget_dashboard.load(Ordering::SeqCst),
         "two_tier_memory": state.two_tier_memory.load(Ordering::SeqCst),
         "enable_context_scaling": state.enable_context_scaling.load(Ordering::SeqCst),
         "max_inline_chars": state.max_inline_chars.load(Ordering::SeqCst),
@@ -1512,15 +1518,41 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             // 双层记忆（深层 + 浅层）：开启时注入常驻深层永久块与弹性浅层块。
                             // 两者均为纯读取；默认开启。
                             if state.two_tier_memory.load(Ordering::SeqCst) {
-                                let (eg_block, _eg_tok) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+                                // 有限脑仲裁（Phase B）：把深层永久块与弹性浅层块收敛为一次
+                                // `context_arbiter::assemble` —— 统一按价值排序、共享预算、降级不丢。
+                                // 预算取「当前两块实际占用 + 安全余量」（下限 2048 token），大窗口下
+                                // 通常不触发降级（行为近等价），小窗口下按价值优雅降级而不静默消失。
+                                let (eg_block, eg_tok) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+                                let (lam_block, lam_tok, lam_hashes) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
+                                let mut arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
                                 if !eg_block.trim().is_empty() {
                                     info!("注入深层永久块 ({} chars)", eg_block.len());
-                                    history.insert(0, ChatMessage::system(&eg_block));
+                                    arts.push(crate::context_arbiter::artifact_from_block(
+                                        crate::context_arbiter::ArtifactKind::DeepFact,
+                                        "global", 60.0, 0.6, true, eg_block,
+                                    ));
                                 }
-                                let (lam_block, _lam_tok) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
                                 if !lam_block.trim().is_empty() {
                                     info!("注入浅层记忆块 ({} chars)", lam_block.len());
-                                    history.insert(0, ChatMessage::system(&lam_block));
+                                    arts.push(crate::context_arbiter::artifact_from_block(
+                                        crate::context_arbiter::ArtifactKind::ShallowMemory,
+                                        "shallow", 50.0, 1.0, false, lam_block,
+                                    ));
+                                }
+                                let mem_budget = (eg_tok + lam_tok + 512).max(2048);
+                                let res = crate::context_arbiter::assemble(&mut arts, mem_budget, 0);
+                                for block in &res.blocks {
+                                    if !block.trim().is_empty() {
+                                        history.insert(0, ChatMessage::system(block));
+                                    }
+                                }
+                                info!("有限脑仲裁：记忆产物装入 {} blocks / {} tokens (预算 {})", res.blocks.len(), res.used, mem_budget);
+                                // 召回触达（A2）：对本次实际注入的浅层记忆写回 last_accessed/
+                                // access_count/recall_boost，让 R/U 随真实使用学习；一次批量 UPDATE。
+                                if !lam_hashes.is_empty() {
+                                    if let Ok(touched) = state.memory_store.shallow_touch_batch(&lam_hashes) {
+                                        info!("浅层记忆召回触达 {} 条", touched);
+                                    }
                                 }
                             }
 
@@ -2478,6 +2510,9 @@ async fn agent_settings_save_handler(
     let two_tier_memory = body.get("two_tier_memory")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.two_tier_memory.load(Ordering::SeqCst));
+    let budget_dashboard = body.get("budget_dashboard")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.budget_dashboard.load(Ordering::SeqCst));
     let enable_context_scaling = body.get("enable_context_scaling")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.enable_context_scaling.load(Ordering::SeqCst));
@@ -2514,6 +2549,7 @@ async fn agent_settings_save_handler(
         trim_redundant_tool_calls,
         knowledge_pre_retrieval,
         two_tier_memory,
+        budget_dashboard,
         enable_context_scaling,
         max_inline_chars,
         skill_listing_strategy.as_str().to_string(),
@@ -2532,6 +2568,7 @@ async fn agent_settings_save_handler(
             state.knowledge_pre_retrieval.store(knowledge_pre_retrieval, Ordering::SeqCst);
             state.sop_replay.store(sop_replay, Ordering::SeqCst);
         state.two_tier_memory.store(two_tier_memory, Ordering::SeqCst);
+        state.budget_dashboard.store(budget_dashboard, Ordering::SeqCst);
             state.enable_context_scaling.store(enable_context_scaling, Ordering::SeqCst);
             state.max_inline_chars.store(max_inline_chars, Ordering::SeqCst);
             state.skill_listing_strategy.store(skill_listing_strategy.index(), Ordering::SeqCst);
@@ -2552,6 +2589,7 @@ async fn agent_settings_save_handler(
                 "knowledge_pre_retrieval": knowledge_pre_retrieval,
                 "sop_replay": sop_replay,
                 "two_tier_memory": two_tier_memory,
+                "budget_dashboard": budget_dashboard,
                 "enable_context_scaling": enable_context_scaling,
                 "max_inline_chars": max_inline_chars,
                 "skill_listing_strategy": skill_listing_strategy.as_str().to_string(),
@@ -2860,6 +2898,47 @@ async fn usage_today_handler(
         Ok(data) => Json(data),
         Err(e) => Json(json!({ "error": e })),
     }
+}
+
+/// 统一上下文预算（Finite Brain）仪表盘数据：返回窗口 / 预留 / 占用 / 剩余
+/// 及各用途的估算分配，供 Dashboard 页的「有限脑预算」视图渲染。
+async fn budget_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let enabled = state.budget_dashboard.load(Ordering::SeqCst);
+    let threshold = state.context_window_threshold.load(Ordering::SeqCst).max(1).min(100);
+
+    // 优先显示 agent 每次真正组装上下文时写入的实测快照（与系统提示同源）。
+    let snap = state.context_budget.lock().unwrap().clone();
+    let latest = snap.is_some();
+
+    let report = match snap {
+        Some(r) => r,
+        None => {
+            // 尚无会话：显示配置包络（window / reserve，used=0）。
+            let window = {
+                let model_configs = state.model_configs.read().await;
+                model_configs.iter().map(|m| m.context_window).max().unwrap_or(128_000)
+            };
+            let reserve = window / 10 + window / 50;
+            crate::context_arbiter::budget_report(window, reserve, &[])
+        }
+    };
+
+    let max_history = report.window * threshold / 100;
+    let lines: Vec<Value> = report.lines.iter()
+        .map(|l| json!({ "category": l.category, "tokens": l.tokens }))
+        .collect();
+
+    Json(json!({
+        "enabled": enabled,
+        "window_threshold_pct": threshold,
+        "max_history_budget": max_history,
+        "window": report.window,
+        "reserve": report.reserve,
+        "used": report.used,
+        "free": report.free,
+        "latest": latest,
+        "lines": lines,
+    }))
 }
 
 

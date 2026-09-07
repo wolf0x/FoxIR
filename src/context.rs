@@ -219,6 +219,10 @@ pub struct InvocationContext {
     /// Independent SOP replay switch (default on). Unlike knowledge_pre_retrieval,
     /// toggling knowledge off does not disable SOP replay.
     pub sop_replay: bool,
+    pub budget_dashboard: bool,
+    /// Shared budget snapshot sink: the agent writes its real measured context
+    /// budget here each build; `/api/budget` reads it for the Dashboard page.
+    pub budget_sink: Option<std::sync::Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>>,
     /// Model context window size in tokens
     pub context_window: usize,
     /// Context usage threshold percentage (e.g. 80 = trim at 80%)
@@ -289,6 +293,8 @@ impl InvocationContext {
             trim_redundant_tool_calls: false, // Off by default; opt in via Settings to avoid dropping legitimate follow-up tool calls
             knowledge_pre_retrieval: true,
             sop_replay: true,
+            budget_dashboard: true,
+            budget_sink: None,
             context_window: 128000,
             context_window_threshold: 80,
             enable_context_scaling: true,
@@ -362,6 +368,19 @@ impl InvocationContext {
     /// Independently enable/disable SOP replay.
     pub fn with_sop_replay(mut self, v: bool) -> Self {
         self.sop_replay = v;
+        self
+    }
+
+    /// Enable/disable the unified context budget (Finite Brain) dashboard: when
+    /// on, the agent's system prompt carries a CONTEXT BUDGET self-awareness block.
+    pub fn with_budget_dashboard(mut self, v: bool) -> Self {
+        self.budget_dashboard = v;
+        self
+    }
+
+    /// Set the shared budget snapshot sink (writes location for measured reports).
+    pub fn with_budget_sink(mut self, v: Option<std::sync::Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>>) -> Self {
+        self.budget_sink = v;
         self
     }
 

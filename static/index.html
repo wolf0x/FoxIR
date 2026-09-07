@@ -875,7 +875,18 @@ input:checked+.slider:before{transform:translateX(20px)}
               <input type="checkbox" id="twoTierInput" onchange="saveAgentSettings()">
               <span class="slider"></span>
             </label>
-          </div>          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+          </div>
+          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <label style="margin-bottom:0">&#129504; 统一上下文预算仪表盘</label>
+              <small style="color:var(--t3)">在系统提示注入 CONTEXT BUDGET 自省块，并在 Dashboard 页展示有限脑预算分配（默认开）</small>
+            </div>
+            <label class="perm-toggle">
+              <input type="checkbox" id="budgetDashboardInput" onchange="saveAgentSettings()">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
             <div>
               <label style="margin-bottom:0">&#128421; Computer Use (GUI Control)</label>
               <small style="color:var(--t3)">Enable screenshot, mouse, keyboard, window management tools</small>
@@ -1213,6 +1224,21 @@ input:checked+.slider:before{transform:translateX(20px)}
               <div class="posture-label">API Calls</div>
             </div>
           </div>
+        </div>
+
+        <!-- Finite Brain Context Budget -->
+        <div class="dash-section">
+          <div class="dash-section-header">
+            <h3>&#129504; 有限脑预算 <span style="font-weight:400;font-size:12px">Context Budget</span></h3>
+            <span class="dash-last-scan" id="budgetState">-</span>
+          </div>
+          <div class="posture-cards" id="budgetCards">
+            <div class="posture-card total"><div class="posture-number" id="budgetWindow">-</div><div class="posture-label">Window</div></div>
+            <div class="posture-card input"><div class="posture-number" id="budgetReserve">-</div><div class="posture-label">Reserve</div></div>
+            <div class="posture-card output"><div class="posture-number" id="budgetUsed">-</div><div class="posture-label">Used</div></div>
+            <div class="posture-card calls"><div class="posture-number" id="budgetFree">-</div><div class="posture-label">Free</div></div>
+          </div>
+          <div id="budgetLines" class="token-table" style="margin-top:10px"></div>
         </div>
 
         <!-- Quick Actions (Dashboard only, editable) -->
@@ -2298,6 +2324,7 @@ async function loadModels(){
     if(typeof d.knowledge_pre_retrieval==='boolean') document.getElementById('knowledgePreInput').checked=d.knowledge_pre_retrieval;
     if(typeof d.sop_replay==='boolean') document.getElementById('sopReplayInput').checked=d.sop_replay;
     if(typeof d.two_tier_memory==='boolean') document.getElementById('twoTierInput').checked=d.two_tier_memory;
+    if(typeof d.budget_dashboard==='boolean') document.getElementById('budgetDashboardInput').checked=d.budget_dashboard;
     if(typeof d.enable_context_scaling==='boolean') document.getElementById('inlineScalingInput').checked=d.enable_context_scaling;
     if(d.max_inline_chars !== undefined) document.getElementById('maxInlineCharsInput').value = d.max_inline_chars;
     if(d.max_tool_retries !== undefined) document.getElementById('toolMaxRetriesInput').value = d.max_tool_retries;
@@ -3280,6 +3307,7 @@ function saveAgentSettings(){
     knowledge_pre_retrieval:knowledgePreRetrieval,
     sop_replay:sopReplay,
     two_tier_memory:document.getElementById('twoTierInput').checked,
+    budget_dashboard:document.getElementById('budgetDashboardInput').checked,
     enable_context_scaling:enableContextScaling,
     max_inline_chars:maxInlineChars
   })})
@@ -3554,6 +3582,7 @@ async function loadDashboard(){
   loadSystemStatus();
   loadTodayUsage();
   loadTokenUsage();
+  loadBudget();
   // Start periodic refresh for uptime
   if(dashRefreshTimer)clearInterval(dashRefreshTimer);
   dashRefreshTimer=setInterval(()=>{
@@ -3604,6 +3633,36 @@ async function loadTodayUsage(){
   }catch(e){}
 }
 
+
+function fmtToks(n){
+  n=Number(n)||0;
+  if(n>=1000000) return (n/1000000).toFixed(1)+'M';
+  if(n>=1000) return (n/1000).toFixed(1)+'k';
+  return String(n);
+}
+
+async function loadBudget(){
+  try{
+    const r=await fetch('/api/budget');
+    const d=await r.json();
+    const st=document.getElementById('budgetState');
+    if(st) st.textContent = d.enabled ? 'Enabled' : 'Off';
+    const set=(id,v)=>{const el=document.getElementById(id); if(el) el.textContent=fmtToks(v)};
+    set('budgetWindow',d.window); set('budgetReserve',d.reserve);
+    set('budgetUsed',d.used); set('budgetFree',d.free);
+    const wrap=document.getElementById('budgetLines');
+    if(!wrap) return;
+    if(d.latest){
+      const rows=(d.lines||[]).map(l=>'<tr><td>'+esc(l.category||'')+'</td><td>'+fmtToks(l.tokens||0)+'</td></tr>').join('');
+      wrap.innerHTML='<table style="width:100%"><thead><tr><th>类别</th><th>实测 Tokens</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    } else {
+      wrap.innerHTML='<div style="color:var(--t3)">尚无会话记录 — 显示配置包络。执行一次任务后此处将展示最近一次实测占用。</div>';
+    }
+  }catch(e){
+    const wrap=document.getElementById('budgetLines');
+    if(wrap) wrap.innerHTML='<div style="color:#e74c3c">Budget data unavailable</div>';
+  }
+}
 
 // Quick Actions catalog
 // Quick Actions (Dashboard only, editable; no sidebar nav / no checkboxes)

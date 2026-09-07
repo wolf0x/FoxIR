@@ -1171,6 +1171,23 @@ impl MemoryStore {
         Ok(serde_json::Value::Array(result))
     }
 
+    /// Return the most recent request's prompt token count — a proxy for how full
+    /// the context window currently is. None when no usage has been recorded yet.
+    pub fn get_last_prompt_tokens(&self) -> Result<Option<u64>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT prompt_tokens FROM usage_stats ORDER BY id DESC LIMIT 1"
+        ).map_err(|e| format!("Failed to prepare usage query: {}", e))?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("Failed to query usage: {}", e))?;
+        if let Some(row) = rows.next() {
+            let v = row.map_err(|e| format!("Row error: {}", e))?;
+            Ok(Some(v.max(0) as u64))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get today's total token usage summary.
     pub fn get_today_usage(&self) -> Result<serde_json::Value, String> {
         let conn = self.conn.lock().unwrap();
@@ -1405,6 +1422,62 @@ impl MemoryStore {
         .map_err(|e| format!("shallow_touch: {e}"))?;
         Ok(())
     }
+    /// 批量召回触达：对本次实际注入的浅层记忆一次性刷新
+    /// last_accessed / access_count(+1) / recall_boost(+0.3, cap 2.0)。
+    pub fn shallow_touch_batch(&self, hashes: &[String]) -> Result<usize, String> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = crate::shallow_memory::now_secs();
+        let placeholders = vec!["?"; hashes.len()].join(",");
+        let sql = format!(
+            "UPDATE shallow_memories
+             SET last_accessed = ?1, access_count = access_count + 1,
+                 recall_boost = MIN(recall_boost + 0.3, 2.0)
+             WHERE hash IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("shallow_touch_batch prepare: {e}"))?;
+        let now_i64: i64 = now as i64;
+        let mut named: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hashes.len() + 1);
+        named.push(&now_i64);
+        for h in hashes {
+            named.push(h);
+        }
+        let n = stmt
+            .execute(rusqlite::params_from_iter(named))
+            .map_err(|e| format!("shallow_touch_batch: {e}"))?;
+        Ok(n)
+    }
+
+    /// 深度事实召回触达：刷新 last_accessed。仅在显式使用/召回时调用，
+    /// 保留时间退火遗忘（不随每次自动注入刷新，避免常驻块永不降级）。
+    pub fn deep_touch(&self, ids: &[String]) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = crate::shallow_memory::now_secs();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "UPDATE deep_facts SET last_accessed = ?1 WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("deep_touch prepare: {e}"))?;
+        let now_i64: i64 = now as i64;
+        let mut named: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        named.push(&now_i64);
+        for s in ids {
+            named.push(s);
+        }
+        let n = stmt
+            .execute(rusqlite::params_from_iter(named))
+            .map_err(|e| format!("deep_touch: {e}"))?;
+        Ok(n)
+    }
 
     /// FTS5 BM25 搜索，返回 (hash, rank)。rank 为负、越小越相关。
     pub fn shallow_fts_search(&self, query: &str, limit: usize) -> Result<Vec<(String, f64)>, String> {
@@ -1558,14 +1631,14 @@ impl MemoryStore {
         budget: usize,
         max_budget: usize,
         decay_rate: f32,
-    ) -> (String, usize) {
+    ) -> (String, usize, Vec<String>) {
         let now = crate::shallow_memory::now_secs();
         let candidates = match self.shallow_query_candidates(500) {
             Ok(c) => c,
-            Err(_) => return (String::new(), 0),
+            Err(_) => return (String::new(), 0, Vec::new()),
         };
         if candidates.is_empty() {
-            return (String::new(), 0);
+            return (String::new(), 0, Vec::new());
         }
         let fts_rank = match self.shallow_fts_search(query, 20) {
             Ok(r) => r.into_iter().collect::<std::collections::HashMap<String, f64>>(),

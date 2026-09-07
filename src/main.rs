@@ -14,6 +14,7 @@ mod context;
 mod error;
 mod deep_memory;
 mod shallow_memory;
+mod context_arbiter;
 mod event_log;
 mod external_tools;
 mod heartbeat;
@@ -506,6 +507,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-turn knowledge pre-retrieval pointer injection (Settings toggle).
     let knowledge_pre_retrieval = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.knowledge_pre_retrieval));
     // 双层记忆（深层 + 浅层）注入开关（Settings，默认开）。
+    // 统一上下文预算仪表盘（有限脑）开关（Settings，默认开）。
+    let budget_dashboard = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.budget_dashboard));
+    // Finite Brain 实测预算快照：agent 每次建上下文时写入，`/api/budget` 读取。
+    let context_budget = Arc::new(std::sync::Mutex::new(None::<crate::context_arbiter::BudgetReport>));
     let two_tier_memory = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.two_tier_memory));
 
     // Shared hot-reloadable settings for context-scaled inline result caps. Mirrored
@@ -530,6 +535,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .trim_redundant_tool_calls(trim_redundant_tool_calls.clone())
         .knowledge_pre_retrieval(knowledge_pre_retrieval.clone())
         .sop_replay(sop_replay.clone())
+        .budget_dashboard(budget_dashboard.clone())
+        .budget_sink(Some(context_budget.clone()))
         .enable_context_scaling(enable_context_scaling.clone())
         .max_inline_chars(max_inline_chars.clone())
         .skill_listing_strategy(skill_listing_strategy.clone())
@@ -693,6 +700,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sop_replay: sop_replay.clone(),
         skill_used_sessions: skill_used_sessions.clone(),
         two_tier_memory: two_tier_memory.clone(),
+        budget_dashboard: budget_dashboard.clone(),
+        context_budget: context_budget.clone(),
         enable_context_scaling: enable_context_scaling.clone(),
         max_inline_chars: max_inline_chars.clone(),
         skill_listing_strategy: skill_listing_strategy.clone(),

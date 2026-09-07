@@ -230,9 +230,9 @@ pub fn assemble(
     cool: f32,
     decay_rate: f32,
     now: u64,
-) -> (String, usize) {
+) -> (String, usize, Vec<String>) {
     if budget < MIN_ENTRY_TOKENS || entries.is_empty() {
-        return (String::new(), 0);
+        return (String::new(), 0, Vec::new());
     }
     let thresholds = effective_thresholds(budget, max_budget, hot, warm, cool);
 
@@ -273,6 +273,7 @@ pub fn assemble(
 
     let mut output = String::from(header);
     let mut packed_count = 0usize;
+    let mut packed_hashes: Vec<String> = Vec::new();
 
     // explicit_save 优先，恒以最低保真兜底
     for (fidelity, _value, entry) in scored.iter().filter(|(_, _, e)| e.explicit_save) {
@@ -286,6 +287,7 @@ pub fn assemble(
         output.push_str(&text);
         remaining -= cost;
         packed_count += 1;
+        packed_hashes.push(entry.hash.clone());
     }
     // 其余按分数
     for (fidelity, _value, entry) in &scored {
@@ -302,14 +304,15 @@ pub fn assemble(
         output.push_str(&text);
         remaining -= cost;
         packed_count += 1;
+        packed_hashes.push(entry.hash.clone());
     }
 
     if packed_count == 0 {
-        return (String::new(), 0);
+        return (String::new(), 0, Vec::new());
     }
     output.push_str(footer);
     let total_cost = estimate_tokens(&output);
-    (output, total_cost)
+    (output, total_cost, packed_hashes)
 }
 
 

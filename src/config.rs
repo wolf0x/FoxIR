@@ -43,6 +43,10 @@ pub struct AgentConfig {
     /// 双层记忆（深层 + 浅层）注入开关。默认开。
     #[serde(default = "default_two_tier_memory")]
     pub two_tier_memory: bool,
+    /// 统一上下文预算仪表盘（有限脑）开关：系统提示注入 CONTEXT BUDGET，
+    /// 并在 Dashboard 页显示预算分配。默认开。
+    #[serde(default = "default_budget_dashboard")]
+    pub budget_dashboard: bool,
     /// Context window usage threshold percentage (default: 80 = trim at 80% of model context)
     #[serde(default = "default_context_window_threshold")]
     pub context_window_threshold: usize,
@@ -219,6 +223,7 @@ impl Default for Config {
                 knowledge_pre_retrieval: default_knowledge_pre_retrieval(),
                 sop_replay: default_sop_replay(),
                 two_tier_memory: default_two_tier_memory(),
+                budget_dashboard: default_budget_dashboard(),
                 context_window_threshold: default_context_window_threshold(),
                 enable_context_scaling: default_enable_context_scaling(),
                 max_inline_chars: default_max_inline_chars(),
@@ -264,6 +269,7 @@ fn default_trim_redundant_tool_calls() -> bool { false }
 fn default_knowledge_pre_retrieval() -> bool { true }
 fn default_sop_replay() -> bool { true }
 fn default_two_tier_memory() -> bool { true }
+fn default_budget_dashboard() -> bool { true }
 fn default_context_window() -> usize { 128000 }
 fn default_context_window_threshold() -> usize { 80 }
 fn default_enable_context_scaling() -> bool { true }
@@ -440,6 +446,7 @@ rabbit_hole_threshold = 5
 trim_redundant_tool_calls = false  # Off by default (see fn default_trim_redundant_tool_calls)
 knowledge_pre_retrieval = true   # per-turn knowledge pointer pre-injection (default on)
 sop_replay = true                # independent SOP replay (default on)
+budget_dashboard = true          # unified context budget dashboard (default on)
 context_window_threshold = 80
 # Raise per-tool inline caps with the model's context window (default: true)
 enable_context_scaling = true
@@ -504,6 +511,7 @@ timezone_offset = 8
         trim_redundant_tool_calls: bool,
         knowledge_pre_retrieval: bool,
         two_tier_memory: bool,
+        budget_dashboard: bool,
         enable_context_scaling: bool,
         max_inline_chars: usize,
         skill_listing_strategy: String,
@@ -523,6 +531,7 @@ timezone_offset = 8
         config.agent.trim_redundant_tool_calls = trim_redundant_tool_calls;
         config.agent.knowledge_pre_retrieval = knowledge_pre_retrieval;
         config.agent.two_tier_memory = two_tier_memory;
+        config.agent.budget_dashboard = budget_dashboard;
         config.agent.enable_context_scaling = enable_context_scaling;
         config.agent.max_inline_chars = max_inline_chars;
         config.agent.skill_listing_strategy = skill_listing_strategy;
