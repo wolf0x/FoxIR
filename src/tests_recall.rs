@@ -109,7 +109,7 @@ fn deep_permanent_recall_rate() {
     for i in 0..5  { s.deep_store(&mk(&format!("l{}", i), &format!("low importance noisy fact {}", i), 1.0, PinnedBy::None)).unwrap(); }
 
     // 大预算常驻块
-    let (block, _) = s.deep_permanent_block("global", 200000, 60.0);
+    let (block, _, _) = s.deep_permanent_block("global", 200000, 60.0);
     let visible_hit = ["pinned durable fact number", "high importance fact number"].iter().map(|prefix| {
         (0..if *prefix == "pinned durable fact number" { 20 } else { 10 })
             .filter(|i| block.contains(&format!("{} {}", prefix, i))).count()
@@ -151,7 +151,7 @@ fn two_tier_composite_recall() {
         };
         s.deep_store(&f).unwrap();
         total += 1;
-        let (block, _) = s.deep_permanent_block("global", 5000, 60.0);
+        let (block, _, _) = s.deep_permanent_block("global", 5000, 60.0);
         if block.contains(&format!("ee{}", i)) { hit += 1; }
     }
     let rate = hit as f64 / total as f64;

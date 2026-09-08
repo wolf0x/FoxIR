@@ -1325,24 +1325,43 @@ impl Agent for LlmAgent {
                 }
                 true
             });
+            // ── 混合价值池（hybrid）：system/tools/deep/shallow/最近对话保底不进场；
+            //    auto-memory(SQLite) + knowledge + SOP 在单一池内按价值排序、共享预算、降级不丢。
+            let mut pool_arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
             if !memory_blocks.is_empty() {
-                effective_system_prompt.push_str("\n\n## Injected Memory From Local Store\n");
-                for block in &memory_blocks {
-                    effective_system_prompt.push_str("\n");
-                    effective_system_prompt.push_str(block);
-                    effective_system_prompt.push_str("\n");
-                }
+                let mem_text = memory_blocks.join("\n");
+                pool_arts.push(crate::context_arbiter::artifact_from_block(
+                    crate::context_arbiter::ArtifactKind::ShallowMemory, "auto-memory",
+                    70.0, 0.8, false, mem_text,
+                ));
             }
-
-            // ── Knowledge pre-retrieval (per user turn) ──
             if let Some(ref kblock) = knowledge_reminder {
                 info!("[session:{}] Injected knowledge pre-retrieval pointers", session_id);
-                effective_system_prompt.push_str(kblock);
+                pool_arts.push(crate::context_arbiter::artifact_from_block(
+                    crate::context_arbiter::ArtifactKind::Knowledge, "knowledge",
+                    55.0, 1.0, false, kblock.clone(),
+                ));
             }
-            // ── SOP replay (dynamic procedural knowledge) ──
             if let Some(ref sblock) = sop_reminder {
                 info!("[session:{}] Injected guided SOP replay", session_id);
-                effective_system_prompt.push_str(sblock);
+                pool_arts.push(crate::context_arbiter::artifact_from_block(
+                    crate::context_arbiter::ArtifactKind::Sop, "sop",
+                    45.0, 0.9, false, sblock.clone(),
+                ));
+            }
+            if !pool_arts.is_empty() {
+                // 池预算：保底受限的阈值窗口一小份，不会饿死对话/sytem/tools。
+                let pool_budget = (max_history_tokens / 8).min(12000).max(2048);
+                let res = crate::context_arbiter::assemble(&mut pool_arts, pool_budget, 0);
+                if !res.blocks.is_empty() {
+                    effective_system_prompt.push_str("\n\n## Context Guidance (value-ranked)\n");
+                    for b in &res.blocks {
+                        effective_system_prompt.push_str("\n");
+                        effective_system_prompt.push_str(b);
+                        effective_system_prompt.push('\n');
+                    }
+                    info!("[session:{}] Hybrid guidance pool: {} blocks / {} tokens (budget {})", session_id, res.blocks.len(), res.used, pool_budget);
+                }
             }
 
             // Account for system prompt size in the token budget.
@@ -1431,7 +1450,6 @@ impl Agent for LlmAgent {
             let run_started = std::time::Instant::now();
             let mut run_tool_calls: u32 = 0u32;
             let mut run_has_error = false;
-            let mut sop_gc_counter: u32 = 0u32;
 
             let start_iter = resume_iteration.unwrap_or(0);
             for iteration in start_iter..max_iter {
@@ -1677,15 +1695,6 @@ impl Agent for LlmAgent {
                                         warn!("[sop] record_result: {}", e);
                                     }
                                 });
-                                sop_gc_counter += 1;
-                                if sop_gc_counter % 25 == 0 {
-                                    let ws2 = workspace_dir.clone();
-                                    tokio::spawn(async move {
-                                        if let Ok(n) = crate::sop::gc_sops(&ws2) {
-                                            info!("[sop] GC removed {} low-value/proven-bad SOP(s)", n);
-                                        }
-                                    });
-                                }
                             }
                             if content.len() < 100 {
                                 info!("[session:{}] Short response content: {}", session_id, content);
@@ -1926,20 +1935,22 @@ impl Agent for LlmAgent {
 
                         // ── SOP 结果记录（A1）──
                         // 统计本轮工具调用数，并从本轮 tool 结果中探测错误/被拒信号。
+                        // ── SOP 结果记录（A1）──
+                        // 统计本轮工具调用数；C1：成功信号改为"结构化工具错误信封"判定，
+                        // 不再扫描正文里的 error/failed 子串（那是 IR/取证场景的领域数据）。
                         run_tool_calls += tool_calls.len() as u32;
                         if !run_has_error {
                             for m in &history[hist_start..] {
-                                if let Some(t) = m.content_as_text() {
-                                    let tl = t.to_lowercase();
-                                    if tl.contains("error") || tl.contains("denied") || tl.contains("failed") {
-                                        run_has_error = true;
-                                        break;
+                                if m.role == "tool" {
+                                    if let Some(t) = m.content_as_text() {
+                                        if is_structured_tool_error(&t) {
+                                            run_has_error = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
-
-                        // ── Automatic stall detection & self-heal (no human required) ──
                         // After tool execution, tracks repeated identical tool results and "no new
                         // state" windows. On stall it condenses duplicated results in history,
                         // injects an automatic strategy reconsideration, and (bounded) terminates
@@ -2883,6 +2894,44 @@ fn generate_static_summary(history: &[ChatMessage], iterations: usize) -> String
 /// Layered-routing core (no `self`, unit-testable). When a task-matched SKILL is already
 /// driving this turn, do NOT inject a competing SOP (the skill wins). Otherwise match SOP
 /// tags and replay the best one.
+/// C1：结构化工具错误判定 —— 只认工具执行返回的"错误信封"（JSON 顶层 error 键：
+/// 超时 / 中止 / panic / 未知工具 / 重试耗尽等硬失败），不扫正文里的 error/failed 子串
+/// （那些是 IR/取证场景的领域数据，会把成功流程误判为失败）。
+fn is_structured_tool_error(text: &str) -> bool {
+    use serde_json::Value;
+    let t = text.trim();
+    if !t.starts_with('{') {
+        return false;
+    }
+    match serde_json::from_str::<Value>(t) {
+        Ok(Value::Object(map)) => {
+            // D2（原 C1）：error 键任意类型（字符串/对象/数组/数字/布尔）都视为失败，
+            // 消除 `{"error":{...}}` / `{"error":[]}` 等对象型/数组型漏检。
+            if map.contains_key("error") {
+                return true;
+            }
+            // status == "error" / "failed"
+            if let Some(Value::String(s)) = map.get("status") {
+                let lo = s.to_ascii_lowercase();
+                if lo == "error" || lo == "failed" {
+                    return true;
+                }
+            }
+            // is_error == true
+            if map.get("is_error").and_then(Value::as_bool) == Some(true) {
+                return true;
+            }
+            // success / ok == false
+            for k in ["success", "ok"] {
+                if map.get(k).and_then(Value::as_bool) == Some(false) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
 fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -> Option<(String, String)> {
     if task_skill_active {
         return None;
@@ -2901,7 +2950,14 @@ fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -
     }
     let now = crate::sop::now_secs();
     let best = crate::sop::select_best(&candidates, now, 12000)?;
-    let ctx = crate::sop::format_sop_context(&best);
+    // H3：超限 SOP 降级为目录档渲染，不再静默丢弃。
+    let ctx = if best.rough_tokens() > 12000 / 4 {
+        crate::sop::format_sop_catalog(&best)
+    } else {
+        crate::sop::format_sop_context(&best)
+    };
+    crate::sop::bump_metric(workspace_dir, "replay_hits", 1);
+    info!("[sop] replay hit: matched SOP '{}' for task '{}'", best.name, q);
     Some((
         format!(
             "\n\n## Guided SOP (auto-matched — replay this verified procedure)\n\
@@ -3111,7 +3167,32 @@ mod tests {
             "SOP must not inject when a skill is in control");
         // Non-matching task → no replay.
         assert!(sop_reminder_for("do something unrelated entirely", false, &ws).is_none());
-    }}
+    }
+
+    #[test]
+    fn structured_tool_error_signal_ignores_domain_text() {
+        // C1：正文里出现 error/failed/denied 是 IR/取证领域的领域数据，不视为流程失败。
+        assert!(!is_structured_tool_error("collected 200 lines; failed logins: 12; error_count=0"));
+        assert!(!is_structured_tool_error("plain text output with DENIED in it"));
+        assert!(!is_structured_tool_error(r#"[not json] error"#));
+        // 只有结构化"错误信封"（JSON 顶层 error 键）才计为真实工具失败。
+        assert!(is_structured_tool_error(r#"{"error": "Tool execution timed out after 120s"}"#));
+        assert!(is_structured_tool_error(r#"{"error":"unknown tool: foo"}"#));
+        assert!(!is_structured_tool_error(r#"{"ok":true,"count":3}"#));
+        // D2：扩展识别——error 任意类型 / status=error / is_error=true / success=false。
+        assert!(is_structured_tool_error(r#"{"status":"error"}"#));
+        assert!(is_structured_tool_error(r#"{"status":"failed"}"#));
+        assert!(is_structured_tool_error(r#"{"is_error":true}"#));
+        assert!(is_structured_tool_error(r#"{"success":false}"#));
+        assert!(is_structured_tool_error(r#"{"ok":false}"#));
+        assert!(is_structured_tool_error(r#"{"error":{"code":7,"msg":"boom"}}"#));
+        assert!(is_structured_tool_error(r#"{"error":[]}"#));
+        // 反向：正常成功信封不应误判为失败。
+        assert!(!is_structured_tool_error(r#"{"status":"ok","count":3}"#));
+        assert!(!is_structured_tool_error(r#"{"success":true}"#));
+        assert!(!is_structured_tool_error(r#"{"is_error":false}"#));
+    }
+}
 
 
 

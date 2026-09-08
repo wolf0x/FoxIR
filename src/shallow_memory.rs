@@ -399,9 +399,12 @@ pub fn strip_memory_blocks(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// SHA-256 派生 hash（前 12 hex）。
-pub fn make_hash(session_id: &str, round: usize, now: u64) -> String {
-    let input = format!("{session_id}:{round}:{now}");
+/// SHA-256 派生 hash（前 12 hex），内容哈希：
+/// 以 (session_id + content) 为输入，同一会话存储相同内容得到相同 hash，
+/// 让 shallow_store 的 INSERT OR REPLACE（以 hash 为主键）能真正去重，
+/// 避免旧实现依赖 round/len+now 导致"同内容反复入多条"。
+pub fn make_hash(session_id: &str, content: &str) -> String {
+    let input = format!("{session_id}:{content}");
     let digest = Sha256::digest(input.as_bytes());
     // 取前 6 字节 = 12 hex
     digest[..6].iter().map(|b| format!("{b:02x}")).collect()

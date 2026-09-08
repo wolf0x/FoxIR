@@ -13,6 +13,7 @@ mod context;
 #[allow(dead_code)]
 mod error;
 mod deep_memory;
+mod memory_migrate;
 mod shallow_memory;
 mod context_arbiter;
 mod event_log;
@@ -443,6 +444,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("Memory store ready: {}", db_path.display());
 
+    // C2：启动时执行一次 SOP 垃圾回收（淘汰低价值/已证伪流程），避免随回放累积。
+    match crate::sop::gc_sops(&workspace_dir) {
+        Ok(n) if n > 0 => info!("[sop] startup GC removed {} low-value/proven-bad SOP(s)", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("[sop] startup GC failed: {}", e),
+    }
+
     // Clean up stale checkpoints (older than 24 hours) on startup
     let _ = memory_store.cleanup_stale_checkpoints(24);
 
@@ -613,7 +621,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut reg = shared_tools.write().await;
         reg.register(Arc::new(crate::tool::cron_manage::CronManageTool::new(scheduler.clone())));
-        reg.register(Arc::new(crate::tool::memory_md::MemoryMdTool::new(workspace_dir.clone())));
+        // B+: two-tier 开启时 MEMORY.md 退役为只读投影，不注册可写 memory_md 工具
+        if !two_tier_memory.load(std::sync::atomic::Ordering::SeqCst) {
+            reg.register(Arc::new(crate::tool::memory_md::MemoryMdTool::new(workspace_dir.clone())));
+        }
         reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
         reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
@@ -664,6 +675,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Registered cron_manage + memory_md + todo_update + browser_cdp tools");
     if let Err(e) = crate::knowledge::build_index(&workspace_dir) {
         tracing::warn!("Failed to build knowledge index: {}", e);
+    }
+
+    // B+ 记忆落地：MEMORY.md 退役为只读投影，deep_facts 为单一事实后端。
+    // 启动时做一次性迁移（幂等）+ 生成式导出，供人查看 / git 审阅。
+    match crate::memory_migrate::import_memory_md_to_shallow(&workspace_dir, &memory_store) {
+        Ok(n) => { if n > 0 { info!("MEMORY.md archived: migrated {} chunk(s) into shallow memory", n); } }
+        Err(e) => tracing::warn!("MEMORY.md shallow migration failed: {}", e),
     }
 
     // Conditionally register Computer Use tools based on config

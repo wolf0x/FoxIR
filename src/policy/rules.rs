@@ -289,6 +289,33 @@ mod tests {
     }
 
     #[test]
+    fn test_redline_permanent_delete_is_audited_not_silent() {
+        // D1 wrap-up：红线"永久删除"命令（del /F /S、rmdir /S /Q、Remove-Item -Recurse -Force）
+        // 必须命中 Audit（与 Permission 确认门配合），不得静默 Pass；且保持为审计而非 Block，
+        // 以保留 IR 清理的合法路径（与"回收站>永久删除 / 先确认"红线一致）。
+        let audit = default_audit_rules();
+        let cases = [
+            ("del /F /S /Q C:\\Windows\\Temp\\*", "cmd"),
+            ("rmdir /S /Q C:\\SomeDir", "cmd"),
+            ("Remove-Item -Recurse -Force C:\\SomeDir", "powershell"),
+            ("Remove-Item -Recurse -Force 'C:\\x' -Confirm:$false", "powershell"),
+        ];
+        for (cmd, shell) in cases {
+            let intent = parse_intent(cmd, shell);
+            assert!(audit.iter().any(|r| r.matches(&intent)), "should AUDIT: {cmd}");
+        }
+        let block = default_block_rules();
+        for (cmd, shell) in [
+            ("del /F /S /Q C:\\Windows\\Temp\\*", "cmd"),
+            ("rmdir /S /Q C:\\SomeDir", "cmd"),
+            ("Remove-Item -Recurse -Force C:\\SomeDir", "powershell"),
+        ] {
+            let intent = parse_intent(cmd, shell);
+            assert!(!block.iter().any(|r| r.matches(&intent)), "should NOT hard-block: {cmd}");
+        }
+    }
+
+    #[test]
     fn test_block_encoded() {
         let rules = default_block_rules();
         let intent = parse_intent("powershell -EncodedCommand RwBlAHQALgAuAC4A", "powershell");

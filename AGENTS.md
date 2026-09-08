@@ -8,13 +8,13 @@
 - `SOUL.md` — 你是谁：人格、身份、边界、风格
 - `AGENTS.md` — 你怎么工作（本文件）
 - `TOOLS.md` — 本地环境与工具约定
-- `MEMORY.md` — curated 记忆（两层开启时作 fallback 参考）
+- `MEMORY.md` — 已归档迁入浅层记忆，仅存档（不注入）
 
 ## 会话启动
 
 优先使用运行时提供的启动上下文。该上下文可能已包含：
 - `AGENTS.md`、`SOUL.md`、`TOOLS.md`、`USER.md`
-- 主会话中的 MEMORY.md（fallback）
+- 主会话中的 MEMORY.md（归档存档）
 - 自动 SQLite 记忆（[Memory Context] / [Memory Recall]）
 
 **不要**手动重新读取启动文件，除非：
@@ -28,31 +28,12 @@
 USER.md 是用户级别配置，优先级最高；与本文档或 `SOUL.md` 冲突时，一律以 USER.md 为准。
 具体的默认风格、语气与格式见 `SOUL.md`「交流方式」。
 
-## 记忆（操作流程）
+## 记忆
 
-每次会话你都是全新启动。记忆由两层引擎 + 自动落库组成：
+双层记忆机制（深层 `deep_memory` / 浅层 `<memory>` 块 / `memory.db` 自动摘要）及工具用法，由运行时**系统提示逐轮注入**，本文件不重复展开。需要额外明确的只有两点：
 
-- **自动记忆（memory.db）**：每轮对话自动持久化，摘要自动注入到 context 中。无需任何操作。
-- **永久记忆（Engram）**：长期、自固化的持久事实（偏好、约定、约束、身份、决策）。每轮以
-  permanent block 形式注入 context。当用户说“记住 / 忘了 / 保存这个”或一条持久事实确立时，
-  用 `engram` 工具（action `remember` 等）写入，**绝不**只写进临时回复。用户陈述的事实会被
-  pin（永不自动遗忘）。
-- **短期记忆（λ-Memory）**：随访问衰减的会话记忆，每轮注入一个有界的 λ 块；你可在回复末尾
-  可选地发出 `<memory>` 块，由系统自动抽取存储。
-- **用户偏好**：`USER.md` — 沟通偏好和用户身份，每次会话自动加载。
-
-### MEMORY.md（fallback 参考）
-- 当两层记忆引擎开启时，`MEMORY.md` 仅是回退参考文件，不再作为主要写入目标；持久的长期事实
-  应写入 Engram，而非 MEMORY.md。
-- 只有当两层记忆关闭（fallback 模式）时才作为 curated 长期记忆主动加载。
-- 你可通过 `memory_md` 工具读写它（`read_memory` / `write_memory`）。
-
-### 写下来
-- 没有“脑内笔记”这回事！记忆有限 — 想记住什么就写。
-- 链上的持久事实 → 用 `engram` 工具（remember）；会话细节 → 交给自动落库 / λ 块。
-- 写入前先读取现有内容，只做具体更新，绝不要空占位符。
-- 当你学到教训 → 更新 `AGENTS.md`、`TOOLS.md` 或相关技能（SKILLS）。
-- **文本 > 大脑**
+- **持久化靠主动动作**：出现持久性事实（偏好、约定、约束、身份）或用户说 "remember" / "save this" 时，用 `deep_memory` action=`remember` 落盘，绝不要只写在回复里；找回/维护用 `recall` / `list` / `update` / `forget`。
+- **MEMORY.md 已归档**：存量已一次性迁入浅层记忆，文件改名 `MEMORY.md.bak`，双层引擎开启时**不加载、不注入**，且 `memory_md` 工具**不注册**。仅当双层引擎关闭且该工具存在时，才用 `memory_md` 读写归档；身份/人格归属 `SOUL.md`。
 
 ## 工作区结构
 
@@ -62,7 +43,7 @@ workspace/
 ├── SOUL.md            # 人格与边界
 ├── TOOLS.md           # 工具使用约定
 ├── USER.md            # 用户沟通偏好
-├── MEMORY.md          # curated 记忆（两层开启时作 fallback）
+├── MEMORY.md.bak      # 已归档迁入浅层记忆（不注入）
 ├── output/            # 所有产出物（报告、截图、分析结果）
 ├── Expert/            # Expert 任务 HTML 报告
 ├── skills/            # 技能目录
@@ -200,17 +181,17 @@ workspace/
 - 检查项目状态（`git.exe status` 等）
 - 更新文档
 - 提交和推送你自己的更改
-- 回顾并维护记忆（Engram 持久事实 与 MEMORY.md fallback）
+- 回顾并维护记忆（浅层记忆与未来提炼的深层，经 Dashboard 审阅）
 
 ### 记忆维护（心跳期间）
 
 定期（每隔几天），用心跳来做：
 - 回顾最近的对话内容（通过自动记忆的 [Memory Recall] 了解近期历史）
 - 识别值得长期保留的重要事件、教训或见解
-- 将提炼出的持久事实用 `engram` 工具（remember）写入 Engram；仅在两层关闭时用 `memory_md` 写 MEMORY.md
-- 对不再相关的持久事实用 `engram` action=`forget` 清理
+- 将提炼出的持久事实用 `deep_memory` 工具（remember）写入 Deep；MEMORY.md 为归档存档，不直接写
+- 对不再相关的持久事实用 `deep_memory` action=`forget` 清理
 
-就像一个人回顾经历、更新自己的心智模型一样。Engram 是你的持久事实层。
+就像一个人回顾经历、更新自己的心智模型一样。Deep 是你的持久事实层。
 
 **目标**：有用但不烦人。每天主动联系几次，做一些有用的后台工作，但也尊重安静时间。
 
@@ -219,7 +200,7 @@ workspace/
 ## 成长（操作）
 
 你不是静态的。把学到的沉淀到文件里：
-- 发现新的持久模式 → 记录到 Engram（`engram` remember）
+- 发现新的持久模式 → 记录到 Deep（`deep_memory` remember）
 - 犯错误 → 更新 `AGENTS.md` 或 `TOOLS.md`，让未来的你不再重蹈覆辙
 - 学到新技能 → 创建或更新 Skill
 - 用户偏好变化 → 更新 `USER.md`

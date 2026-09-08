@@ -1241,6 +1241,41 @@ input:checked+.slider:before{transform:translateX(20px)}
           <div id="budgetLines" class="token-table" style="margin-top:10px"></div>
         </div>
 
+        <!-- Deep Memory Viewer -->
+        <div class="dash-section">
+          <div class="dash-section-header">
+            <h3>&#129504; 深层记忆 <span style="font-weight:400;font-size:12px">Deep Memory</span></h3>
+            <span class="dash-last-scan" id="deepMemState">-</span>
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
+            <input id="deepMemSearch" placeholder="搜索记忆（回车）" style="flex:1;min-width:0;padding:8px 10px;border-radius:6px;border:1px solid var(--bd,#444);background:var(--bg2,#fff);color:var(--t1,#eee)" onkeydown="if(event.key==='Enter')loadDeepMemory()">
+            <div style="display:flex;gap:8px">
+              <button class="cron-act on" onclick="openDeepEdit()">&#43; 新建</button>
+              <button class="cron-act" onclick="loadDeepMemory()">刷新</button>
+            </div>
+          </div>
+          <div id="deepMemList" class="cron-list">Loading...</div>
+        </div>
+
+        <!-- Deep Memory edit modal -->
+        <div class="qa-editor" id="deepModal" style="display:none">
+          <div class="qa-editor-card">
+            <div class="qa-editor-head"><h3 id="deepModalTitle">新建深层记忆</h3><button class="qa-ed-close" onclick="closeDeepModal()">&#10005;</button></div>
+            <div class="qa-editor-body">
+              <div class="form-group"><label>内容</label><textarea id="deepFContent" rows="3" style="width:100%"></textarea></div>
+              <div style="display:flex;gap:12px;flex-wrap:wrap">
+                <div class="form-group"><label>类型</label><select id="deepFType"><option>Reference</option><option>Identity</option><option>Preference</option><option>Project</option><option>Constraint</option></select></div>
+                <div class="form-group"><label>重要度 (1-5)</label><input id="deepFImportance" type="number" min="1" max="5" step="0.5" value="4" style="width:120px"></div>
+                <div class="form-group"><label>Pin</label><select id="deepFPin"><option value="User">User</option><option value="Agent">Agent</option><option value="None">None</option></select></div>
+              </div>
+              <div class="form-group"><label>subject_key（同键覆盖）</label><input id="deepFSubject" placeholder="可选" style="width:100%"></div>
+            </div>
+            <div class="qa-editor-foot">
+              <div class="qa-ed-actions"><button class="qa-ed-cancel" onclick="closeDeepModal()">Cancel</button><button class="qa-ed-save" onclick="saveDeep()">Save</button></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Quick Actions (Dashboard only, editable) -->
         <div class="dash-section">
           <div class="dash-section-header qa-hdr">
@@ -3583,6 +3618,7 @@ async function loadDashboard(){
   loadTodayUsage();
   loadTokenUsage();
   loadBudget();
+  loadDeepMemory();
   // Start periodic refresh for uptime
   if(dashRefreshTimer)clearInterval(dashRefreshTimer);
   dashRefreshTimer=setInterval(()=>{
@@ -3662,6 +3698,101 @@ async function loadBudget(){
     const wrap=document.getElementById('budgetLines');
     if(wrap) wrap.innerHTML='<div style="color:#e74c3c">Budget data unavailable</div>';
   }
+}
+
+
+let deepEditingId=null;
+async function loadDeepMemory(){
+  const el=document.getElementById('deepMemList');
+  if(!el)return;
+  el.innerHTML='Loading...';
+  const q=((document.getElementById('deepMemSearch')||{}).value)||'';
+  try{
+    const r=await fetch('/api/memory/deep?q='+encodeURIComponent(q));
+    const d=await r.json();
+    const facts=d.facts||[];
+    const st=document.getElementById('deepMemState');
+    if(st)st.textContent=facts.length+' fact(s)';
+    if(!facts.length){el.innerHTML='<div class="cron-empty">No deep memory facts yet. Create one above, or let the curator capture durable facts.</div>';return;}
+    el.innerHTML=facts.map(f=>{
+      const pin = f.pinned_by==='User'?'<span class="cron-status on">User Pin</span>': f.pinned_by==='Agent'?'<span class="cron-status on" style="background:#8e44ad">Agent</span>':'<span class="cron-status off">auto</span>';
+      const ql='<span class="cron-status '+(f.quality==='Permanent'?'on':'off')+'">'+esc(f.quality||'')+'</span>';
+      const im='<span class="cron-badge" title="importance I">I:'+esc(f.importance)+'</span>';
+      const ty='<span class="cron-badge">'+esc(f.fact_type||'')+'</span>';
+      const sub=f.subject_key?'<span class="cron-badge">@'+esc(f.subject_key)+'</span>':'';
+      const dtp=String(new Date((f.created_at||0)*1000).toLocaleString());
+      return '<div class="cron-item">'+
+        '<div class="cron-item-main">'+
+          '<div class="cron-item-head">'+ql+im+ty+pin+sub+'</div>'+
+          '<div class="cron-item-name" style="white-space:pre-wrap">'+esc(f.content)+'</div>'+
+          '<div class="cron-meta">created '+dtp+'</div>'+
+        '</div>'+
+        '<div class="cron-actions">'+
+          '<button class="cron-act off" onclick="setDeepPin(\''+esc(f.id)+'\','+(f.pinned_by!=='User')+')">'+(f.pinned_by!=='User'?'Pin':'Unpin')+'</button>'+
+          '<button class="cron-act" onclick="openDeepEdit(\''+esc(f.id)+'\')">&#9998;&#65039; 编辑</button>'+
+          '<button class="cron-act danger" onclick="deleteDeep(\''+esc(f.id)+'\')">&#10060; 删除</button>'+
+        '</div>'+
+      '</div>';
+    }).join('');
+  }catch(e){el.innerHTML='<div style="color:#e74c3c">Failed to load deep memory</div>'}
+}
+function openDeepEdit(id){
+  deepEditingId=id||null;
+  document.getElementById('deepModalTitle').textContent=id?'编辑深层记忆':'新建深层记忆';
+  if(id){
+    fetch('/api/memory/deep')
+      .then(r=>r.json())
+      .then(d=>{
+        const f=(d.facts||[]).find(x=>x.id===id); if(!f)return;
+        document.getElementById('deepFContent').value=f.content||'';
+        document.getElementById('deepFType').value=f.fact_type||'Reference';
+        document.getElementById('deepFImportance').value=f.importance||4;
+        document.getElementById('deepFPin').value=f.pinned_by||'User';
+        document.getElementById('deepFSubject').value=f.subject_key||'';
+      });
+  } else {
+    document.getElementById('deepFContent').value='';
+    document.getElementById('deepFType').value='Reference';
+    document.getElementById('deepFImportance').value=4;
+    document.getElementById('deepFPin').value='User';
+    document.getElementById('deepFSubject').value='';
+  }
+  document.getElementById('deepModal').style.display='flex';
+}
+function closeDeepModal(){document.getElementById('deepModal').style.display='none';}
+async function saveDeep(){
+  const content=document.getElementById('deepFContent').value.trim();
+  if(!content){alert('Content required');return;}
+  const payload={
+    content:content,
+    fact_type:document.getElementById('deepFType').value,
+    importance:Number(document.getElementById('deepFImportance').value)||4,
+    pinned_by:document.getElementById('deepFPin').value,
+    subject_key:document.getElementById('deepFSubject').value||null
+  };
+  try{
+    let r;
+    if(deepEditingId){r=await fetch('/api/memory/deep/'+encodeURIComponent(deepEditingId),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}
+    else{r=await fetch('/api/memory/deep',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}
+    const d=await r.json();
+    if(!d.success){alert('Save failed: '+(d.error||'unknown'));return;}
+    closeDeepModal();loadDeepMemory();
+  }catch(e){alert('Save failed')}
+}
+async function deleteDeep(id){
+  if(!confirm('确认删除该深层记忆？'))return;
+  try{
+    await fetch('/api/memory/deep/'+encodeURIComponent(id),{method:'DELETE'});
+    loadDeepMemory();
+  }catch(e){alert('Delete failed')}
+}
+async function setDeepPin(id,userPin){
+  try{
+    const d=await (await fetch('/api/memory/deep')).json();
+    const f=(d.facts||[]).find(x=>x.id===id); if(!f)return;
+    await fetch('/api/memory/deep/'+encodeURIComponent(id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({pinned_by:userPin?'User':'None'})});
+    loadDeepMemory();
+  }catch(e){alert('Pin update failed')}
 }
 
 // Quick Actions catalog

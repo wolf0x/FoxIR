@@ -1452,9 +1452,11 @@ impl MemoryStore {
         Ok(n)
     }
 
-    /// 深度事实召回触达：刷新 last_accessed。仅在显式使用/召回时调用，
-    /// 保留时间退火遗忘（不随每次自动注入刷新，避免常驻块永不降级）。
-    pub fn deep_touch(&self, ids: &[String]) -> Result<usize, String> {
+    /// 深度记忆批量召回触达（对称 shallow_touch_batch）：
+    /// 对本次实际注入的深层事实刷新 last_accessed，使 R（近因）随真实使用学习，
+    /// 避免"每次注入却从不 touch → i_eff 单调下滑 → 可能被误降级"。注入即 touch 等价于
+    /// 浅层"用进废退"：只有被 pack_by_budget 选中的事实才会被刷新，未注入者正常退火。
+    pub fn deep_touch_batch(&self, ids: &[String]) -> Result<usize, String> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -1466,7 +1468,7 @@ impl MemoryStore {
         );
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| format!("deep_touch prepare: {e}"))?;
+            .map_err(|e| format!("deep_touch_batch prepare: {e}"))?;
         let now_i64: i64 = now as i64;
         let mut named: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
         named.push(&now_i64);
@@ -1475,8 +1477,14 @@ impl MemoryStore {
         }
         let n = stmt
             .execute(rusqlite::params_from_iter(named))
-            .map_err(|e| format!("deep_touch: {e}"))?;
+            .map_err(|e| format!("deep_touch_batch: {e}"))?;
         Ok(n)
+    }
+
+    /// 深度事实召回触达（单条便利入口）：刷新 last_accessed。
+    /// 显式使用/召回与注入触达均走 deep_touch_batch，保持"用进废退"一致语义。
+    pub fn deep_touch(&self, ids: &[String]) -> Result<usize, String> {
+        self.deep_touch_batch(ids)
     }
 
     /// FTS5 BM25 搜索，返回 (hash, rank)。rank 为负、越小越相关。
@@ -1663,15 +1671,16 @@ impl MemoryStore {
         scope_key: &str,
         p_max: usize,
         tau_days: f32,
-    ) -> (String, usize) {
+    ) -> (String, usize, Vec<String>) {
         use crate::deep_memory::{DeepParams, PinnedBy};
         let now = crate::shallow_memory::now_secs();
         let params = DeepParams { tau_days, ..Default::default() };
         let facts = match self.deep_list(scope_key) {
             Ok(f) => f,
-            Err(_) => return (String::new(), 0),
+            Err(_) => return (String::new(), 0, Vec::new()),
         };
-        let mut lines: Vec<(String, f32, usize)> = Vec::new();
+        // lines: (渲染行, 价值, token 成本, 事实 id)
+        let mut lines: Vec<(String, f32, usize, String)> = Vec::new();
         for f in &facts {
             let pin_user = f.pinned_by == PinnedBy::User;
             let pin_agent = f.pinned_by == PinnedBy::Agent;
@@ -1689,27 +1698,29 @@ impl MemoryStore {
             let line = format!("- [{}] {}", f.fact_type.as_str(), body);
             let cost = crate::shallow_memory::estimate_tokens(&line);
             // 上下文预算内按「统一工件价值 V=Q²·R·U」排序，优先级：重要、近期、常用。
-            lines.push((line, f.value(now) as f32, cost));
+            lines.push((line, f.value(now) as f32, cost, f.id.clone()));
         }
         if lines.is_empty() {
-            return (String::new(), 0);
+            return (String::new(), 0, Vec::new());
         }
         let header = "## Permanent Memory (Deep) — durable facts about this user/project\n";
         let header_cost = crate::shallow_memory::estimate_tokens(header);
         let body_budget = p_max.saturating_sub(header_cost);
-        let items: Vec<(f32, usize)> = lines.iter().map(|(_, i, c)| (*i, *c)).collect();
+        let items: Vec<(f32, usize)> = lines.iter().map(|(_, i, c, _)| (*i, *c)).collect();
         let picked = crate::deep_memory::pack_by_budget(&items, body_budget);
         if picked.is_empty() {
-            return (String::new(), 0);
+            return (String::new(), 0, Vec::new());
         }
         let mut out = String::from(header);
         let mut toks = header_cost;
+        let mut picked_ids = Vec::with_capacity(picked.len());
         for idx in &picked {
             out.push_str(&lines[*idx].0);
             out.push('\n');
             toks += lines[*idx].2;
+            picked_ids.push(lines[*idx].3.clone());
         }
-        (out, toks)
+        (out, toks, picked_ids)
     }
 }
 

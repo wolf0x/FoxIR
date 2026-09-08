@@ -192,8 +192,8 @@ fn row_to_sop(r: &rusqlite::Row) -> rusqlite::Result<Sop> {
         id: r.get(0)?,
         name: r.get(1)?,
         description: r.get(2)?,
-        semantic_tags: serde_json::from_str(&tags).unwrap_or_default(),
-        phases: serde_json::from_str(&phases).unwrap_or_default(),
+        semantic_tags: parse_string_list(&tags, "semantic_tags"),
+        phases: parse_string_list(&phases, "phases"),
         version: r.get::<_, i64>(5)? as u32,
         created: r.get::<_, i64>(6)? as u64,
         updated: r.get::<_, i64>(7)? as u64,
@@ -255,17 +255,67 @@ pub fn save_sops(workspace_dir: &str, sops: &[Sop]) -> Result<(), String> {
 // 匹配 / 选择
 // ---------------------------------------------------------------------------
 
-/// 按 semantic_tags 对任务描述做不区分大小写的子串匹配（与 skill 一致）。
+/// 判断 `needle` 是否作为"整词"出现在 `hay`（ASCII 词边界，H2-L0）。
+/// CJK 字符非 ASCII 字母数字 → 视为自然边界，因此不影响中文子串命中；
+/// 同时阻止英文标签在较长英文单词内误命中（如 "api" 命中 "rapids"、"ip" 命中 "hip"）。
+fn word_boundary_contains(hay_lower: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return false;
+    }
+    let hay: Vec<char> = hay_lower.chars().collect();
+    let ndl: Vec<char> = needle_lower.chars().collect();
+    let n = ndl.len();
+    if n > hay.len() {
+        return false;
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut i = 0;
+    while i + n <= hay.len() {
+        if &hay[i..i + n] == &ndl[..] {
+            let before_ok = i == 0 || !is_word(hay[i - 1]);
+            let after_idx = i + n;
+            let after_ok = after_idx >= hay.len() || !is_word(hay[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 按 semantic_tags 对任务描述做不区分大小写的多词/双语匹配（H2-L0：词边界）。
+/// 替换旧的裸 `contains` 子串匹配：既有整词边界（消除误命中），又有"去空白粘合"
+/// 回退（让多词标签 "Full Hunt" 也能命中紧凑输入 fullhunt / 汉语紧凑输入）。
 pub fn match_sops(sops: &[Sop], task: &str) -> Vec<Sop> {
     let t = task.to_lowercase();
+    // 粘合串：去掉所有空白（含中文与全角空格），用于多词标签的紧凑命中。
+    let t_glued: String = t.chars().filter(|c| !c.is_whitespace()).collect();
     sops.iter()
-        .filter(|s| s.semantic_tags.iter().any(|tag| t.contains(&tag.to_lowercase())))
+        .filter(|s| {
+            s.semantic_tags.iter().any(|tag| {
+                let tag_l = tag.to_lowercase();
+                if word_boundary_contains(&t, &tag_l) {
+                    return true;
+                }
+                // 多词标签（内部含空白）→ 用其去空白粘合形式对原始任务再试一次，
+                // 兼容紧凑/双语输入（如 tag "Full Hunt" 命中任务 "run fullhunt now"）；
+                // 任务本身也被全压成无空白时再对粘合任务串兜底试一次。
+                if tag_l.contains(char::is_whitespace) {
+                    let tag_glued: String = tag_l.chars().filter(|c| !c.is_whitespace()).collect();
+                    if word_boundary_contains(&t, &tag_glued) || word_boundary_contains(&t_glued, &tag_glued) {
+                        return true;
+                    }
+                }
+                false
+            })
+        })
         .cloned()
         .collect()
 }
 
 /// 从候选里挑价值最高的一条；若其体积超过上下文 1/4 则放弃（只给目录）。
-pub fn select_best(sops: &[Sop], now: u64, context_limit: usize) -> Option<Sop> {
+pub fn select_best(sops: &[Sop], now: u64, _context_limit: usize) -> Option<Sop> {
     if sops.is_empty() {
         return None;
     }
@@ -275,12 +325,8 @@ pub fn select_best(sops: &[Sop], now: u64, context_limit: usize) -> Option<Sop> 
             .partial_cmp(&a.value(now))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let best = &c[0];
-    let hard_limit = context_limit / 4;
-    if best.rough_tokens() > hard_limit {
-        return None;
-    }
-    Some(best.clone())
+    // H3：不再因超限 `return None` 而将复杂 SOP 静默丢弃；改由调用方按体积降级渲染。
+    c.into_iter().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,35 +341,41 @@ pub fn record_result(
     tool_calls: u32,
     duration_secs: u32,
 ) -> Result<Sop, String> {
-    let mut sops = load_sops(workspace_dir);
     let now = now_secs();
-    let mut found: Option<Sop> = None;
-    for s in sops.iter_mut() {
-        if s.id == id {
-            s.times_executed += 1;
-            if success {
-                s.times_succeeded += 1;
-            } else {
-                s.times_failed += 1;
-            }
-            s.last_executed_at = Some(now);
-            s.updated = now;
-            let n = s.times_executed.max(1) as f32;
-            s.avg_tool_calls =
-                (s.avg_tool_calls * (s.times_executed - 1) as f32 + tool_calls as f32) / n;
-            s.avg_duration_secs =
-                (s.avg_duration_secs * (s.times_executed - 1) as f32 + duration_secs as f32) / n;
-            found = Some(s.clone());
-            break;
-        }
+    // A：定向列 UPDATE —— 只就地累加统计列，绝不触碰 phases/semantic_tags。
+    // 消除"load→改→save_sops 全表重写"的并发丢更新（M5）与潜在的数据蒸发路径。
+    let mut conn = open_sop_conn(workspace_dir)?;
+    let tx = conn.transaction().map_err(|e| format!("tx begin: {e}"))?;
+    let rows = tx.execute(
+        "UPDATE sops SET
+             times_executed   = times_executed + 1,
+             times_succeeded  = times_succeeded + ?1,
+             times_failed     = times_failed + ?2,
+             last_executed_at = ?3,
+             updated          = ?3,
+             avg_tool_calls   = (avg_tool_calls * times_executed + ?4) / (times_executed + 1),
+             avg_duration_secs= (avg_duration_secs * times_executed + ?5) / (times_executed + 1)
+         WHERE id = ?6",
+        params![
+            if success { 1 } else { 0 },
+            if success { 0 } else { 1 },
+            now as i64,
+            tool_calls as f32,
+            duration_secs as f32,
+            id,
+        ],
+    )
+    .map_err(|e| format!("record_result update: {e}"))?;
+    if rows == 0 {
+        return Err(format!("SOP '{id}' not found"));
     }
-    match found {
-        Some(s) => {
-            save_sops(workspace_dir, &sops)?;
-            Ok(s)
-        }
-        None => Err(format!("SOP '{id}' not found")),
-    }
+    tx.commit().map_err(|e| format!("record_result commit: {e}"))?;
+    bump_metric(workspace_dir, "recorded", 1);
+    let sops = load_sops(workspace_dir);
+    sops
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("SOP '{id}' not found"))
 }
 
 /// 注册或更新一条 SOP（同名/同 id 覆盖）。
@@ -338,13 +390,25 @@ pub fn register_sop(workspace_dir: &str, mut sop: Sop) -> Result<Sop, String> {
         sop.id = gen_id(&sop.name);
     }
     let id = sop.id.clone();
-    if let Some(existing) = sops.iter_mut().find(|s| s.id == id) {
-        *existing = sop.clone();
+    let merged = if let Some(existing) = sops.iter_mut().find(|s| s.id == id) {
+        // C3：合并语义 —— 保留学习证据（created/times_*/last_executed_at/avg_*），
+        // 仅精炼内容字段并递增版本，避免 re-author 清零统计使优化/毕业判据失真。
+        existing.name = sop.name.clone();
+        existing.description = sop.description.clone();
+        existing.semantic_tags = sop.semantic_tags.clone();
+        existing.phases = sop.phases.clone();
+        existing.version = existing.version.saturating_add(1);
+        existing.updated = now;
+        Some(existing.clone())
     } else {
+        if sop.version == 0 {
+            sop.version = 1;
+        }
         sops.push(sop.clone());
-    }
+        None
+    };
     save_sops(workspace_dir, &sops)?;
-    Ok(sop)
+    Ok(merged.unwrap_or(sop))
 }
 
 /// 删除一条 SOP。
@@ -370,6 +434,7 @@ pub fn gc_sops(workspace_dir: &str) -> Result<usize, String> {
         !(v < GC_VALUE_THRESHOLD || proven_bad)
     });
     let removed = before - sops.len();
+    bump_metric(workspace_dir, "gc_removed", removed as i64);
     save_sops(workspace_dir, &sops)?;
     Ok(removed)
 }
@@ -378,20 +443,111 @@ pub fn gc_sops(workspace_dir: &str) -> Result<usize, String> {
 // 注入格式化 / 辅助
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 遥测与容错解析（A / 防线2）
+// ---------------------------------------------------------------------------
+
+/// 防线2：按行容错解析字符串数组；解析失败「降级保留原始文本为一项 + 告警」，
+/// 绝不静默清空——否则一次 save_sops 重写就会把历史步骤以空数组落盘。
+fn parse_string_list(raw: &str, what: &str) -> Vec<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<String>>(t) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("[sop] {what} 非法 JSON，按单步原文保留：{e}");
+            vec![t.to_string()]
+        }
+    }
+}
+
+/// 轻量遥测：SOP 环路计数器（authored / replay_hits / recorded / gc_removed），
+/// 持久化于 memory.db 的 `met_kv` 表，供 `/api/sop/stats` 读取。不构系统，只加计数。
+pub fn bump_metric(workspace_dir: &str, key: &str, delta: i64) {
+    if let Err(e) = bump_metric_inner(workspace_dir, key, delta) {
+        tracing::warn!("[sop] bump_metric({key}): {e}");
+    }
+}
+
+fn bump_metric_inner(workspace_dir: &str, key: &str, delta: i64) -> Result<(), String> {
+    let conn = open_sop_conn(workspace_dir)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS met_kv (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0)",
+    )
+    .map_err(|e| format!("met_kv create: {e}"))?;
+    conn.execute(
+        "INSERT INTO met_kv(key,value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value = value + excluded.value",
+        params![key, delta],
+    )
+    .map_err(|e| format!("met_kv upsert: {e}"))?;
+    Ok(())
+}
+
+/// 读取 SOP 遥测计数（键值表）。
+pub fn sop_metrics(workspace_dir: &str) -> std::collections::HashMap<String, i64> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(conn) = open_sop_conn(workspace_dir) else { return out };
+    if let Ok(mut stmt) = conn.prepare("SELECT key,value FROM met_kv") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        }) {
+            for r in rows.flatten() {
+                out.insert(r.0, r.1);
+            }
+        }
+    }
+    out
+}
 /// 把 SOP 格式化为注入上下文的操作指南。
 pub fn format_sop_context(sop: &Sop) -> String {
+    // P2：0 次执行的 SOP 是草稿，不称"已验证流程"，避免假权威误导执行。
+    let verdict = if sop.times_executed == 0 {
+        "（草稿：尚未执行，未经验证）".to_string()
+    } else {
+        format!(
+            "（已验证流程：{} 次执行 / 成功率 {:.0}%）",
+            sop.times_executed,
+            sop.success_rate() * 100.0
+        )
+    };
     let mut out = format!(
-        "=== SOP: {} (v{}) ===\n{}\n（已验证流程：{} 次执行 / 成功率 {:.0}%）\n",
-        sop.name,
-        sop.version,
-        sop.description,
-        sop.times_executed,
-        sop.success_rate() * 100.0
+        "=== SOP: {} (v{}) ===\n{}\n{}\n",
+        sop.name, sop.version, sop.description, verdict
     );
     for (i, ph) in sop.phases.iter().enumerate() {
         out.push_str(&format!("Phase {}: {}\n", i + 1, ph));
     }
     out.push_str("按 Phase 顺序执行，仅在条件不同时偏离；完成后回写 SOP 记录结果。\n=== END SOP ===");
+    out
+}
+
+/// H3：SOP 超限时的降级渲染（目录档）——只给 name/description + Phase 标题，
+/// 避免复杂 SOP 因体积被静默丢弃。
+pub fn format_sop_catalog(sop: &Sop) -> String {
+    let verdict = if sop.times_executed == 0 {
+        "草稿".to_string()
+    } else {
+        format!("已验证（{} 次）", sop.times_executed)
+    };
+    let mut out = format!(
+        "【SOP 目录】{} — {} [{}]",
+        sop.name, sop.description, verdict
+    );
+    if !sop.phases.is_empty() {
+        let titles: Vec<String> = sop
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let head: String = p.chars().take(40).collect();
+                format!("Phase {}: {}", i + 1, head)
+            })
+            .collect();
+        out.push_str(&format!("\n  {}", titles.join("\n  ")));
+    }
     out
 }
 
@@ -580,6 +736,7 @@ pub async fn author_sop_from_session(
         }
     };
     let saved = register_sop(workspace_dir, sop)?;
+    bump_metric(workspace_dir, "authored", 1);
     warn!("[sop] authored SOP '{}' ({} phases)", saved.name, saved.phases.len());
     Ok(Some(saved))
 }
@@ -666,12 +823,12 @@ mod tests {
     }
 
     #[test]
-    fn select_best_rejects_oversized() {
+    fn select_best_oversized_degrades_not_drops() {
         let mut sop = base();
         sop.phases = vec!["x".repeat(4000)];
         let sops = vec![sop];
-        // context_limit 很小 → token 帽触发,返回 None
-        assert!(select_best(&sops, now_secs(), 1000).is_none());
+        // H3：超限不再返回 None，仍选出价值最高者（由调用方降级为目录档渲染）。
+        assert!(select_best(&sops, now_secs(), 1000).is_some());
     }
 
     #[test]
@@ -686,6 +843,28 @@ mod tests {
         // 持久化验证
         let reloaded = load_sops(&ws);
         assert_eq!(reloaded[0].times_executed, 11);
+    }
+    #[test]
+    fn record_result_does_not_rewrite_phases() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().to_str().unwrap().to_string();
+        let mut sop = base();
+        sop.phases = vec!["step-a".to_string(), "step-b".to_string()];
+        register_sop(&ws, sop.clone()).unwrap();
+
+        // A：record_result 定向 UPDATE —— 只累加统计，绝不触碰 phases。
+        record_result(&ws, "s1", true, 4, 30).unwrap();
+        let after = load_sops(&ws);
+        assert_eq!(after[0].phases, sop.phases, "record_result must not rewrite phases");
+
+        // M5：多次记录不丢更新（不依赖全表重写）。
+        record_result(&ws, "s1", true, 5, 30).unwrap();
+        let after2 = load_sops(&ws);
+        assert_eq!(after2[0].times_executed, base().times_executed + 2);
+
+        // 指标已落库（recorded）
+        let m = sop_metrics(&ws);
+        assert!(m.get("recorded").copied().unwrap_or(0) >= 2);
     }
 
     #[test]
@@ -782,7 +961,7 @@ SKIP
         assert_eq!(best.id, registered.id);
         let ctx = format_sop_context(&best);
         assert!(ctx.contains("Phase 5"), "should contain all 5 phases");
-        assert!(ctx.contains("已验证流程"), "should carry stats line");
+        assert!(!ctx.contains("已验证流程"), "0-run SOP must not claim verified (P2)");
 
         // 4) 调用后更新统计：模拟一次成功执行(4 次工具调用,180s)，并持久化重载。
         let after = record_result(&ws, &registered.id, true, 4, 180).unwrap();
@@ -812,4 +991,43 @@ SKIP
         let ctx2 = format_sop_context(&reloaded[0]);
         assert!(ctx2.contains("50%"), "success rate 1/2 should be 50%");
     }
+
+    #[test]
+    fn match_sops_word_boundary_and_multiword() {
+        let mk = |tags: &[&str]| crate::sop::Sop {
+            id: "t".into(),
+            name: "t".into(),
+            description: String::new(),
+            semantic_tags: tags.iter().map(|s| s.to_string()).collect(),
+            phases: vec![],
+            version: 1,
+            created: 1,
+            updated: 1,
+            times_executed: 0,
+            times_succeeded: 0,
+            times_failed: 0,
+            last_executed_at: None,
+            avg_tool_calls: 0.0,
+            avg_duration_secs: 0.0,
+        };
+
+        // 整词命中
+        let s = mk(&["network", "cleanup"]);
+        assert_eq!(match_sops(&[s.clone()], "perform network cleanup").len(), 1);
+        // 单词在较长英文单词内→不误命中（旧 contains 会误命中）
+        assert_eq!(match_sops(&[s.clone()], "rapids networker cleanupx").len(), 0);
+        // 中文子串不受词边界影响
+        let c = mk(&["清理", "持久化"]);
+        assert_eq!(match_sops(&[c.clone()], "我需要做一次持久化清理").len(), 1);
+        // 多词标签 → 紧凑/双语输入仍能命中
+        let mw = mk(&["Full Hunt", "应急响应"]);
+        assert_eq!(match_sops(&[mw.clone()], "run fullhunt now").len(), 1);
+        assert_eq!(match_sops(&[mw.clone()], "full hunt 做一遍").len(), 1);
+        // 无双语同义命中（无标签不误中）
+        let none = mk(&["zeroclick"]);
+        assert_eq!(match_sops(&[none.clone()], "do a zeroclick task").len(), 1);
+    }
+
 }
+
+

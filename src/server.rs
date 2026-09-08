@@ -268,10 +268,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/memory/summaries", get(memory_summaries_handler))
         .route("/api/memory", get(memory_entries_handler))
         .route("/api/memory/summarize", post(memory_summarize_handler))
+.route("/api/memory/deep", get(deep_memory_list_handler))
+.route("/api/memory/deep", post(deep_memory_create_handler))
+.route("/api/memory/deep/{id}", put(deep_memory_update_handler))
+.route("/api/memory/deep/{id}", delete(deep_memory_delete_handler))
+        .route("/api/memory/deep/import", post(deep_memory_import_handler))
         .route("/api/history", get(history_handler))
         .route("/api/usage", get(usage_handler))
         .route("/api/usage/today", get(usage_today_handler))
         .route("/api/budget", get(budget_handler))
+        .route("/api/sop/stats", get(sop_stats_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/tools/{name}/toggle", post(tools_toggle_handler))
         .route("/api/tools/{name}/description", post(tools_desc_handler))
@@ -1423,7 +1429,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                         let engine = ::base64::engine::general_purpose::STANDARD;
                                         if let Ok(bytes) = engine.decode(base64_str) {
                                             let file_path = att_dir.join(name);
-                                            if let Err(e) = std::fs::write(&file_path, &bytes) {
+                                            if let Err(e) = tokio::fs::write(&file_path, &bytes).await {
                                                 tracing::warn!("Failed to save attachment {}: {}", name, e);
                                             } else {
                                                 entry.push_str(&format!(
@@ -1522,7 +1528,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 // `context_arbiter::assemble` —— 统一按价值排序、共享预算、降级不丢。
                                 // 预算取「当前两块实际占用 + 安全余量」（下限 2048 token），大窗口下
                                 // 通常不触发降级（行为近等价），小窗口下按价值优雅降级而不静默消失。
-                                let (eg_block, eg_tok) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+                                let (eg_block, eg_tok, eg_ids) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
                                 let (lam_block, lam_tok, lam_hashes) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
                                 let mut arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
                                 if !eg_block.trim().is_empty() {
@@ -1552,6 +1558,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 if !lam_hashes.is_empty() {
                                     if let Ok(touched) = state.memory_store.shallow_touch_batch(&lam_hashes) {
                                         info!("浅层记忆召回触达 {} 条", touched);
+                                    }
+                                    // H4：深层注入即 touch（对称 shallow_touch_batch）。
+                                    // 本次实际注入的深层事实刷新 last_accessed，使 R 随真实使用学习。
+                                    if let Ok(touched) = state.memory_store.deep_touch_batch(&eg_ids) {
+                                        info!("深层记忆召回触达 {} 条", touched);
                                     }
                                 }
                             }
@@ -1938,6 +1949,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                     }
 
                                     two_tier_write(&state, &mut assistant_text, &session_id, content.as_str());
+                                    spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
                                     // Update session history
                                     if !assistant_text.is_empty() {
                                         let mut sessions = state.sessions.lock().await;
@@ -2228,7 +2240,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let sid = session_id.clone();
         tokio::spawn(async move {
             match crate::sop::author_sop_from_session(&history, provider, &model_name, &workspace_dir).await {
-                Ok(Some(sop)) => info!("Session {} authored SOP '{}' ({} phases)", &sid[..8.min(sid.len())], sop.name, sop.phases.len()),
+                Ok(Some(sop)) => {
+                    info!("Session {} authored SOP '{}' ({} phases)", &sid[..8.min(sid.len())], sop.name, sop.phases.len());
+                    // C2：作者化（低频事件）是天然 drain 点，作者化后即执行一次 GC。
+                    match crate::sop::gc_sops(&workspace_dir) {
+                        Ok(n) if n > 0 => info!("[sop] GC after authoring removed {} SOP(s)", n),
+                        _ => {}
+                    }
+                }
                 Ok(None) => info!("Session {} no SOP-worthy procedure", &sid[..8.min(sid.len())]),
                 Err(e) => warn!("Session {} SOP authoring failed: {}", &sid[..8.min(sid.len())], e),
             }
@@ -2312,9 +2331,258 @@ async fn memory_summarize_handler(
     }
 }
 
-// ============================================================
-// History API - fetch recent conversation from memory store
-// ============================================================
+// ── Deep Memory API (记忆查看器) ────────────────────────────
+
+#[derive(Deserialize)]
+struct DeepListQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+    scope: Option<String>,
+}
+
+fn deep_parse_type(t: &str) -> crate::deep_memory::FactType {
+    match t.to_ascii_lowercase().as_str() {
+        "identity" => crate::deep_memory::FactType::Identity,
+        "preference" | "pref" => crate::deep_memory::FactType::Preference,
+        "project" => crate::deep_memory::FactType::Project,
+        "constraint" => crate::deep_memory::FactType::Constraint,
+        _ => crate::deep_memory::FactType::Reference,
+    }
+}
+
+fn deep_parse_pinned(t: &str) -> crate::deep_memory::PinnedBy {
+    match t.to_ascii_lowercase().as_str() {
+        "agent" => crate::deep_memory::PinnedBy::Agent,
+        "none" => crate::deep_memory::PinnedBy::None,
+        _ => crate::deep_memory::PinnedBy::User,
+    }
+}
+
+fn deep_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn deep_make_id(scope: &str, subject: Option<&str>, content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let basis = match subject {
+        Some(s) => format!("{}|subj|{}", scope, s),
+        None => format!("{}|body|{}", scope, content),
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    basis.hash(&mut h);
+    format!("eg{:016x}", h.finish())
+}
+
+/// 简单档位标注：仅供查看器展示（深层存储派生，不落盘）。
+fn deep_display_quality(f: &crate::deep_memory::DeepFact, now: u64) -> (f32, String) {
+    use crate::deep_memory::PinnedBy;
+    let pinned_user = matches!(f.pinned_by, PinnedBy::User);
+    if pinned_user {
+        return (5.0, "Permanent".to_string());
+    }
+    let params = crate::deep_memory::DeepParams::default();
+    let i_eff = crate::deep_memory::effective_importance(
+        f.importance, f.last_accessed, now, false, params.tau_days,
+    );
+    let label = if i_eff >= params.theta_up {
+        "Permanent".to_string()
+    } else if i_eff >= params.theta_down {
+        "Active".to_string()
+    } else {
+        "Archived".to_string()
+    };
+    (i_eff, label)
+}
+
+async fn deep_memory_list_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DeepListQuery>,
+) -> Json<Value> {
+    let scope = query.scope.clone().unwrap_or_else(|| "global".to_string());
+    match state.memory_store.deep_list(&scope) {
+        Ok(facts) => {
+            let q = query
+                .q
+                .as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default();
+            let now = deep_now();
+            let mut items: Vec<Value> = facts
+                .iter()
+                .filter_map(|f| {
+                    if !q.is_empty() {
+                        let hay = format!(
+                            "{} {} {} {}",
+                            f.content,
+                            f.summary,
+                            f.essence,
+                            f.tags.join(" ")
+                        )
+                        .to_lowercase();
+                        if !hay.contains(&q) {
+                            return None;
+                        }
+                    }
+                    let (i_eff, label) = deep_display_quality(f, now);
+                    let mut v = serde_json::to_value(f).unwrap_or(Value::Null);
+                    if let Value::Object(ref mut m) = v {
+                        m.insert("i_eff".to_string(), json!(i_eff));
+                        m.insert("quality".to_string(), json!(label));
+                        m.insert("value".to_string(), json!(f.value(now)));
+                    }
+                    Some(v)
+                })
+                .collect();
+            items.sort_by(|a, b| {
+                let va = a.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let vb = b.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let limit = query.limit.unwrap_or(100).min(500);
+            items.truncate(limit);
+            Json(json!({ "facts": items, "count": items.len() }))
+        }
+        Err(e) => Json(json!({ "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeepCreateReq {
+    content: String,
+    #[serde(default)]
+    fact_type: String,
+    #[serde(default)]
+    importance: Option<f32>,
+    #[serde(default)]
+    pinned_by: String,
+    #[serde(default)]
+    subject_key: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    essence: String,
+}
+
+async fn deep_memory_create_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeepCreateReq>,
+) -> Json<Value> {
+    use crate::deep_memory::PinnedBy;
+    let content = body.content.trim().to_string();
+    if content.is_empty() {
+        return Json(json!({ "success": false, "error": "content is required" }));
+    }
+    let scope = crate::deep_memory::MemoryScope::Global;
+    let pinned = deep_parse_pinned(&body.pinned_by);
+    let importance = body
+        .importance
+        .unwrap_or(if matches!(pinned, PinnedBy::User) { 5.0 } else { 4.0 })
+        .clamp(crate::deep_memory::IMPORTANCE_MIN, crate::deep_memory::IMPORTANCE_MAX);
+    let id = deep_make_id("global", body.subject_key.as_deref(), &content);
+    let fact = crate::deep_memory::DeepFact {
+        id,
+        content,
+        summary: body.summary.clone(),
+        essence: body.essence.clone(),
+        fact_type: deep_parse_type(&body.fact_type),
+        scope,
+        pinned_by: pinned,
+        subject_key: body.subject_key.clone(),
+        importance,
+        created_at: deep_now(),
+        last_accessed: deep_now(),
+        tags: body.tags,
+        links: Vec::new(),
+    };
+    match state.memory_store.deep_store(&fact) {
+        Ok(()) => Json(json!({ "success": true, "fact": serde_json::to_value(&fact).unwrap_or(Value::Null) })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeepUpdateReq {
+    content: Option<String>,
+    summary: Option<String>,
+    essence: Option<String>,
+    fact_type: Option<String>,
+    importance: Option<f32>,
+    pinned_by: Option<String>,
+    subject_key: Option<String>,
+    tags: Option<Vec<String>>,
+}
+
+async fn deep_memory_update_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DeepUpdateReq>,
+) -> Json<Value> {
+    let Some(mut fact) = state
+        .memory_store
+        .deep_get(&id)
+        .map_err(|e| e)
+        .unwrap_or(None)
+    else {
+        return Json(json!({ "success": false, "error": "not found" }));
+    };
+    if let Some(v) = body.content {
+        if !v.trim().is_empty() {
+            fact.content = v.trim().to_string();
+        }
+    }
+    if let Some(v) = body.summary {
+        fact.summary = v;
+    }
+    if let Some(v) = body.essence {
+        fact.essence = v;
+    }
+    if let Some(v) = body.fact_type {
+        fact.fact_type = deep_parse_type(&v);
+    }
+    if let Some(v) = body.importance {
+        fact.importance = crate::deep_memory::ema_update(fact.importance, v.clamp(0.0, 5.0), 0.4);
+    }
+    if let Some(v) = body.pinned_by {
+        fact.pinned_by = deep_parse_pinned(&v);
+    }
+    if let Some(v) = body.subject_key {
+        fact.subject_key = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
+    }
+    if let Some(v) = body.tags {
+        fact.tags = v;
+    }
+    match state.memory_store.deep_store(&fact) {
+        Ok(()) => Json(json!({ "success": true, "fact": serde_json::to_value(&fact).unwrap_or(Value::Null) })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+async fn deep_memory_delete_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match state.memory_store.deep_forget(&id) {
+        Ok(true) => Json(json!({ "success": true })),
+        Ok(false) => Json(json!({ "success": false, "error": "not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+async fn deep_memory_import_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    match crate::memory_migrate::import_memory_md_to_shallow(&state.workspace_dir, &state.memory_store) {
+        Ok(n) => Json(json!({ "success": true, "imported": n })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+// ── History API ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct HistoryQuery {
@@ -2324,6 +2592,155 @@ struct HistoryQuery {
     limit: usize,
     #[serde(default = "default_tz_offset")]
     tz_offset: i32,
+}
+
+// ── Engram Curator（后台自动蒸馏，temm1e 形态）───────────────
+
+#[derive(serde::Deserialize)]
+struct CuratedFact {
+    content: String,
+    #[serde(default)]
+    fact_type: String,
+    #[serde(default)]
+    subject_key: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CuratedFacts {
+    #[serde(default)]
+    facts: Vec<CuratedFact>,
+}
+
+/// 从可能带代码围栏的 LLM 输出里截取第一个 `{...}` JSON 对象。
+fn parse_curated_facts(content: &str) -> Option<Vec<CuratedFact>> {
+    let a = content.find('{')?;
+    let b = content.rfind('}')?;
+    if b < a {
+        return None;
+    }
+    serde_json::from_str::<CuratedFacts>(&content[a..=b])
+        .ok()
+        .map(|c| c.facts)
+}
+
+/// 词集 Jaccard 近似重复检测（阈值 0.6），防止把已存在的同义事实重复入深层。
+fn deep_near_duplicate(a: &str, b: &str) -> bool {
+    fn words(x: &str) -> std::collections::HashSet<String> {
+        x.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+            .map(String::from)
+            .collect()
+    }
+    let (wa, wb) = (words(a), words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return false;
+    }
+    let inter = wa.intersection(&wb).count() as f32;
+    let union = wa.union(&wb).count() as f32;
+    inter / union >= 0.6
+}
+
+/// 后台 Engram Curator：实质回复后异步蒸馏 durable facts 到深层记忆。
+fn spawn_deep_curator(
+    state: Arc<AppState>,
+    model: &str,
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    if !state.two_tier_memory.load(Ordering::SeqCst) {
+        return;
+    }
+    if user_text.trim().chars().count() <= 40 {
+        return;
+    }
+    if assistant_text.trim().is_empty() {
+        return;
+    }
+    let model = model.to_string();
+    let user_text = user_text.to_string();
+    let assistant_text = assistant_text.to_string();
+    tokio::spawn(async move {
+        let trunc = |s: &str| s.chars().take(500).collect::<String>();
+        let digest = format!("User: {}\nTem: {}", trunc(&user_text), trunc(&assistant_text));
+        let sys = "You are a precise long-term-memory curator. From the conversation below extract DURABLE facts about the user or project worth remembering permanently across future sessions: standing preferences, identity details, hard constraints, stable project facts. Ignore one-off or transient details. Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
+        let messages = vec![ChatMessage::system(sys), ChatMessage::user(&digest)];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let content = match state
+            .provider
+            .chat_stream(&model, &messages, &[], tx, "deep-curator", "memory")
+            .await
+        {
+            Ok((c, _, _, _, _)) => c,
+            Err(e) => {
+                tracing::warn!("[deep-curator] LLM call failed: {e}");
+                return;
+            }
+        };
+        let Some(facts) = parse_curated_facts(&content) else {
+            return;
+        };
+        let now = deep_now();
+        for cf in facts.iter().take(3) {
+            let fcontent = cf.content.trim();
+            if fcontent.is_empty() {
+                continue;
+            }
+            let existing = cf.subject_key.as_deref().and_then(|sk| {
+                state
+                    .memory_store
+                    .deep_list("global")
+                    .ok()
+                    .and_then(|l| l.into_iter().find(|e| e.subject_key.as_deref() == Some(sk)))
+            });
+            if existing.is_none() {
+                let dup = state
+                    .memory_store
+                    .deep_list("global")
+                    .ok()
+                    .map(|l| l.iter().any(|e| deep_near_duplicate(&e.content, fcontent)))
+                    .unwrap_or(false);
+                if dup {
+                    continue;
+                }
+            }
+            if let Some(mut fact) = existing {
+                if matches!(fact.pinned_by, crate::deep_memory::PinnedBy::User) {
+                    continue;
+                }
+                fact.content = fcontent.to_string();
+                fact.fact_type = deep_parse_type(&cf.fact_type);
+                fact.importance = fact.importance.max(4.0);
+                fact.last_accessed = now;
+                if state.memory_store.deep_store(&fact).is_ok() {
+                    tracing::info!("[deep-curator] updated durable fact: {}", fcontent);
+                }
+                continue;
+            }
+            let fact = crate::deep_memory::DeepFact {
+                id: deep_make_id("global", cf.subject_key.as_deref(), fcontent),
+                content: fcontent.to_string(),
+                summary: fcontent.chars().take(160).collect(),
+                essence: fcontent.split_whitespace().take(6).collect::<Vec<_>>().join(" "),
+                fact_type: deep_parse_type(&cf.fact_type),
+                scope: crate::deep_memory::MemoryScope::Global,
+                pinned_by: crate::deep_memory::PinnedBy::Agent,
+                subject_key: cf.subject_key.clone(),
+                importance: 4.0,
+                created_at: now,
+                last_accessed: now,
+                tags: Vec::new(),
+                links: Vec::new(),
+            };
+            if let Err(e) = state.memory_store.deep_store(&fact) {
+                tracing::warn!("[deep-curator] store failed: {e}");
+                continue;
+            }
+            tracing::info!("[deep-curator] captured durable fact: {}", fcontent);
+        }
+    });
 }
 
 fn default_history_days() -> usize { 3 }
@@ -2742,43 +3159,81 @@ async fn agent_settings_expert_save_handler(
 // Config Files (AGENTS.md, SOUL.md, TOOLS.md)
 // ============================================================
 
-async fn config_files_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+async fn config_files_handler(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let workspace = &state.workspace_dir;
     let files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "MEMORY.md", "USER.md"];
     let mut result = serde_json::Map::new();
 
     for file_name in &files {
         let path = std::path::Path::new(workspace).join(file_name);
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        result.insert(file_name.to_string(), json!(content));
+        // A2：读失败必须显式报错，区分"不存在"（返回空）与"读取失败"（返回错误）——
+        // 杜绝"静默读空 → 保存清空"的身份文件丢失回路。B2：改用异步 tokio::fs。
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                result.insert(file_name.to_string(), json!(content));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                result.insert(file_name.to_string(), json!(""));
+            }
+            Err(e) => {
+                return Err((
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to read config file {}: {}", file_name, e) })),
+                ));
+            }
+        }
     }
 
-    Json(json!({ "files": result, "workspace_dir": workspace }))
+    Ok(Json(json!({ "files": result, "workspace_dir": workspace })))
 }
 
 async fn config_file_save_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let allowed = ["AGENTS.md", "SOUL.md", "TOOLS.md", "MEMORY.md", "USER.md"];
     if !allowed.contains(&name.as_str()) {
-        return Json(json!({ "success": false, "error": "Invalid file name. Allowed: AGENTS.md, SOUL.md, TOOLS.md, MEMORY.md, USER.md" }));
+        return Ok(Json(json!({ "success": false, "error": "Invalid file name. Allowed: AGENTS.md, SOUL.md, TOOLS.md, MEMORY.md, USER.md" })));
     }
 
     let content = body["content"].as_str().unwrap_or("");
     let path = std::path::Path::new(&state.workspace_dir).join(&name);
 
-    if let Err(e) = std::fs::create_dir_all(&state.workspace_dir) {
-        return Json(json!({ "success": false, "error": format!("Failed to create workspace: {}", e) }));
+    // A2：空内容覆盖非空文件 → 拒绝（防"读空→写空"清空人格/规则/身份文件）。
+    // 与"用户刻意清空"区分：只有现有内容非空且新内容为空才拦截。
+    if content.trim().is_empty() {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(existing) if !existing.trim().is_empty() => {
+                return Ok(Json(json!({
+                    "success": false,
+                    "error": format!("Refusing to overwrite non-empty {} with empty content (A2 clobber guard)", name)
+                })));
+            }
+            _ => {}
+        }
     }
 
-    match std::fs::write(&path, content) {
+    if let Err(e) = tokio::fs::create_dir_all(&state.workspace_dir).await {
+        return Ok(Json(json!({ "success": false, "error": format!("Failed to create workspace: {}", e) })));
+    }
+
+    // A2：覆盖前保留 .bak 快照（仅当现有内容非空且与本次不同）。
+    if !content.trim().is_empty() {
+        if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+            if !existing.trim().is_empty() && existing != content {
+                let bak = path.with_extension("md.bak");
+                let _ = tokio::fs::write(&bak, &existing).await;
+            }
+        }
+    }
+
+    match tokio::fs::write(&path, content).await {
         Ok(_) => {
             info!("Config file saved: {}", path.display());
-            Json(json!({ "success": true, "file": name }))
+            Ok(Json(json!({ "success": true, "file": name })))
         }
-        Err(e) => Json(json!({ "success": false, "error": format!("Failed to save: {}", e) })),
+        Err(e) => Ok(Json(json!({ "success": false, "error": format!("Failed to save: {}", e) }))),
     }
 }
 
@@ -2902,6 +3357,14 @@ async fn usage_today_handler(
 
 /// 统一上下文预算（Finite Brain）仪表盘数据：返回窗口 / 预留 / 占用 / 剩余
 /// 及各用途的估算分配，供 Dashboard 页的「有限脑预算」视图渲染。
+async fn sop_stats_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let ws = state.workspace_dir.clone();
+    let metrics = crate::sop::sop_metrics(&ws);
+    Json(json!({
+        "metrics": metrics,
+        "replay_enabled": state.sop_replay.load(Ordering::SeqCst),
+    }))
+}
 async fn budget_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let enabled = state.budget_dashboard.load(Ordering::SeqCst);
     let threshold = state.context_window_threshold.load(Ordering::SeqCst).max(1).min(100);
@@ -2958,7 +3421,7 @@ fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &st
         let trunc = |s: &str| s.chars().take(500).collect::<String>();
         // Faithful to temm1e runtime.rs: full_text = truncated User/Assistant pair.
         let full_text = format!("User: {}\nAssistant: {}", trunc(user_text), trunc(&assist_clean));
-        let hash = crate::shallow_memory::make_hash(session_id, assist_clean.len(), now);
+        let hash = crate::shallow_memory::make_hash(session_id, &full_text);
         let is_explicit = user_text.to_lowercase().contains("remember");
         let entry = crate::shallow_memory::ShallowEntry::new(
             hash,
