@@ -74,7 +74,7 @@ fn main() {
 
     // Embed Windows application icon
     if cfg!(target_os = "windows") {
-        let icon_path = "RustAgent.ico";
+        let icon_path = "FOXIR.ico";
         if Path::new(icon_path).exists() {
             let mut res = winresource::WindowsResource::new();
             res.set_icon(icon_path);
