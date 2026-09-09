@@ -1663,7 +1663,14 @@ impl Agent for LlmAgent {
                             let is_greeting = ["hi", "hello", "hey", "你好", "嗨", "哈喽", "早上好", "下午好", "晚上好"]
                                 .iter().any(|g| user_trimmed == *g);
 
-                            if !is_greeting && (mentions_tool || has_intent) {
+                            // The model already gave a substantive, complete text answer: never
+                            // re-organize it into a tool call just because the content or reasoning
+                            // happens to mention a tool name or an intent phrase (e.g. quoting a
+                            // recalled lesson that names "browser_cdp"). Only force a tool call
+                            // when the visible answer is an empty/short stub that meant to act.
+                            let gave_full_answer = content.trim().chars().count() >= 120;
+                            if !is_greeting && !gave_full_answer && (mentions_tool || has_intent) {
+
                                 reprompt_count += 1;
                                 let reason = if mentions_tool {
                                     "tool name mentioned"
