@@ -117,6 +117,11 @@ impl SkillManager {
         for entry in glob::glob(&dir_pattern).ok().into_iter().flatten() {
             match entry {
                 Ok(path) => {
+                    // 跳过回收站：skills/_deleted/ 下的已删技能绝不能再次被发现，
+                    // 否则 delete_skill 移到 _deleted 后 reload() 会把它"复活"。
+                    if path.components().any(|c| c.as_os_str() == "_deleted") {
+                        continue;
+                    }
                     let skill_dir = path.parent()
                         .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_string())
                         .unwrap_or_default();

@@ -605,7 +605,10 @@ impl MemoryStore {
                     };
                     let preview: String = e.content.chars().take(300).collect();
                     let suffix = if e.content.chars().count() > 300 { "..." } else { "" };
-                    parts.push(format!("[{}] {}: {}{}", e.date, role_label, preview, suffix));
+                    let when = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|_| e.date.clone());
+                    parts.push(format!("[{}] {}: {}{}", when, role_label, preview, suffix));
                 }
             }
         }

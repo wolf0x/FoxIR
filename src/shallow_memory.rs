@@ -180,9 +180,10 @@ pub fn best_representation(
 
 fn format_hot(entry: &ShallowEntry) -> String {
     format!(
-        "[hot] {}\n      ({} | importance: {:.1}{})\n\n",
+        "[hot] {}\n      ({} | {} | importance: {:.1}{})\n\n",
         entry.full_text,
         &entry.hash[..7.min(entry.hash.len())],
+        ts(entry.created_at),
         entry.importance,
         if entry.explicit_save { " | explicit save" } else { "" },
     )
@@ -197,9 +198,10 @@ fn format_warm(entry: &ShallowEntry) -> String {
 }
 fn format_cool(entry: &ShallowEntry) -> String {
     format!(
-        "[cool] {} ({})\n",
+        "[cool] {} ({} | {})\n",
         entry.essence_text,
         &entry.hash[..7.min(entry.hash.len())],
+        ts(entry.created_at),
     )
 }
 fn format_faded(entry: &ShallowEntry) -> String {
@@ -211,7 +213,9 @@ fn format_faded(entry: &ShallowEntry) -> String {
 }
 fn ts(epoch: u64) -> String {
     // 仅作展示；不做时区换算（终端日志遵循系统时区由上层负责）。
-    format!("{}", epoch)
+    chrono::DateTime::from_timestamp(epoch as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| epoch.to_string())
 }
 
 // ── 上下文组装（纯函数：候选由调用方预先取好）────────────────
