@@ -604,6 +604,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Scheduler::run_loop(scheduler_loop).await;
     });
 
+    // Heartbeat switch (default: on; runs proactive HEARTBEAT.md checks)
+    let heartbeat_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
     // Spawn heartbeat background loop
     let heartbeat = Heartbeat::new(
         runner.clone(),
@@ -617,6 +620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.agent.tool_timeout_secs as u64,
         notify_tx.clone(),
         workspace_dir.clone(),
+        heartbeat_enabled.clone(),
     );
     tokio::spawn(async move {
         heartbeat.run_loop().await;
@@ -705,6 +709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Human intervention simulation switch (default: false)
     let human_intervention_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+
     // Build app state
     let state = Arc::new(AppState {
         runner: runner.clone(),
@@ -752,6 +757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider: provider_for_state,
         computer_use_enabled,
         human_intervention_enabled,
+        heartbeat_enabled,
         primary_model: Arc::new(std::sync::RwLock::new(config.agent.primary_model.clone())),
         fallback_model: Arc::new(std::sync::RwLock::new(config.agent.fallback_model.clone())),
         expert_role_models: Arc::new(std::sync::RwLock::new(config.agent.expert_role_models.clone())),

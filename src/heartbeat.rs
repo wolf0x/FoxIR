@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
 
@@ -31,6 +32,7 @@ pub struct Heartbeat {
     notify_tx: NotifyTx,
     workspace_dir: String,
     interval_secs: u64,
+    enabled: Arc<AtomicBool>,
 }
 
 impl Heartbeat {
@@ -46,6 +48,7 @@ impl Heartbeat {
         tool_timeout_secs: u64,
         notify_tx: NotifyTx,
         workspace_dir: String,
+        enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             runner,
@@ -60,6 +63,7 @@ impl Heartbeat {
             notify_tx,
             workspace_dir,
             interval_secs: DEFAULT_HEARTBEAT_INTERVAL,
+            enabled,
         }
     }
 
@@ -80,6 +84,10 @@ impl Heartbeat {
 
     /// Run one heartbeat cycle: read HEARTBEAT.md, execute via agent, send alerts.
     async fn run_once(&self) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            debug!("Heartbeat: disabled, skipping");
+            return;
+        }
         let heartbeat_content = match self.read_heartbeat_file() {
             Some(c) => c,
             None => {

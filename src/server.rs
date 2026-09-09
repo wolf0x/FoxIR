@@ -208,6 +208,8 @@ pub struct AppState {
     pub computer_use_enabled: Arc<AtomicBool>,
     /// Whether to use LLM to simulate human intervention when Expert mode is blocked
     pub human_intervention_enabled: Arc<AtomicBool>,
+    /// Whether the background heartbeat (proactive HEARTBEAT.md checks) is enabled
+    pub heartbeat_enabled: Arc<AtomicBool>,
     /// Primary model name (from config.toml) — RwLock for hot-reload from UI
     pub primary_model: Arc<std::sync::RwLock<Option<String>>>,
     /// Fallback model name (from config.toml) — RwLock for hot-reload from UI
@@ -287,6 +289,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/checkpoints/{id}", delete(checkpoints_delete_handler))
         .route("/api/settings/computer_use", post(computer_use_toggle_handler))
         .route("/api/settings/human_intervention", get(human_intervention_get_handler).post(human_intervention_toggle_handler))
+        .route("/api/settings/heartbeat", get(heartbeat_get_handler).post(heartbeat_toggle_handler))
         .route("/api/settings/agent", post(agent_settings_save_handler))
         .route("/api/settings/agent/extended", post(agent_settings_extended_save_handler))
         .route("/api/settings/agent/expert", post(agent_settings_expert_save_handler))
@@ -2884,6 +2887,30 @@ async fn human_intervention_toggle_handler(
     
     if prev != enabled {
         info!("Human Intervention Simulation {}", if enabled { "ENABLED" } else { "DISABLED" });
+    }
+    
+    Json(json!({ "success": true, "enabled": enabled }))
+}
+
+// Heartbeat toggle
+// ============================================================
+
+async fn heartbeat_get_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let enabled = state.heartbeat_enabled.load(Ordering::SeqCst);
+    Json(json!({ "success": true, "enabled": enabled }))
+}
+
+async fn heartbeat_toggle_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let prev = state.heartbeat_enabled.swap(enabled, Ordering::SeqCst);
+    
+    if prev != enabled {
+        info!("Heartbeat {}", if enabled { "ENABLED" } else { "DISABLED" });
     }
     
     Json(json!({ "success": true, "enabled": enabled }))

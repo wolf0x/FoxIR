@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Cache-Control" content="no-cache">
-<title>RustAgent</title>
+<title>FoxIR</title>
+<link rel="icon" type="image/x-icon" href="/static/foxir.ico">
 <script>
 /**
  * marked v15.0.12 - a markdown parser
@@ -96,6 +97,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 @keyframes logoPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.1)}}
 @keyframes logoRipple{0%{transform:scale(1);opacity:0.6}100%{transform:scale(1.8);opacity:0}}
 .sidebar-hdr-row{display:flex;align-items:center;gap:12px}
+.sidebar-logo .logo-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
 .nav-tabs{display:flex;flex-direction:column;gap:4px;padding:8px}
 .nav-tab{padding:12px 16px;background:0;border:0;color:#bdc3c7;text-align:left;cursor:pointer;border-radius:var(--rs);font-size:14px;font-weight:500;transition:.2s}
 .nav-tab:hover{background:#34495e;color:white}
@@ -424,6 +426,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 .grok-item .grok-chk{margin-left:auto;color:var(--accent);font-weight:700;padding-top:2px;visibility:hidden}
 .grok-item.sel .grok-chk{visibility:visible}
 /* 发送 / 停止（狼头 LOGO 呼吸 ↔ 红色停止脉冲） */
+.grok-send .send-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
 .grok-send{
   flex-shrink:0; width:40px; height:40px; border-radius:50%; border:none; cursor:pointer;
   background:linear-gradient(135deg,#3498db 0%,#2ecc71 100%); color:#fff; display:flex; align-items:center; justify-content:center;
@@ -714,9 +717,9 @@ input:checked+.slider:before{transform:translateX(20px)}
   <div class="sidebar">
     <div class="sidebar-hdr">
       <div class="sidebar-hdr-row">
-        <div class="sidebar-logo" id="sidebarLogo">🐺</div>
+        <div class="sidebar-logo" id="sidebarLogo"><img class="logo-img" src="/static/foxir.ico" alt="FoxIR"></div>
         <div>
-          <h2>RustAgent</h2>
+          <h2>FoxIR</h2>
           <p>AI System Agent By W@L4</p>
         </div>
       </div>
@@ -845,6 +848,16 @@ input:checked+.slider:before{transform:translateX(20px)}
             </div>
             <label class="perm-toggle">
               <input type="checkbox" id="cuToggle" onchange="toggleComputerUse(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <label style="margin-bottom:0">&#128276; Heartbeat</label>
+              <small style="color:var(--t3)">Periodically read HEARTBEAT.md for proactive checks; off to stop the background loop</small>
+            </div>
+            <label class="perm-toggle">
+              <input type="checkbox" id="heartbeatToggle" onchange="toggleHeartbeat(this.checked)">
               <span class="slider"></span>
             </label>
           </div>
@@ -1286,7 +1299,7 @@ input:checked+.slider:before{transform:translateX(20px)}
               </div>
             </div>
             <!-- 发送 / 停止（狼头 LOGO） -->
-            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送">🐺</button>
+            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送"><img class="send-img" src="/static/foxir.ico" alt="send"></button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopAgent()" style="display:none">Stop</button>
           </div>
           </div>
@@ -1368,7 +1381,7 @@ function switchPage(name,btn){
   if(name==='mcp')loadMcp();
   if(name==='cron')loadCron();
   if(name==='agents')loadAgents();
-  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();}
+  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();initHeartbeatToggle();}
   if(name==='tools')loadTools();
   if(name==='knowledge')loadKnowledge();
   if(name==='dashboard')loadDashboard();
@@ -2336,6 +2349,20 @@ async function initHumanInterventionToggle(){
     // Failed to load state, keep default (unchecked)
   }
 }
+// Initialize heartbeat toggle state from backend
+async function initHeartbeatToggle(){
+  try{
+    const r=await fetch('/api/settings/heartbeat');
+    const d=await r.json();
+    const toggle=document.getElementById('heartbeatToggle');
+    if(toggle&&d.enabled!==undefined){
+      toggle.checked=d.enabled;
+    }
+  }catch(e){
+    // Failed to load state, keep default (on)
+  }
+}
+
 async function saveProvider(){
   const name=document.getElementById('provName').value.trim();
   const apiBase=document.getElementById('provApiBase').value.trim();
@@ -3314,6 +3341,20 @@ function toggleHumanIntervention(enabled){
       }
     })
     .catch(e=>addLog('Human intervention toggle error: '+e,'error'));
+}
+
+// Toggle background heartbeat
+function toggleHeartbeat(enabled){
+  fetch('/api/settings/heartbeat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})})
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.success){
+        addLog('Heartbeat '+(enabled?'enabled':'disabled'),'info');
+      }else{
+        addLog('Heartbeat toggle failed: '+(d.error||'unknown'),'error');
+      }
+    })
+    .catch(e=>addLog('Heartbeat toggle error: '+e,'error'));
 }
 
 // Save extended settings (model selection, timezone, permissions) to config.toml

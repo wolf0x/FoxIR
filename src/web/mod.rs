@@ -60,6 +60,12 @@ impl StaticServer {
     /// Serve files embedded in the binary as fallback.
     fn serve_embedded(path: &str) -> Response {
         match path {
+            "foxir.ico" => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "image/x-icon")
+                .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                .body(include_bytes!("../../static/foxir.ico").to_vec().into())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             "marked.min.js" => {
                 Response::builder()
                     .status(StatusCode::OK)
