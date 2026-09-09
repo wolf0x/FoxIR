@@ -1645,43 +1645,33 @@ impl Agent for LlmAgent {
                         info!("[session:{}] Response analysis: content={} chars, reasoning={} chars, native_tool_calls={}",
                               session_id, content.len(), reasoning.len(), tool_calls.len());
                         if tool_calls.is_empty() && !tool_defs.is_empty() && !has_executed_tools && reprompt_count < 2 && !combined.trim().is_empty() {
-                            // Check BOTH content AND reasoning for tool name mentions.
-                            let check_text = format!("{}\n{}", &content, &reasoning).to_lowercase();
-                            let mentions_tool = tool_defs.iter().any(|t| check_text.contains(&t.function.name.to_lowercase()));
-
-                            // Detect intent phrases in both Chinese and English that suggest
-                            // the model intends to take an action (call a tool) but didn't.
-                            // Only specific action phrases — generic words like "运行" or "i'll"
-                            // cause false positives on greetings and casual chat.
-                            let intent_phrases = [
-                                "查一下", "看一下", "检查一下", "让我查", "让我看看", "让我来",
-                                "使用工具", "调用工具",
-                                "let me check", "let me run", "let me use", "let me look",
-                                "allow me to",
-                            ];
-                            let has_intent = intent_phrases.iter().any(|p| check_text.contains(p));
-
-                            // Skip re-prompt for simple greetings — the model should
-                            // just respond naturally without being forced to call tools.
-                            let user_trimmed = user_message.trim().to_lowercase();
-                            let is_greeting = ["hi", "hello", "hey", "你好", "嗨", "哈喽", "早上好", "下午好", "晚上好"]
-                                .iter().any(|g| user_trimmed == *g);
-
-                            // The model already gave a substantive, complete text answer: never
-                            // re-organize it into a tool call just because the content or reasoning
-                            // happens to mention a tool name or an intent phrase (e.g. quoting a
-                            // recalled lesson that names "browser_cdp"). Only force a tool call
-                            // when the visible answer is an empty/short stub that meant to act.
-                            let gave_full_answer = content.trim().chars().count() >= 120;
-                            if !is_greeting && !gave_full_answer && (mentions_tool || has_intent) {
+                            // D3 根治：是否重提示改由结构化 decide_turn 决定；散文信号
+                            // （工具名子串 / 意图词 / 长度阈值）全部删除，不再参与决策。
+                            // 一段实质文本回答永远被接受为 Answer（治愈“复述含 browser_cdp 的记忆”误触）。
+                            // 查漏1（观测）：探测“有工具信封但解析失败”——潜在丢失的工具调用。
+                            let malformed_env = tool_calls.is_empty()
+                                && crate::turn_decision::looks_like_tool_envelope(combined);
+                            if malformed_env {
+                                warn!("[session:{}] 检测到工具调用信封但解析为空（iter {}）：潜在丢失的工具调用；Stage B 仅观测不重试", session_id, iteration);
+                            }
+                            let turn_signals = crate::turn_decision::TurnSignals {
+                                tool_calls: tool_calls.len(),
+                                finish_reason: crate::turn_decision::FinishReason::normalize(finish_reason.as_deref()),
+                                has_visible_text: !combined.trim().is_empty(),
+                                // 查漏1：malformed_envelope 现由 looks_like_tool_envelope 真实置位（信号保真）；
+                                // 但 native_tool_calling 仍硬编码 true → decide_turn 不会选 RetryMalformed（重试行为不变，仅 warn! 观测）。
+                                malformed_envelope: malformed_env,
+                                native_tool_calling: true,
+                                ran_tools: has_executed_tools,
+                                malformed_retry_done: reprompt_count > 0,
+                            };
+                            let turn_decision = crate::turn_decision::decide_turn(&turn_signals);
+                            info!("[session:{}] turn decision={:?} tool_calls={} finish={:?} visible_text={} ran_tools={}",
+                                  session_id, turn_decision, turn_signals.tool_calls, turn_signals.finish_reason, turn_signals.has_visible_text, has_executed_tools);
+                            if matches!(turn_decision, crate::turn_decision::TurnDecision::RetryMalformed) {
 
                                 reprompt_count += 1;
-                                let reason = if mentions_tool {
-                                    "tool name mentioned"
-                                } else {
-                                    "intent phrase detected"
-                                };
-                                info!("[session:{}] Re-prompting model to emit tool call JSON (iter {}, attempt {}, reason: {})", session_id, iteration, reprompt_count, reason);
+                                info!("[session:{}] Re-prompting model to emit well-formed tool call JSON (iter {}, attempt {}, reason: malformed tool envelope)", session_id, iteration, reprompt_count);
 
                                 // Notify the user that the system is retrying the tool call
                                 let _ = tx.send(Ok(AgentEvent::thinking(
