@@ -207,12 +207,15 @@ impl Tool for TodoUpdateTool {
                 self.save_todos(&todos, &session_id)
                     .map_err(|e| format!("Failed to save TODOs: {}", e))?;
 
-                // Terminal fuse: when this update leaves every item in a terminal
-                // state (completed/cancelled/skipped), the task contract is finished —
-                // auto-clear instead of leaving a stale list.
-                let all_terminal = !todos.items.is_empty()
-                    && todos.items.iter().all(|i| i.status == "completed" || i.status == "cancelled" || i.status == "skipped");
-                if all_terminal {
+                // Terminal fuse: only a *successful* completion (completed) or an
+                // explicit cancellation counts as "work done". A watchdog-skipped
+                // item is *not* finished — it must not trigger auto-clear, otherwise
+                // genuinely unfinished work gets silently dropped and the user never
+                // gets a chance to resume it.
+                let skipped_count = todos.items.iter().filter(|i| i.status == "skipped").count();
+                let all_done = !todos.items.is_empty()
+                    && todos.items.iter().all(|i| i.status == "completed" || i.status == "cancelled");
+                if all_done {
                     self.save_todos(&TodoList::default(), &session_id)
                         .map_err(|e| format!("Failed to clear TODOs: {}", e))?;
                     return Ok(json!({
@@ -223,10 +226,17 @@ impl Tool for TodoUpdateTool {
                     }));
                 }
 
+                let mut note = String::new();
+                if skipped_count > 0 {
+                    note = format!(
+                        " NOTE: {} item(s) are 'skipped' (unfinished) and were NOT counted toward completion; they remain in the list for you to resume.",
+                        skipped_count
+                    );
+                }
                 Ok(json!({
                     "success": true,
                     "action": "update",
-                    "message": format!("Item {} updated to '{}'", index, status),
+                    "message": format!("Item {} updated to '{}'{}", index, status, note),
                     "todos": Self::todos_to_json(&todos)
                 }))
             }
@@ -386,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_clear_when_all_terminal_including_skipped() {
+    async fn skipped_items_prevent_auto_clear() {
         let ws = tmp_ws("clearskip");
         let t = tool(&ws);
         let c = ctx(&ws, "main-6");
@@ -397,11 +407,33 @@ mod tests {
         // skip first, still one pending -> not cleared
         let r1 = t.execute(json!({"action": "update", "index": 0, "status": "skipped"}), &c).await.unwrap();
         assert_ne!(r1["auto_cleared"].as_bool().unwrap_or(false), true);
-        // mark last skipped too -> all terminal -> auto-clear
+        // mark last skipped too -> ALL items are terminal but none were really
+        // completed -> MUST NOT auto-clear, and must note the unfinished skipped item
         let r2 = t.execute(json!({"action": "update", "index": 1, "status": "skipped"}), &c).await.unwrap();
-        assert_eq!(r2["auto_cleared"].as_bool().unwrap_or(false), true);
+        assert_ne!(r2["auto_cleared"].as_bool().unwrap_or(false), true);
+        assert!(r2["message"].as_str().unwrap_or("").contains("skipped"));
+        // list must still hold both items (unfinished -> not cleared)
         let list = t.execute(json!({"action": "list"}), &c).await.unwrap();
-        assert_eq!(list["todos"]["count"].as_u64().unwrap(), 0);
+        assert_eq!(list["todos"]["count"].as_u64().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn skipped_item_does_not_clear_even_when_rest_completed() {
+        let ws = tmp_ws("clearskip2");
+        let t = tool(&ws);
+        let c = ctx(&ws, "main-7");
+        t.execute(json!({"action": "set", "items": [
+            {"description": "a", "status": "pending"},
+            {"description": "b", "status": "pending"},
+        ]}), &c).await.unwrap();
+        // one skipped (watchdog timeout), other completed -> list must survive
+        t.execute(json!({"action": "update", "index": 0, "status": "skipped"}), &c).await.unwrap();
+        let r2 = t.execute(json!({"action": "update", "index": 1, "status": "completed"}), &c).await.unwrap();
+        assert_ne!(r2["auto_cleared"].as_bool().unwrap_or(false), true);
+        assert!(r2["message"].as_str().unwrap_or("").contains("skipped"));
+        let list = t.execute(json!({"action": "list"}), &c).await.unwrap();
+        assert_eq!(list["todos"]["count"].as_u64().unwrap(), 2);
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
