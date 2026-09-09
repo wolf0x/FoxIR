@@ -1,11 +1,11 @@
 [package]
-name = "RustAgent"
-version = "0.33.29"
+name = "FoxIR"
+version = "1.0.0"
 edition = "2021"
 description = "Local AI agent with WebSocket gateway, multi-model support, and Windows system tools"
 
 [[bin]]
-name = "RustAgent"
+name = "FoxIR"
 path = "src/main.rs"
 
 [dependencies]

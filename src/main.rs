@@ -499,7 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
 
     let agent = LlmAgent::builder()
-        .name("RustAgent")
+        .name("FoxIR")
         .description("Local AI agent with Windows system tools")
         .provider(provider)
         .tools(shared_tools.clone())
@@ -548,7 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .agent(agent)
         .logger(logger.clone())
         .checkpointer(checkpointer)
-        .app_name("RustAgent")
+        .app_name("FoxIR")
         .trim_redundant_tool_calls(trim_redundant_tool_calls.clone())
         .knowledge_pre_retrieval(knowledge_pre_retrieval.clone())
         .sop_replay(sop_replay.clone())

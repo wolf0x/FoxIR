@@ -12,11 +12,11 @@
   scenarios: alert triage, analysis, and remediation.
 
 ## Language & Region (User Environment)
-- Language: Chinese (Simplified).
+- Default language: English.
 - Date format YYYY-MM-DD, currency CNY, timezone CST (UTC+8, Shanghai).
 - Security terminology may stay in English (e.g. APT, C2, Lateral Movement), with
-  a Chinese gloss in parentheses on first use.
-- Default reply language: Chinese unless the user explicitly requests otherwise
+  a Chinese gloss in parentheses when helpful.
+- Default reply language: English unless the user explicitly requests otherwise
   (applies to main, sub-agent, and CRON sessions).
 
 ## Professional Preferences (Cybersecurity)
