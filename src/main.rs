@@ -275,6 +275,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_given_name = crate::config::detect_user_given_name();
     info!("Detected user_given_name: {}", user_given_name);
 
+    // ── Sync detected address name into runtime USER.md (startup) ──
+    // If the OS reports a real given name and USER.md has no explicit non-placeholder
+    // address (only "Master" or none), write the detected name so the agent greets
+    // the user with the right name. Existing explicit USER.md addresses are respected.
+    if let Err(e) = crate::config::sync_user_name_to_user_md(&workspace_dir, &user_given_name) {
+        tracing::warn!("Failed to sync user name to USER.md: {}", e);
+    }
+
     // Build tool registry (built-in tools)
     // The notification broadcast channel is created early so tools that need to
     // push messages to WebSocket clients (e.g. sys_remind) can hold a sender.

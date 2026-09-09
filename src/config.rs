@@ -398,6 +398,87 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
+/// Current address name read from USER.md, if any explicit non-placeholder
+/// declaration exists. Looks for English "Call me X" or Chinese "称呼我为 X".
+pub fn user_md_address_name(workspace_dir: &str) -> Option<String> {
+    let path = std::path::Path::new(workspace_dir).join("USER.md");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // English: "Call me <name>"
+        let lower = trimmed.to_lowercase();
+        if let Some(idx) = lower.find("call me") {
+            let rest = &trimmed[idx + "call me".len()..];
+            let name: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace() || *c == ':' || *c == '：' || *c == '-')
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+                .collect();
+            let name = name.trim().to_string();
+            if !name.is_empty() && !name.eq_ignore_ascii_case("master") {
+                return Some(name);
+            }
+        }
+        // Chinese: "称呼我为 <name>"
+        if let Some(idx) = trimmed.find("称呼我为") {
+            let rest = &trimmed[idx + "称呼我为".len()..];
+            let name: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace() || *c == '：' || *c == ':')
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+                .collect();
+            let name = name.trim().to_string();
+            if !name.is_empty() && !name.eq_ignore_ascii_case("master") {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Sync the user address name into the runtime USER.md on startup.
+/// If the system detects a real given name and USER.md has no explicit non-placeholder
+/// address (only "Master" or none), written the detected name so the agent addresses
+/// the user correctly without manual edits. Returns true if USER.md was updated.
+pub fn sync_user_name_to_user_md(workspace_dir: &str, detected_name: &str) -> Result<bool, String> {
+    let detected = detected_name.trim();
+    if detected.is_empty() || !is_real_given_name(detected) {
+        return Ok(false);
+    }
+    // Respect an explicit user-declared address (any real name). Only fill the gap
+    // when USER.md uses the placeholder "Master" or has no address line at all.
+    if let Some(_existing) = user_md_address_name(workspace_dir) {
+        return Ok(false);
+    }
+    let path = std::path::Path::new(workspace_dir).join("USER.md");
+    let mut content = std::fs::read_to_string(&path).map_err(|e| format!("read USER.md: {e}"))?;
+    let line_en = content
+        .lines()
+        .find(|l| l.to_lowercase().contains("address the user as") || l.to_lowercase().contains("call me"))
+        .map(|l| l.to_string());
+    let line_cn = content.lines().find(|l| l.contains("称呼我为")).map(|l| l.to_string());
+    if let Some(old) = line_en {
+        let new_line = format!("- Address the user as **{}**.", detected);
+        if content.contains(&old) {
+            content = content.replace(&old, &new_line);
+        } else {
+            content.push_str(&format!("
+- Address the user as **{}**.
+", detected));
+        }
+    } else if let Some(old) = line_cn {
+        let new_line = format!("- 称呼我为 {}.", detected);
+        content = content.replace(&old, &new_line);
+    } else {
+        content.push_str(&format!("
+## Identity
+- Address the user as **{}**.
+", detected));
+    }
+    std::fs::write(&path, &content).map_err(|e| format!("write USER.md: {e}"))?;
+    Ok(true)
+}
+
 impl Config {
     /// Load config from the workspace directory. If no config exists, check the
     /// exe directory for backward compatibility, then generate a minimal default
@@ -591,4 +672,67 @@ timezone_offset = 8
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn tmp_ws(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("cfg_sync_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn sync_writes_detected_name_when_no_address() {
+        let ws = tmp_ws("noaddr");
+        std::fs::write(Path::new(&ws).join("USER.md"), "# USER.md\n\nSome body.\n").unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Alice").unwrap();
+        assert!(updated);
+        let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
+        assert!(content.contains("Alice"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sync_writes_detected_name_over_master_placeholder() {
+        let ws = tmp_ws("master");
+        std::fs::write(
+            Path::new(&ws).join("USER.md"),
+            "# USER.md\n\n- Address the user as **Master** by default.\n",
+        ).unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Bob").unwrap();
+        assert!(updated);
+        let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
+        assert!(content.contains("Bob"));
+        assert!(!content.contains("Address the user as **Master**"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sync_respects_existing_explicit_address() {
+        let ws = tmp_ws("explicit");
+        std::fs::write(
+            Path::new(&ws).join("USER.md"),
+            "# USER.md\n\n- 称呼我为 Wolf。\n",
+        ).unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Bob").unwrap();
+        assert!(!updated, "existing explicit address must be respected");
+        let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
+        assert!(content.contains("Wolf"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sync_skips_system_account_names() {
+        let ws = tmp_ws("admin");
+        std::fs::write(Path::new(&ws).join("USER.md"), "# USER.md\n\nSome body.\n").unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Administrator").unwrap();
+        assert!(!updated);
+        let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
+        assert!(!content.contains("Administrator"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
 
