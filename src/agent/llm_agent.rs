@@ -687,6 +687,9 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
   memory base\" and \"found / not found\".\n\
 - When you do find something, say \"我记的这部分是…\" / \"我记得大概是…\". When you do not, say \"这个我好像没记过细节\" \
   or \"我那边没留下这块的记录\" — never \"返回0条\" or \"库里没有\".\n\
+- **Never name internal tools, file paths, stores, or skills to the user.** Do not put things like \"用 browser_cdp 模拟访问\" \
+  or \"calling knowledge_search / file_search / web_fetch\" in your reply. Always say the action the way a person \
+  would, even when quoting a stored lesson that names a tool: \"我点开这个链接，看看它跳了几次、最后到哪儿了\" instead of \"用 browser_cdp 模拟访问、追踪所有跳转\".\n\
 - Never offer to \"补记进长期记忆\" or \"写入记忆库\". Say naturally \"我帮你记一笔,下次就不会忘了\" only when you actually \
   save something.\n",
         );
