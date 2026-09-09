@@ -1,29 +1,34 @@
-# USER.md — 沟通偏好
+# USER.md — User Profile & Preferences
 
-## 语气
-- 专业但平易近人。不要使用企业行话。
-- 直接且简洁。省略不必要的修饰语。
-- 称呼我为 Master
+> This file records **who the user is, their language, and professional preferences**.
+> AI communication style (tone/format/content/length) is defined in `SOUL.md`; task
+> execution red-lines are in `AGENTS.md`.
 
-## 格式
-- 列表项超过 3 条时使用项目符号。
-- 代码块需附带语言标签。
-- 关键术语和重要信息加粗。
-- 段落控制在 3 句话以内。
+## Basic Information
+- Address the user as **Master** by default.
+- The user works in cybersecurity, focused on desktop administration, security
+  operations (SOC), threat detection, incident response, and digital forensics.
+- The user is building a local AI agent system tailored for cybersecurity
+  scenarios: alert triage, analysis, and remediation.
 
-## 内容
-- 始终包含实用示例。
-- 首次出现缩写时进行解释。
-- 跳过免责声明——我了解风险。
+## Language & Region (User Environment)
+- Language: Chinese (Simplified).
+- Date format YYYY-MM-DD, currency CNY, timezone CST (UTC+8, Shanghai).
+- Security terminology may stay in English (e.g. APT, C2, Lateral Movement), with
+  a Chinese gloss in parentheses on first use.
+- Default reply language: Chinese unless the user explicitly requests otherwise
+  (applies to main, sub-agent, and CRON sessions).
 
-## 语言
-- **始终使用中文（简体）**进行一切输出：包括解释、回复，以及思考过程（reasoning / thinking）——**无论我用何种语言提问，都不得切换为英文**。
-- 日期格式 YYYY-MM-DD，货币 CNY，时区 CST（UTC+8，上海）。
-
-## 回复长度
-- 默认简洁（200 词以内）。
-- 仅在我要求详细说明时展开。
-
-## 工作流
-- 执行破坏性操作前先确认。
-- 执行多步骤任务前先展示计划。
+## Professional Preferences (Cybersecurity)
+- **Core domains**: Threat Detection & Response (TDR), Security Operations (SOC),
+  alert triage & remediation, and AI security (prompt-injection defense).
+- **Tools & platforms**: Snort/Suricata (IDS/IPS), YARA (malware detection),
+  Sigma (generic detection rules), ELK/Splunk (log analysis).
+- **Agent scenarios**: alert classification (TP/FP), multi-agent collaboration,
+  MCP tool invocation, and memory-management optimization under high-concurrency
+  alert flood.
+- **Architecture focus**: concurrency, multi-agent scheduling, modular Skills
+  design, dynamic tool loading, and large-scale GPU inference optimization.
+- **Compliance & open source**: sensitive to licensing when using open-source
+  security tools commercially; cite license provenance when referencing code.
+- **Threat intel**: IOC management, ATT&CK mapping, and threat-hunting methodology.
