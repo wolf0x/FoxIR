@@ -3660,9 +3660,9 @@ async function loadBudget(){
     if(!wrap) return;
     if(d.latest){
       const rows=(d.lines||[]).map(l=>'<tr><td>'+esc(l.category||'')+'</td><td>'+fmtToks(l.tokens||0)+'</td></tr>').join('');
-      wrap.innerHTML='<table style="width:100%"><thead><tr><th>类别</th><th>实测 Tokens</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      wrap.innerHTML='<table style="width:100%"><thead><tr><th>Category</th><th>Measured Tokens</th></tr></thead><tbody>' + rows + '</tbody></table>';
     } else {
-      wrap.innerHTML='<div style="color:var(--t3)">尚无会话记录 — 显示配置包络。执行一次任务后此处将展示最近一次实测占用。</div>';
+      wrap.innerHTML='<div style="color:var(--t3)">No session data yet — showing configured envelope. The most recent measured usage will appear here after you run a task.</div>';
     }
   }catch(e){
     const wrap=document.getElementById('budgetLines');
