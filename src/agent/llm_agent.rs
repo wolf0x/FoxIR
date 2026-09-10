@@ -1646,7 +1646,7 @@ impl Agent for LlmAgent {
                             let malformed_env = tool_calls.is_empty()
                                 && crate::turn_decision::looks_like_tool_envelope(combined);
                             if malformed_env {
-                                warn!("[session:{}] 检测到工具调用信封但解析为空（iter {}）：潜在丢失的工具调用；Stage B 仅观测不重试", session_id, iteration);
+                                warn!("[session:{}] detected tool-call envelope but parsed empty (iter {}): potentially lost tool call; Stage B observes only, no retry", session_id, iteration);
                             }
                             let turn_signals = crate::turn_decision::TurnSignals {
                                 tool_calls: tool_calls.len(),

@@ -457,7 +457,7 @@ fn parse_string_list(raw: &str, what: &str) -> Vec<String> {
     match serde_json::from_str::<Vec<String>>(t) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("[sop] {what} 非法 JSON，按单步原文保留：{e}");
+            tracing::warn!("[sop] {what} invalid JSON, kept verbatim as a single step: {e}");
             vec![t.to_string()]
         }
     }

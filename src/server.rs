@@ -1535,14 +1535,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 let (lam_block, lam_tok, lam_hashes) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
                                 let mut arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
                                 if !eg_block.trim().is_empty() {
-                                    info!("注入深层永久块 ({} chars)", eg_block.len());
+                                    info!("Injected deep permanent block ({} chars)", eg_block.len());
                                     arts.push(crate::context_arbiter::artifact_from_block(
                                         crate::context_arbiter::ArtifactKind::DeepFact,
                                         "global", 60.0, 0.6, true, eg_block,
                                     ));
                                 }
                                 if !lam_block.trim().is_empty() {
-                                    info!("注入浅层记忆块 ({} chars)", lam_block.len());
+                                    info!("Injected shallow memory block ({} chars)", lam_block.len());
                                     arts.push(crate::context_arbiter::artifact_from_block(
                                         crate::context_arbiter::ArtifactKind::ShallowMemory,
                                         "shallow", 50.0, 1.0, false, lam_block,
@@ -1555,17 +1555,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                         history.insert(0, ChatMessage::system(block));
                                     }
                                 }
-                                info!("有限脑仲裁：记忆产物装入 {} blocks / {} tokens (预算 {})", res.blocks.len(), res.used, mem_budget);
+                                info!("Finite-brain arbitration: packed memory artifacts into {} blocks / {} tokens (budget {})", res.blocks.len(), res.used, mem_budget);
                                 // 召回触达（A2）：对本次实际注入的浅层记忆写回 last_accessed/
                                 // access_count/recall_boost，让 R/U 随真实使用学习；一次批量 UPDATE。
                                 if !lam_hashes.is_empty() {
                                     if let Ok(touched) = state.memory_store.shallow_touch_batch(&lam_hashes) {
-                                        info!("浅层记忆召回触达 {} 条", touched);
+                                        info!("Shallow memory recall touched {} entries", touched);
                                     }
                                     // H4：深层注入即 touch（对称 shallow_touch_batch）。
                                     // 本次实际注入的深层事实刷新 last_accessed，使 R 随真实使用学习。
                                     if let Ok(touched) = state.memory_store.deep_touch_batch(&eg_ids) {
-                                        info!("深层记忆召回触达 {} 条", touched);
+                                        info!("Deep memory recall touched {} entries", touched);
                                     }
                                 }
                             }
@@ -3483,7 +3483,7 @@ fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &st
             now,
         );
         if let Err(e) = state.memory_store.shallow_store(&entry) {
-            tracing::warn!("双层浅层记忆存储失败: {e}");
+            tracing::warn!("Two-tier shallow memory storage failed: {e}");
         }
     }
     *assistant_text = crate::shallow_memory::strip_memory_blocks(assistant_text);

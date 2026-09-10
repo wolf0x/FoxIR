@@ -65,7 +65,7 @@ fn shallow_recall_rate() {
         }
     }
     let rate = hit as f64 / 20.0;
-    println!("浅层记忆召回率 (FTS query, hot entries): {:.1}% ({}/{})", rate * 100.0, hit, 20);
+    println!("Shallow memory recall rate (FTS query, hot entries): {:.1}% ({}/{})", rate * 100.0, hit, 20);
     cleanup(s, dir);
     // 全部是高重要度+关键词唯一，召回应接近 100%。
     assert!(rate >= 0.95, "λ recall rate too low: {:.1}%", rate * 100.0);
