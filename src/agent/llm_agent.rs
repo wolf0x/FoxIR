@@ -480,27 +480,6 @@ impl LlmAgent {
                 .to_string()
         }
     }
-    /// Build a lightweight norms section (AGENTS.md / SOUL.md / USER.md) injected
-    /// into sub-agent sessions so they inherit the same red-lines, boundaries, and
-    /// user identity/language as the main session, WITHOUT leaking MEMORY.md.
-    fn sub_agent_norms_section(&self) -> String {
-        const MAX_NORMS_CHARS: usize = 8000;
-        let workspace = &self.workspace_dir;
-        if workspace.is_empty() { return String::new(); }
-        let files = [
-            ("AGENTS.md", "Behavior & Rules"),
-            ("SOUL.md", "Personality, Tone & Boundaries"),
-            ("USER.md", "User Communication Preferences"),
-        ];
-        let mut out = String::from("\n## Sub-Agent Norms (workspace)\n");
-        for (filename, desc) in files {
-            if let Some((content, _)) = Self::read_workspace_file(workspace, filename, MAX_NORMS_CHARS) {
-                out.push_str(&format!("\n## {} ({})\n{}", desc, filename, content));
-                out.push('\n');
-            }
-        }
-        out
-    }
 
     /// Deterministic per-turn knowledge pre-retrieval (thClaws-KMS pattern).
     /// Searches the local knowledge base with the current user message and
@@ -698,14 +677,11 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
   save something.\n",
         );
 
-        prompt.push_str(
-            "\n## CHECK AVAILABLE CONTEXT BEFORE CALLING TOOLS\n\
-If a sub-agent report, a [Memory Context]/[Memory Recall] block, or your own earlier findings in this conversation already answer the user's question, use that data directly and summarize it — do NOT re-run the same diagnostics from scratch.\n\
-- Injected sub-agent reports appear as blocks like `[Sub-agent 'X' completed - job ...]` followed by the report; read them first before repeating the analysis.\n\
-- Memory blocks are the authoritative record of prior conversations — use them instead of reopening memory files.\n\
-- This rule prevents redundant re-runs of work already captured in the conversation context.\n\
-- EXCEPTION: if the user asks about live system state (IP, running processes, disk usage, services, network, etc.) or explicitly wants a fresh check, you MUST still call the tool to get real current data.\n",
-        );
+        prompt.push_str("\n## CHECK AVAILABLE CONTEXT BEFORE CALLING TOOLS\n");
+        prompt.push_str("If a [Memory Context]/[Memory Recall] block, or your own earlier findings in this conversation already answer the user's question, use that data directly and summarize it — do NOT re-run the same diagnostics from scratch.\n");
+        prompt.push_str("- Memory blocks are the authoritative record of prior conversations — use them instead of reopening memory files.\n");
+        prompt.push_str("- This rule prevents redundant re-runs of work already captured in the conversation context.\n");
+        prompt.push_str("- EXCEPTION: if the user asks about live system state (IP, running processes, disk usage, services, network, etc.) or explicitly wants a fresh check, you MUST still call the tool to get real current data.\n");
 
         // ── Permission Respect Rules ──
         prompt.push_str(
@@ -1172,14 +1148,14 @@ impl Agent for LlmAgent {
         let (tx, rx) = tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(200);
 
         // Build system prompt and history in the spawned task
-        let (system_prompt, task_skill_active) = match &ctx.system_prompt_override {
-            Some(p) if !p.trim().is_empty() => {
-                let lang_rule = self.resolve_language_rule(user_message);
-                let norms = self.sub_agent_norms_section();
-                (format!("{}\n\n## LANGUAGE RULE (STRICT)\n{}\n{}", p, lang_rule, norms), false)
-            }
-            _ => self.build_system_prompt(user_message, &ctx.conversation_history, skill_strategy, skill_max_inline_chars, skill_catalog_max, skill_hot_top_k),
-        };
+        let (system_prompt, task_skill_active) = self.build_system_prompt(
+            user_message,
+            &ctx.conversation_history,
+            skill_strategy,
+            skill_max_inline_chars,
+            skill_catalog_max,
+            skill_hot_top_k,
+        );
         // system_prompt is mutated below (TODO block); keep it mutable via a rebind.
         let mut system_prompt = system_prompt;
         // Inject the active TODO list as the main-session task contract.

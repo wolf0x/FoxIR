@@ -548,7 +548,7 @@ impl Scheduler {
             let scheduler_arc = self_arc.clone();
             let ctask_id = task_id.clone();
 
-            // Execute the task as an independent sub-agent (own session, empty history)
+            // Execute the task as an independent session (own session, empty history)
             tokio::spawn(async move {
                 let session_id = format!("cron-{}", uuid::Uuid::new_v4());
                 let start = std::time::Instant::now();
