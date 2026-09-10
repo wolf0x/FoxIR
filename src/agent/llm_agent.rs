@@ -1767,17 +1767,9 @@ impl Agent for LlmAgent {
                         // genuinely new tool call is never dropped.
                         if trim_redundant_tool_calls && has_executed_tools
                             && content.trim().len() >= 40 && !tool_calls.is_empty() {
-                            // Never trim read-only status/polling tools: a repeated call is a
-                            // legitimate retry (e.g. re-polling fetch_agent_result while the
-                            // job is still running), not a redundant re-execution of an
-                            // already-completed action. Trimming these would kill the main
-                            // loop's wait-for-completion path and rob it of auto-summary.
                             let kept = tool_calls.iter().filter(|tc| {
-                                let name = tc.function.name.as_deref().unwrap_or("unknown");
-                                if matches!(name, "fetch_agent_result" | "wait_agents") {
-                                    return true;
-                                }
-                                let sig = format!("{}:{}", name,
+                                let sig = format!("{}:{}",
+                                    tc.function.name.as_deref().unwrap_or("unknown"),
                                     tc.function.arguments.as_deref().unwrap_or("{}"));
                                 call_signatures.get(&sig).copied().unwrap_or(0) == 0
                             }).cloned().collect::<Vec<_>>();
