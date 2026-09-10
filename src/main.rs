@@ -322,7 +322,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("models.json", "models.json"),
         ("cron_tasks.json", "cron_tasks.json"),
         ("mcp_servers.json", "mcp_servers.json"),
-        ("agents.json", "agents.json"),
         ("memory.db", "memory/memory.db"),
     ];
     for (src_name, dst_rel) in &migrations {
@@ -587,7 +586,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notify_tx.clone(),
     )));
 
-    // Predefined sub-agent store (agents.json + per-agent workdirs)
 
     // Spawn scheduler background loop
     let scheduler_loop = scheduler.clone();

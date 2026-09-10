@@ -154,7 +154,6 @@ impl SkillManager {
 
     /// Resolve a skill by name for runtime use (case-insensitive, then by
     /// directory name). Returns a clone of the matched [`Skill`] or `None`.
-    /// Used by `run_skill` / sub-agent orchestration.
     pub fn find_skill(&self, name: &str) -> Option<Skill> {
         let name = name.trim().trim_start_matches('@');
         if name.is_empty() {

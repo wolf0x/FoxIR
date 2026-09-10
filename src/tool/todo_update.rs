@@ -44,11 +44,11 @@ impl TodoUpdateTool {
 
     /// Session-scoped TODO file path. The main session (and any session with
     /// an empty id, e.g. tools invoked outside a runner) writes to
-    /// `todos.json`; sub-agent / cron sessions write to `todos-<session>.json`
+    /// `todos.json`; cron sessions write to `todos-<session>.json`
     /// so they never clobber the main task contract (session-isolation fuse).
     fn todos_path(&self, session_id: &str) -> PathBuf {
         let main = session_id.trim().is_empty()
-            || (!session_id.starts_with("sub-") && !session_id.starts_with("cron-"));
+            || !session_id.starts_with("cron-");
         if main {
             PathBuf::from(&self.workspace_dir).join("todos.json")
         } else {
@@ -297,7 +297,6 @@ mod tests {
         assert_eq!(t.todos_path("main-123").file_name().unwrap(), "todos.json");
         assert_eq!(t.todos_path("").file_name().unwrap(), "todos.json");
         assert_eq!(t.todos_path("cron-abc").file_name().unwrap(), "todos-cron-abc.json");
-        assert_eq!(t.todos_path("sub-def").file_name().unwrap(), "todos-sub-def.json");
         let _ = std::fs::remove_dir_all(&ws);
     }
 

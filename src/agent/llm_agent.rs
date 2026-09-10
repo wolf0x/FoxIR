@@ -459,7 +459,7 @@ impl LlmAgent {
     }
 
     /// Resolve the reply language rule: explicit user request wins, else the
-    /// USER.md default language. Applies to main, sub-agent, and CRON sessions.
+    /// USER.md default language. Applies to main and CRON sessions.
     fn resolve_language_rule(&self, user_message: &str) -> String {
         let msg_lower = user_message.to_lowercase();
         let explicit_cn = user_message.contains("中文");
@@ -1168,7 +1168,6 @@ impl Agent for LlmAgent {
         }
         let todo_item_timeout_secs = ctx.todo_item_timeout_secs;
         let is_main_session = !session_id.is_empty()
-            && !session_id.starts_with("sub-")
             && !session_id.starts_with("cron-");
         if is_main_session {
             // #3 (converged + resume-safe): always embed the full list/status
