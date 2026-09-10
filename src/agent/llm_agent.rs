@@ -1506,13 +1506,7 @@ impl Agent for LlmAgent {
                 // running agent as the next user turn (no stop required). Ordinary
                 // follow-up messages stay in the pending queue and are dispatched by
                 // the server as separate tasks after this run completes.
-                let interjections = crate::interject::drain_insert(&session_id);
-                if !interjections.is_empty() {
-                    info!("[session:{}] Injecting {} interjection(s) into running context", session_id, interjections.len());
-                    for msg in interjections {
-                        history.push(ChatMessage::user(&msg));
-                    }
-                }
+                inject_user_interjections(&mut history, &session_id);
                 // Per-item TODO timeout watchdog (main session only): if the
                 // active item stalled past its timeout, auto-mark it 'skipped'
                 // and tell the model to advance to the next item.
@@ -1921,6 +1915,7 @@ impl Agent for LlmAgent {
                                 } else {
                                     // Standard sequential execution
                                     for tc in &tool_calls {
+                                        inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
                                             &tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, event_log.as_mut(),
                                         ).await;
@@ -1950,6 +1945,7 @@ impl Agent for LlmAgent {
                                     history.extend(msgs);
                                 } else {
                                     for tc in &tool_calls {
+                                        inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
                                             &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, event_log.as_mut(),
                                         ).await;
@@ -2166,6 +2162,23 @@ impl Agent for LlmAgent {
 /// native function calling. Looks for:
 /// 1. JSON code blocks: ```json {"name": "...", "arguments": {...}} ```
 /// 2. Inline JSON objects: {"name": "...", "arguments": {...}}
+/// Annotation injected in front of a user-interjection so the model treats it as
+/// supplementary context (not a new task) and continues the current goal.
+const INTERJECT_ANNOTATION: &str = "[User-injected supplementary context -- incorporate it and continue the current task; do NOT treat this as a new task and do NOT abandon or overwrite the work in progress]\n\n";
+
+/// Drain user-injected "insert-now" interjections and push them into history as
+/// annotated user turns (plan C+D: boundary injection + explicit context semantics).
+/// Does NOT touch the pending follow-up queue (ordinary interjections).
+fn inject_user_interjections(history: &mut Vec<ChatMessage>, session_id: &str) {
+    let inter = crate::interject::drain_insert(session_id);
+    if !inter.is_empty() {
+        info!("[session:{}] Injecting {} interjection(s) at boundary", session_id, inter.len());
+        for m in inter {
+            history.push(ChatMessage::user(&format!("{}{}", INTERJECT_ANNOTATION, m)));
+        }
+    }
+}
+
 fn extract_tool_calls_from_content(content: &str) -> Vec<crate::model::ToolCallDelta> {
     use crate::model::{FunctionCallDelta, ToolCallDelta};
     let mut calls = Vec::new();

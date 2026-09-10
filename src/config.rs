@@ -94,6 +94,9 @@ pub struct AgentConfig {
     /// Default: false (disabled). Can be toggled at runtime via Settings UI.
     #[serde(default)]
     pub computer_use: bool,
+    /// Whether the background heartbeat (proactive HEARTBEAT.md checks) runs. Default: off.
+    #[serde(default = "default_heartbeat_enabled")]
+    pub heartbeat_enabled: bool,
     /// Primary model name (selected in Settings UI)
     #[serde(default)]
     pub primary_model: Option<String>,
@@ -236,6 +239,7 @@ impl Default for Config {
                 max_tool_retries: default_max_tool_retries(),
                 parallel_ir_tools: default_parallel_ir_tools(),
                 computer_use: false,
+                heartbeat_enabled: default_heartbeat_enabled(),
                 primary_model: None,
                 fallback_model: None,
                 timezone_offset: default_timezone_offset(),
@@ -282,6 +286,7 @@ fn default_skill_self_improve() -> bool { false }
 fn default_tool_timeout_secs() -> usize { 300 }
 fn default_max_tool_retries() -> usize { 2 }
 fn default_parallel_ir_tools() -> bool { true }
+fn default_heartbeat_enabled() -> bool { false }
 fn default_max_tokens() -> u32 { 16384 }
 fn default_temperature() -> f64 { 0.7 }
 fn default_timezone_offset() -> i8 { 8 }
@@ -551,6 +556,8 @@ max_tool_retries = 2
 parallel_ir_tools = true
 # Enable Computer Use (GUI control) tools
 computer_use = false
+# Heartbeat (proactive HEARTBEAT.md checks). Default: off.
+heartbeat_enabled = false
 # Primary and fallback model names (set via Settings UI)
 # primary_model = "gpt-4o"
 # fallback_model = ""
@@ -572,6 +579,13 @@ timezone_offset = 8
     /// Save the current config to config.toml in the workspace directory.
     /// This persists agent settings (max_iterations, rabbit_hole_threshold, etc.)
     /// so they survive restarts.
+    /// Persist the heartbeat_enabled flag to config.toml.
+    pub fn save_heartbeat_setting(workspace_dir: &str, enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Self::load(workspace_dir).unwrap_or_default();
+        config.agent.heartbeat_enabled = enabled;
+        config.save(workspace_dir)
+    }
+
     pub fn save(&self, workspace_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = std::path::Path::new(workspace_dir).join("config.toml");
         let content = toml::to_string_pretty(self)?;

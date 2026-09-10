@@ -2906,11 +2906,12 @@ async fn heartbeat_toggle_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
     let prev = state.heartbeat_enabled.swap(enabled, Ordering::SeqCst);
     
     if prev != enabled {
         info!("Heartbeat {}", if enabled { "ENABLED" } else { "DISABLED" });
+        let _ = crate::config::Config::save_heartbeat_setting(&state.workspace_dir, enabled);
     }
     
     Json(json!({ "success": true, "enabled": enabled }))

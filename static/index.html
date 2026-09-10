@@ -426,7 +426,6 @@ input:checked+.slider:before{transform:translateX(20px)}
 .grok-item .grok-chk{margin-left:auto;color:var(--accent);font-weight:700;padding-top:2px;visibility:hidden}
 .grok-item.sel .grok-chk{visibility:visible}
 /* 发送 / 停止（狼头 LOGO 呼吸 ↔ 红色停止脉冲） */
-.grok-send .send-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
 .grok-send{
   flex-shrink:0; width:40px; height:40px; border-radius:50%; border:none; cursor:pointer;
   background:linear-gradient(135deg,#3498db 0%,#2ecc71 100%); color:#fff; display:flex; align-items:center; justify-content:center;
@@ -1299,7 +1298,7 @@ input:checked+.slider:before{transform:translateX(20px)}
               </div>
             </div>
             <!-- 发送 / 停止（狼头 LOGO） -->
-            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送"><img class="send-img" src="/static/foxir.ico" alt="send"></button>
+            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送">🐺</button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopAgent()" style="display:none">Stop</button>
           </div>
           </div>

@@ -604,8 +604,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Scheduler::run_loop(scheduler_loop).await;
     });
 
-    // Heartbeat switch (default: on; runs proactive HEARTBEAT.md checks)
-    let heartbeat_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Heartbeat switch (default: off; reads config.toml, runtime-togglable)
+    let heartbeat_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.heartbeat_enabled));
 
     // Spawn heartbeat background loop
     let heartbeat = Heartbeat::new(
