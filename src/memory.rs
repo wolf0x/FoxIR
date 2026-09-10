@@ -504,6 +504,91 @@ impl MemoryStore {
         Ok(entries)
     }
 
+    /// Fetch the most recent conversation entries for a specific session,
+    /// newest-first (limit cap), for session-recall synthesis.
+    pub fn get_session_entries(&self, session_id: &str, limit: usize) -> Result<Vec<ConversationEntry>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, date, session_id, role, content, tool_name, timestamp \
+             FROM conversations WHERE session_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2"
+        ).map_err(|e| format!("Query prepare failed: {}", e))?;
+        let entries = stmt.query_map(params![session_id, limit as i64], |row| {
+            Ok(ConversationEntry {
+                id: row.get(0)?,
+                date: row.get(1)?,
+                session_id: row.get(2)?,
+                role: row.get(3)?,
+                content: row.get(4)?,
+                tool_name: row.get(5)?,
+                timestamp: row.get(6)?,
+            })
+        }).map_err(|e| format!("Query failed: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(entries)
+    }
+
+    /// ZeroClaw-style session recall: read the most recent rounds of the current
+    /// session and synthesize a bounded [Session Recall] block with a budget
+    /// window (in characters). The block renders chronologically (oldest first
+    /// within the window) so the model can "replay" the tail of the session and
+    /// pick up where it left off — without re-running tools or re-deriving
+    /// already-confirmed results. Limited to the header + whatever fits in
+    /// `budget_chars`; a pointer is appended when entries were truncated.
+    pub fn build_session_recall_block(&self, session_id: &str, budget_chars: usize, fetch_rounds: usize) -> Option<String> {
+        if session_id.is_empty() {
+            return None;
+        }
+        let entries = self.get_session_entries(session_id, fetch_rounds * 2).ok()?;
+        if entries.is_empty() {
+            return None;
+        }
+        // Drop system/tool-role noise; keep user + assistant turns only.
+        let mut turns: Vec<&ConversationEntry> = entries.iter()
+            .filter(|e| e.role == "user" || e.role == "assistant")
+            .collect();
+        if turns.is_empty() {
+            return None;
+        }
+        // Render oldest-first (chronological replay of the tail).
+        turns.reverse();
+
+        let mut s = String::new();
+        let header = format!(
+            "\n## Session Recall — current session, most recent rounds (pick up where this left off; reuse, do not re-run):\n"
+        );
+        s.push_str(&header);
+        let mut used = s.len();
+        let mut total_shown = 0usize;
+        for e in &turns {
+            let when = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|_| e.date.clone());
+            let role_label = if e.role == "user" { "User" } else { "Assistant" };
+            let preview: String = e.content.chars().take(300).collect();
+            // Indent continuation lines so role boundaries stay readable.
+            let flat = preview.replace('\n', " ");
+            let mut line = format!("[{}] {}: {}\n", when, role_label, flat);
+            if used + line.len() > budget_chars {
+                s.push_str(&format!("... ({} more rounds cut for budget; use `evidence list` / continue chatting to recall)\n", turns.len() - total_shown));
+                break;
+            }
+            used += line.len();
+            s.push_str(&line);
+            total_shown += 1;
+        }
+        if total_shown == 0 {
+            return None;
+        }
+        Some(s)
+    }
+
+    /// Convenience wrapper: build the session recall block with a sane default
+    /// budget and enough rounds to replay the tail of a long task.
+    pub fn build_session_recall_block_default(&self, session_id: &str) -> Option<String> {
+        self.build_session_recall_block(session_id, 2400, 50)
+    }
+
     /// Full-text search across recent conversation entries using FTS5.
     ///
     /// Uses BM25 ranking so the most relevant results come first.
@@ -1874,6 +1959,40 @@ mod tests_two_tier {
         assert_eq!(s.deep_get("eng1").unwrap().unwrap().importance, 5.0);
         assert!(s.deep_forget("eng1").unwrap());
         assert_eq!(s.deep_list("global").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn session_recall_replays_tail_and_skips_noise() {
+        let s = tmp_store();
+        let sid = "sess-recall-1";
+        s.store_entry(sid, "user", "collect from 192.168.52.137", Some("winrm")).unwrap();
+        s.store_entry(sid, "assistant", "found suspicious process miner.exe; credentials admin/Solarsec521 cached", None).unwrap();
+        s.store_entry(sid, "system", "## Internal", None).unwrap();
+        s.store_entry(sid, "user", "confirm the C2 IP", None).unwrap();
+        s.store_entry(sid, "assistant", "C2 is 67.42.1.1 (verified)", None).unwrap();
+        s.store_entry("other-sess", "user", "unrelated topic", None).unwrap();
+
+        let blk = s.build_session_recall_block(&sid, 100_000, 50).expect("block should exist");
+        assert!(!blk.contains("unrelated topic"));
+        assert!(blk.contains("collect from 192.168.52.137"));
+        assert!(blk.contains("C2 is 67.42.1.1"));
+        assert!(!blk.contains("## Internal"));
+        assert!(blk.contains("Session Recall"));
+    }
+
+    #[test]
+    fn session_recall_budget_truncates_with_pointer() {
+        let s = tmp_store();
+        let sid = "sess-recall-2";
+        for i in 0..10 {
+            let msg = format!("message number {} with plenty of padding content here", i);
+            s.store_entry(sid, "user", &msg, None).unwrap();
+            s.store_entry(sid, "assistant", &format!("assistant reply {}", i), None).unwrap();
+        }
+        let blk = s.build_session_recall_block(&sid, 400, 50).expect("block exists");
+        assert!(blk.contains("cut for budget"));
+        assert!(s.build_session_recall_block("", 100, 50).is_none());
+        assert!(s.build_session_recall_block("no-such-session", 100, 50).is_none());
     }
 }
 

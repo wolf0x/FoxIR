@@ -1211,6 +1211,13 @@ impl Agent for LlmAgent {
                 system_prompt.push_str(&reminder);
             }
         }
+        // Evidence ledger: inject the incident-scoped ledger (budget-capped,
+        // sensitive entries excluded) so the agent reuses, not re-runs, results.
+        if let Some(evidence_block) =
+            crate::tool::evidence::build_evidence_block_for_session(&self.workspace_dir, &session_id)
+        {
+            system_prompt.push_str(&evidence_block);
+        }
         // Tool selectivity: core tools are always sent in full; peripheral tools
         // (MCP / external) are exposed on demand via `load_tool_schema`, and a
         // peripheral tool is re-added once loaded. This bounds the per-request

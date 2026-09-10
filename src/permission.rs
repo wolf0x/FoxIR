@@ -26,14 +26,14 @@ pub fn tool_category(name: &str) -> &'static str {
         | "cu_screenshot" | "cu_window_list" | "cu_clipboard_read" | "cu_display_info"
         | "cu_cursor_position" | "cu_process_list" | "cu_ui_tree" | "cu_ui_find" => "read",
         // Write — creates/overwrites content
-        "file_write" | "memory_md" | "todo_update" | "cu_clipboard_write" => "write",
+        "file_write" | "memory_md" | "todo_update" | "evidence" | "cu_clipboard_write" => "write",
         // Delete
         "file_delete" => "delete",
         // Modify — changes state of existing resources
         "file_modify" | "sys_process" | "sys_service" | "ir_process" | "ir_vss"
         | "browser_cdp" | "cron_manage" | "cu_window_activate" => "modify",
         // Execute — arbitrary code execution
-        "shell_exec" | "app_launch" | "ir_memdump" | "cu_mouse" | "cu_keyboard" | "cu_process_kill" | "cu_ui_interact" => "execute",
+        "shell_exec" | "app_launch" | "ir_memdump" | "cu_mouse" | "cu_keyboard" | "cu_process_kill" | "cu_ui_interact" | "winrm" => "execute",
         // Default: unknown tools (MCP, external) require endorsement
         _ => "execute",
     }
@@ -221,7 +221,7 @@ impl PermissionChecker {
 /// Returns Some(category) if the command performs an action that belongs to another category,
 /// None if the intent is normal execution or cannot be determined.
 fn detect_intent_category(tool_name: &str, args: &Value) -> Option<&'static str> {
-    if tool_name != "shell_exec" && tool_name != "app_launch" {
+    if tool_name != "shell_exec" && tool_name != "app_launch" && tool_name != "winrm" {
         return None;
     }
 
@@ -230,7 +230,14 @@ fn detect_intent_category(tool_name: &str, args: &Value) -> Option<&'static str>
         return None;
     }
 
-    let shell = args["shell"].as_str().unwrap_or("powershell");
+    // shell_exec/app_launch use the "shell" arg; winrm uses the "powershell" boolean (default true).
+    let shell = if args.get("shell").is_some() {
+        args["shell"].as_str().unwrap_or("powershell")
+    } else if args["powershell"].as_bool() == Some(false) {
+        "cmd"
+    } else {
+        "powershell"
+    };
     let intent = crate::policy::parse::parse_intent(command, shell);
 
     use crate::policy::parse::Verb;

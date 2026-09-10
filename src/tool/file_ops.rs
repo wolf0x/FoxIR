@@ -230,7 +230,7 @@ pub struct FileDeleteTool;
 #[async_trait]
 impl Tool for FileDeleteTool {
     fn name(&self) -> &str { "file_delete" }
-    fn description(&self) -> &str { "Delete a file or empty directory." }
+    fn description(&self) -> &str { "Move a file or directory to the Recycle Bin (soft delete, recoverable). Never permanently erases data." }
     fn is_builtin(&self) -> bool { true }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -244,16 +244,26 @@ impl Tool for FileDeleteTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         let path = args["path"].as_str().ok_or_else(|| "Missing 'path'".to_string())?;
         let resolved = resolve_path(ctx, path);
-        if resolved.is_file() {
-            fs::remove_file(&resolved).map_err(|e| format!("Failed to delete: {}", e))?;
-        } else if resolved.is_dir() {
-            fs::remove_dir(&resolved).map_err(|e| {
-                format!("Failed to delete directory (must be empty): {}. Error: {}", resolved.display(), e)
-            })?;
-        } else {
+        if !resolved.exists() {
             return Err(format!("Path does not exist: {}", resolved.display()).into());
         }
-        Ok(json!({ "status": "deleted", "path": resolved.to_string_lossy().replace('\\', "/") }))
+        if resolved.is_file() || resolved.is_dir() {
+            // Soft delete: always move to the OS Recycle Bin (recoverable) rather
+            // than permanently erasing. Falls back to a hard delete only when the
+            // platform has no recycle bin (e.g. some headless/container hosts).
+            match trash::delete(&resolved) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Report the recycle-bin failure up front; do not silently
+                    // hard-delete recoverable user data.
+                    return Err(format!(
+                        "Failed to move to Recycle Bin: {}. Refusing to hard-delete recoverable data.",
+                        e
+                    ).into());
+                }
+            }
+        }
+        Ok(json!({ "status": "recycled", "path": resolved.to_string_lossy().replace('\\', "/") }))
     }
 }
 

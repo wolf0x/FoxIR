@@ -20,6 +20,7 @@ use crate::log::ConversationLogger;
 use crate::memory::MemoryStore;
 use crate::model::ChatMessage;
 use crate::permission::{PermissionResolver, PendingMap};
+use crate::heartbeat::Heartbeat;
 use crate::runner::Runner;
 use crate::runner::ResumeState;
 use crate::scheduler::{Scheduler, CronTask};
@@ -1344,13 +1345,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         // If a follow-up task is queued (sent while the previous task ran, no
         // "insert" click), dispatch it as the next sequential task BEFORE
         // waiting for new user input.
+        // Queued user interjections are always dispatched into the execution
+        // queue (FIFO), even after a Stop. Stop only cancels the in-flight
+        // task; already-queued user messages must still execute.
         let user_msg = match crate::interject::pop_pending(&session_id) {
             Some(next_content) => {
                 info!("[session:{}] Dispatching queued follow-up task", session_id);
                 let msg_json = json!({ "type": "chat", "content": next_content });
                 Some(Message::Text(msg_json.to_string().into()))
             }
-            None => ws_rx.recv().await,
+            _ => ws_rx.recv().await,
         };
         let user_msg = match user_msg {
             Some(msg) => msg,
@@ -1482,7 +1486,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 }
                             }
 
-                            // Reset cancellation for new chat
+                            // Reset cancellation for new chat (new explicit task
+                            // re-enables follow-up auto-dispatch).
                             cancelled.store(false, Ordering::SeqCst);
 
                             // Get session history for multi-turn context
@@ -1515,10 +1520,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             // as an ephemeral SYSTEM message at the start of history.
                             // This is NOT persisted — the server only stores the
                             // original user content + assistant reply below.
-                            if !history.is_empty() && is_recall_query(&content) {
+                            if is_recall_query(&content) || is_continuation_task(&content) {
                                 if let Some(recall) = state.memory_store.build_recall_context(&content, 14) {
-                                    info!("Injecting recall context ({} chars) for query", recall.len());
+                                    info!("Injecting recall context ({} chars) for query/continuation", recall.len());
                                     history.insert(0, ChatMessage::system(&recall));
+                                }
+                                // ZeroClaw-style session recall: replay the recent tail of
+                                // the current session alongside the broader recall, so a
+                                // continuation/new session picks up prior findings without
+                                // re-running tools. Budget-capped; injected after the
+                                // keyword recall so the session tail sits closest to the prompt.
+                                if let Some(sr) = state.memory_store.build_session_recall_block_default(&session_id) {
+                                    info!("Injecting session recall block ({} chars)", sr.len());
+                                    history.insert(0, ChatMessage::system(&sr));
                                 }
                             }
 
@@ -1944,6 +1958,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                             let done_event = AgentEvent::done(&session_id, "system");
                                             let msg_str = done_event.to_ws_message();
                                             let _ = sink.send(Message::Text(msg_str.into())).await;
+                                            // Distill any durable facts from the interrupted turn so that
+                                            // information provided right before Stop (e.g. target/credentials)
+                                            // still lands in deep memory and survives a process restart.
+                                            spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
                                             // Brief yield to let the spawned task detect cancellation
                                             // and exit cleanly before the user can send a new message.
                                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2655,10 +2673,15 @@ fn spawn_deep_curator(
     if !state.two_tier_memory.load(Ordering::SeqCst) {
         return;
     }
-    if user_text.trim().chars().count() <= 40 {
+    // Distill durable facts from either side. Guard only against empty/trivial
+    // interactions (e.g. pure greetings) so short but durable inputs (e.g. a
+    // provided credential/endpoint) still get captured into deep memory.
+    let user_len = user_text.trim().chars().count();
+    let assistant_len = assistant_text.trim().chars().count();
+    if user_len == 0 && assistant_len == 0 {
         return;
     }
-    if assistant_text.trim().is_empty() {
+    if user_len <= 4 && assistant_len <= 4 {
         return;
     }
     let model = model.to_string();
@@ -2666,8 +2689,14 @@ fn spawn_deep_curator(
     let assistant_text = assistant_text.to_string();
     tokio::spawn(async move {
         let trunc = |s: &str| s.chars().take(500).collect::<String>();
-        let digest = format!("User: {}\nTem: {}", trunc(&user_text), trunc(&assistant_text));
-        let sys = "You are a precise long-term-memory curator. From the conversation below extract DURABLE facts about the user or project worth remembering permanently across future sessions: standing preferences, identity details, hard constraints, stable project facts. Ignore one-off or transient details. Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
+        let user_part = trunc(&user_text);
+        let assistant_part = trunc(&assistant_text);
+        let digest = if assistant_part.trim().is_empty() {
+            format!("User: {}", user_part)
+        } else {
+            format!("User: {}\nTem: {}", user_part, assistant_part)
+        };
+        let sys = "You are a precise long-term-memory curator. From the conversation below extract DURABLE facts about the user or project worth remembering permanently across future sessions: standing preferences, identity details, hard constraints, stable project facts. Ignore one-off or transient details. Pay special attention to stable connection/endpoint details such as target hosts, IPs, credentials, accounts, and project infrastructure references — these are durable facts to keep across sessions. Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
         let messages = vec![ChatMessage::system(sys), ChatMessage::user(&digest)];
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -2895,6 +2924,35 @@ async fn human_intervention_toggle_handler(
 // Heartbeat toggle
 // ============================================================
 
+/// Re-spawn the heartbeat background loop. Used by the runtime toggle when the
+/// user enables heartbeat after it was started disabled (or after a disable), so
+/// off->on re-activation works without a restart.
+fn spawn_heartbeat(state: &std::sync::Arc<AppState>) {
+    if !state.heartbeat_enabled.load(Ordering::SeqCst) {
+        // Only spawn when actually enabled; if enabled and already running, the
+        // re-spawn is harmless (the previous loop exits on disable).
+        return;
+    }
+    let heartbeat = Heartbeat::new(
+        state.runner.clone(),
+        state.model_configs.clone(),
+        state.permissions.clone(),
+        state.permission_pending.clone(),
+        state.max_iterations.load(Ordering::SeqCst),
+        state.rabbit_hole_threshold.load(Ordering::SeqCst),
+        128000,
+        state.context_window_threshold.load(Ordering::SeqCst),
+        state.tool_timeout_secs.load(Ordering::SeqCst) as u64,
+        state.notify_tx.clone(),
+        state.workspace_dir.clone(),
+        state.heartbeat_enabled.clone(),
+    );
+    tokio::spawn(async move {
+        heartbeat.run_loop().await;
+    });
+    info!("Heartbeat background loop spawned (runtime enable)");
+}
+
 async fn heartbeat_get_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
@@ -2912,6 +2970,9 @@ async fn heartbeat_toggle_handler(
     if prev != enabled {
         info!("Heartbeat {}", if enabled { "ENABLED" } else { "DISABLED" });
         let _ = crate::config::Config::save_heartbeat_setting(&state.workspace_dir, enabled);
+        if enabled {
+            spawn_heartbeat(&state);
+        }
     }
     
     Json(json!({ "success": true, "enabled": enabled }))
@@ -3307,6 +3368,21 @@ async fn checkpoints_delete_handler(
 /// Detect whether the user's message is asking about earlier conversations.
 /// Used to trigger mid-session injection of the memory context so the agent
 /// can recall past topics instead of claiming it has no history.
+/// Detect a continuation-style first message ("continue previous work") that
+/// implies the user expects us to remember and resume prior context, even
+/// without explicit past-tense recall keywords.
+fn is_continuation_task(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "继续", "接着", "还有", "接下来", "回到", "还没",
+        "继续上次", "接着上次", "继续之前", "接着之前", "继续干", "接着干",
+        "未完", "上一个", "上次那个",
+        "continue", "go on", "go ahead", "resume", "keep going",
+        "next", "and then", "onto", "still",
+    ];
+    KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
 fn is_recall_query(text: &str) -> bool {
     let lower = text.to_lowercase();
     const KEYWORDS: &[&str] = &[

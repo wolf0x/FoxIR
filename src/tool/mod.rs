@@ -38,6 +38,8 @@ pub mod ir_timeline;
 pub mod external_exec;
 pub mod computer_use;
 pub mod linux_ssh;
+pub mod winrm;
+pub mod evidence;
 pub mod linux_ir_common;
 pub mod linux_ir_process;
 pub mod linux_ir_network;
@@ -432,6 +434,8 @@ impl ToolRegistry {
         }
         // General-purpose SSH command execution (like shell_exec for remote Linux)
         registry.register(Arc::new(linux_ssh::SshExecTool));
+        // WinRM command execution (like shell_exec for remote Windows)
+        registry.register(Arc::new(winrm::WinrmExecTool));
         // Forensic disk/memory tools
         registry.register(Arc::new(ir_vss::IrVssTool));
         registry.register(Arc::new(ir_usn::IrUsnTool));

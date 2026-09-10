@@ -199,16 +199,30 @@ impl Heartbeat {
     }
 
     /// Run the heartbeat loop — checks every `interval_secs`.
+    ///
+    /// Gated on the shared `enabled` switch: when disabled the loop does NOT
+    /// start (no idle task, no misleading "started" log) and returns immediately.
+    /// While running, a toggle to disabled stops it after the current cycle.
+    /// A runtime off->on re-activation is performed by the caller (server toggle)
+    /// re-spawning this loop.
     pub async fn run_loop(self) {
+        if !self.enabled.load(Ordering::SeqCst) {
+            info!("Heartbeat disabled — background loop not started");
+            return;
+        }
         info!(
             "Heartbeat loop started (interval: {}s, workspace: {})",
             self.interval_secs, self.workspace_dir
         );
 
-        // Wait one full interval before the first check
+        // Wait one full interval before the first check.
         tokio::time::sleep(std::time::Duration::from_secs(self.interval_secs)).await;
 
         loop {
+            if !self.enabled.load(Ordering::SeqCst) {
+                info!("Heartbeat disabled — background loop stopped");
+                return;
+            }
             self.run_once().await;
             tokio::time::sleep(std::time::Duration::from_secs(self.interval_secs)).await;
         }

@@ -607,25 +607,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat switch (default: off; reads config.toml, runtime-togglable)
     let heartbeat_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.heartbeat_enabled));
 
-    // Spawn heartbeat background loop
-    let heartbeat = Heartbeat::new(
-        runner.clone(),
-        shared_models.clone(),
-        permissions.clone(),
-        permission_pending.clone(),
-        config.agent.max_iterations,
-        config.agent.rabbit_hole_threshold,
-        128000,
-        config.agent.context_window_threshold,
-        config.agent.tool_timeout_secs as u64,
-        notify_tx.clone(),
-        workspace_dir.clone(),
-        heartbeat_enabled.clone(),
-    );
-    tokio::spawn(async move {
-        heartbeat.run_loop().await;
-    });
-    info!("Heartbeat background loop spawned");
+    // Spawn heartbeat background loop ONLY when enabled. When disabled the
+    // loop is not started at all (no idle task, no misleading "spawned" log).
+    // Runtime off->on re-activation is handled by the server toggle (re-spawns).
+    if heartbeat_enabled.load(std::sync::atomic::Ordering::SeqCst) {
+        let heartbeat = Heartbeat::new(
+            runner.clone(),
+            shared_models.clone(),
+            permissions.clone(),
+            permission_pending.clone(),
+            config.agent.max_iterations,
+            config.agent.rabbit_hole_threshold,
+            128000,
+            config.agent.context_window_threshold,
+            config.agent.tool_timeout_secs as u64,
+            notify_tx.clone(),
+            workspace_dir.clone(),
+            heartbeat_enabled.clone(),
+        );
+        tokio::spawn(async move {
+            heartbeat.run_loop().await;
+        });
+        info!("Heartbeat background loop spawned");
+    } else {
+        info!("Heartbeat disabled — background loop not spawned");
+    }
 
     // Register CRON management tool (needs scheduler, which depends on runner)
     // Register memory_md tool (file-based daily logs + long-term memory)
@@ -640,6 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
         reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
+        reg.register(Arc::new(crate::tool::evidence::EvidenceTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_ingest::KnowledgeIngestTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::browser_cdp::BrowserCdpTool::new(browser_session)));
