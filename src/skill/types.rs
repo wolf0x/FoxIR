@@ -107,6 +107,8 @@ pub enum SkillListingStrategy {
     NamesOnly,
     /// Inject no skill listing at all; rely solely on the discover tool.
     DiscoverToolOnly,
+    /// Inject no skill listing and expose no skill tools (sub-agents default).
+    Disabled,
 }
 
 impl SkillListingStrategy {
@@ -115,6 +117,7 @@ impl SkillListingStrategy {
         match s {
             "names-only" => Self::NamesOnly,
             "discover-tool-only" => Self::DiscoverToolOnly,
+            "disabled" => Self::Disabled,
             _ => Self::Query,
         }
     }
@@ -125,6 +128,7 @@ impl SkillListingStrategy {
             Self::Query => "query",
             Self::NamesOnly => "names-only",
             Self::DiscoverToolOnly => "discover-tool-only",
+            Self::Disabled => "disabled",
         }
     }
 
@@ -134,6 +138,7 @@ impl SkillListingStrategy {
             Self::Query => 0,
             Self::NamesOnly => 1,
             Self::DiscoverToolOnly => 2,
+            Self::Disabled => 3,
         }
     }
 
@@ -142,6 +147,7 @@ impl SkillListingStrategy {
         match i {
             1 => Self::NamesOnly,
             2 => Self::DiscoverToolOnly,
+            3 => Self::Disabled,
             _ => Self::Query,
         }
     }

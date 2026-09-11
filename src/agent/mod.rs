@@ -1,4 +1,8 @@
 pub mod event;
+pub mod event_pump;
+pub mod exclusivity;
+pub mod orchestration;
+pub mod workflow;
 pub mod llm_agent;
 
 pub use event::AgentEvent;

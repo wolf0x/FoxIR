@@ -127,6 +127,11 @@ pub struct AgentConfig {
     /// fallback falls back to the global fallback_model when unset.
     #[serde(default)]
     pub expert_role_models: RoleModelsConfig,
+    /// Multi-agent mode configuration (SDD v1.5 \u00a719 / \u00a77.3).
+    /// Step 1 adds schema + defaults only; runtime wiring (allowset / delivery
+    /// gate / spawn depth) lands in Step 2a.
+    #[serde(default)]
+    pub modes: ModesConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -144,6 +149,186 @@ pub struct RoleModelsConfig {
     #[serde(default)]
     pub executor_fallback: Option<String>,
 }
+
+/// Per-mode orchestration + skill behavior (SDD v1.5 \u00a719).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModesConfig {
+    #[serde(default)]
+    pub expert: ExpertModeConfig,
+    #[serde(default)]
+    pub instant: InstantModeConfig,
+    #[serde(default)]
+    pub subagent: SubagentDefaults,
+}
+
+impl Default for ModesConfig {
+    fn default() -> Self {
+        Self {
+            expert: ExpertModeConfig::default(),
+            instant: InstantModeConfig::default(),
+            subagent: SubagentDefaults::default(),
+        }
+    }
+}
+
+/// Expert-mode orchestration settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExpertModeConfig {
+    /// Skill strategy: "attached" (Step 1 default, keeps current Expert behavior)
+    /// or "disabled" (SDD \u00a720.3 B4.3, workers built via `.without_skills()`).
+    #[serde(default = "default_mode_skill_strategy")]
+    pub skill_strategy: String,
+    /// Max sub-agent nesting depth (Phase 0 = 1: root spawns depth-1 workers only).
+    #[serde(default = "default_expert_max_depth")]
+    pub max_depth: u8,
+    /// Orchestration gate: "on" (Step 2a opens `Expert && depth == 0`) or "off".
+    #[serde(default = "default_expert_orchestration_state")]
+    pub orchestration: String,
+    /// Upper bound on concurrently running sub-agents (SDD v1.5 §9, >= 1).
+    #[serde(default = "default_max_concurrent_subagents")]
+    pub max_concurrent_subagents: usize,
+    /// Per-worker wall-clock timeout in seconds (SDD v1.5 §7.4.1 / §9).
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub default_timeout_secs: u64,
+    /// Per-worker token budget; exceeding it cancels that worker (SDD §7.7 / §9).
+    #[serde(default = "default_max_tokens_per_run")]
+    pub max_tokens_per_run: u64,
+    /// Total token budget across all workers of one root run; exceeding it
+    /// cascades cancellation to every running worker (SDD §7.7 / §9).
+    #[serde(default = "default_max_total_tokens")]
+    pub max_total_tokens: u64,
+}
+
+/// Runtime-carried orchestration limits (SDD v1.5 §9), derived from
+/// `ExpertModeConfig` and threaded through the agent builder into the
+/// per-run Orchestrator environment.
+#[derive(Debug, Clone, Copy)]
+pub struct OrchestrationLimits {
+    pub max_concurrent_subagents: usize,
+    pub default_timeout_secs: u64,
+    pub max_tokens_per_run: u64,
+    pub max_total_tokens: u64,
+}
+
+impl Default for OrchestrationLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_subagents: default_max_concurrent_subagents(),
+            default_timeout_secs: default_subagent_timeout_secs(),
+            max_tokens_per_run: default_max_tokens_per_run(),
+            max_total_tokens: default_max_total_tokens(),
+        }
+    }
+}
+
+impl From<&ExpertModeConfig> for OrchestrationLimits {
+    fn from(c: &ExpertModeConfig) -> Self {
+        Self {
+            max_concurrent_subagents: c.max_concurrent_subagents,
+            default_timeout_secs: c.default_timeout_secs,
+            max_tokens_per_run: c.max_tokens_per_run,
+            max_total_tokens: c.max_total_tokens,
+        }
+    }
+}
+
+impl ModesConfig {
+    /// §9 validation: invalid values `warn!` and fall back to defaults.
+    pub fn validate_orchestration(&mut self) {
+        if self.expert.max_concurrent_subagents < 1 {
+            tracing::warn!("[config] modes.expert.max_concurrent_subagents < 1; falling back to default");
+            self.expert.max_concurrent_subagents = default_max_concurrent_subagents();
+        }
+        if self.expert.max_depth < 1 {
+            tracing::warn!("[config] modes.expert.max_depth < 1; falling back to 1");
+            self.expert.max_depth = 1;
+        }
+        if self.expert.max_tokens_per_run > self.expert.max_total_tokens {
+            tracing::warn!("[config] modes.expert.max_tokens_per_run > max_total_tokens; clamping per-run to total");
+            self.expert.max_tokens_per_run = self.expert.max_total_tokens;
+        }
+        if !matches!(self.expert.skill_strategy.as_str(), "attached" | "disabled") {
+            tracing::warn!("[config] modes.expert.skill_strategy invalid; falling back to 'attached'");
+            self.expert.skill_strategy = default_mode_skill_strategy();
+        }
+        if !matches!(self.subagent.skill_strategy.as_str(), "disabled" | "attached") {
+            tracing::warn!("[config] modes.subagent.skill_strategy invalid; falling back to 'disabled'");
+            self.subagent.skill_strategy = "disabled".to_string();
+        }
+    }
+}
+
+impl Default for ExpertModeConfig {
+    fn default() -> Self {
+        Self {
+            skill_strategy: default_mode_skill_strategy(),
+            max_depth: default_expert_max_depth(),
+            orchestration: default_expert_orchestration_state(),
+            max_concurrent_subagents: default_max_concurrent_subagents(),
+            default_timeout_secs: default_subagent_timeout_secs(),
+            max_tokens_per_run: default_max_tokens_per_run(),
+            max_total_tokens: default_max_total_tokens(),
+        }
+    }
+}
+
+/// Instant-mode orchestration settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstantModeConfig {
+    #[serde(default = "default_mode_skill_strategy")]
+    pub skill_strategy: String,
+    #[serde(default = "default_zero_u8")]
+    pub max_depth: u8,
+    #[serde(default = "default_orchestration_state")]
+    pub orchestration: String,
+}
+
+impl Default for InstantModeConfig {
+    fn default() -> Self {
+        Self {
+            skill_strategy: default_mode_skill_strategy(),
+            max_depth: default_zero_u8(),
+            orchestration: default_orchestration_state(),
+        }
+    }
+}
+
+/// Shared defaults applied to every spawned sub-agent (SDD v1.5 \u00a77.3).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubagentDefaults {
+    #[serde(default = "default_mode_skill_strategy")]
+    pub skill_strategy: String,
+    #[serde(default = "default_subagent_max_depth")]
+    pub max_depth: u8,
+    #[serde(default = "default_orchestration_state")]
+    pub orchestration: String,
+    /// Tool names a sub-agent is allowed to call. Empty in Step 1 = inherited
+    /// registry minus skill tools; Step 2a derives it from the spawn profile.
+    #[serde(default)]
+    pub authorized_tools: Vec<String>,
+}
+
+impl Default for SubagentDefaults {
+    fn default() -> Self {
+        Self {
+            skill_strategy: default_mode_skill_strategy(),
+            max_depth: default_subagent_max_depth(),
+            orchestration: default_orchestration_state(),
+            authorized_tools: Vec::new(),
+        }
+    }
+}
+
+fn default_mode_skill_strategy() -> String { "attached".to_string() }
+fn default_zero_u8() -> u8 { 0 }
+fn default_subagent_max_depth() -> u8 { 1 }
+fn default_orchestration_state() -> String { "off".to_string() }
+fn default_expert_orchestration_state() -> String { "on".to_string() }
+fn default_expert_max_depth() -> u8 { 1 }
+fn default_max_concurrent_subagents() -> usize { 4 }
+fn default_subagent_timeout_secs() -> u64 { 300 }
+fn default_max_tokens_per_run() -> u64 { 400_000 }
+fn default_max_total_tokens() -> u64 { 2_000_000 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
@@ -249,6 +434,7 @@ impl Default for Config {
                 expert_max_tool_retries: default_expert_max_tool_retries(),
                 expert_max_managed_rounds: default_expert_max_managed_rounds(),
                 expert_role_models: RoleModelsConfig::default(),
+                modes: ModesConfig::default(),
             },
         }
     }
@@ -493,7 +679,8 @@ impl Config {
 
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            let config: Config = toml::from_str(&content)?;
+            let mut config: Config = toml::from_str(&content)?;
+            config.agent.modes.validate_orchestration();
             Ok(config)
         } else {
             // Backward compatibility: try exe_dir config.toml
@@ -569,6 +756,24 @@ timezone_offset = 8
 # write = true
 # delete = false
 # execute = true
+
+# Multi-agent orchestration (SDD v1.5). Phase 0 enables read-only worker
+# sub-agents for the Expert root at depth 0. Set orchestration = "off" to keep
+# the legacy single-agent behavior.
+[agent.modes.expert]
+skill_strategy = "attached"
+max_depth = 1
+orchestration = "on"
+
+[agent.modes.instant]
+skill_strategy = "attached"
+max_depth = 0
+orchestration = "off"
+
+[agent.modes.subagent]
+skill_strategy = "disabled"
+max_depth = 1
+orchestration = "off"
 "#;
         let config_path = std::path::Path::new(workspace_dir).join("config.toml");
         std::fs::write(&config_path, config_content)?;
@@ -747,6 +952,19 @@ mod tests {
         let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
         assert!(!content.contains("Administrator"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Step 1 default: modes config keeps legacy attach (skill_strategy =
+    /// "attached", orchestration "off", depth 0) so there is zero behavior diff.
+    #[test]
+    fn modes_config_defaults_preserve_legacy() {
+        let m = ModesConfig::default();
+        assert_eq!(m.expert.skill_strategy, "attached");
+        assert_eq!(m.expert.max_depth, 1);
+        assert_eq!(m.expert.orchestration, "on");
+        assert_eq!(m.instant.skill_strategy, "attached");
+        assert_eq!(m.subagent.max_depth, 1);
+        assert!(m.subagent.authorized_tools.is_empty());
     }
 }
 

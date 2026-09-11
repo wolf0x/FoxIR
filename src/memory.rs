@@ -421,7 +421,69 @@ impl MemoryStore {
             info!("Schema v7 migration: blocked_reason column added to task_contracts");
         }
 
+        // ── Schema v8: sub-agent orchestration results (SDD v1.5 Step 2a / 2.4) ──
+        if version < 8 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS subagent_results (
+                    run_id TEXT PRIMARY KEY,
+                    root_invocation_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_subagent_results_root ON subagent_results(root_invocation_id);"
+            ).map_err(|e| format!("v8 migration failed: {}", e))?;
+
+            conn.execute("INSERT INTO schema_version(version) VALUES(8)", [])
+                .map_err(|e| format!("Version 8 insert failed: {}", e))?;
+
+            info!("Schema v8 migration: subagent_results table created");
+        }
+
         Ok(())
+    }
+
+    /// Persist one finished sub-agent result, keyed by its run + root invocation.
+    /// Used for crash recovery: on resume, `load_subagent_results` returns
+    /// already-terminated workers' results so they are not re-spawned.
+    pub fn save_subagent_result(&self, root_invocation_id: &str, res: &crate::context::SubAgentResult) -> Result<(), String> {
+        let json = serde_json::to_string(res).map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO subagent_results
+                (run_id, root_invocation_id, role, status, result_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                res.run_id,
+                root_invocation_id,
+                res.role,
+                format!("{:?}", res.status),
+                json,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| format!("save_subagent_result failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Load all persisted results for a root invocation (crash-recovery reuse).
+    pub fn load_subagent_results(&self, root_invocation_id: &str) -> Result<Vec<crate::context::SubAgentResult>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT result_json FROM subagent_results WHERE root_invocation_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![root_invocation_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(json) = row {
+                if let Ok(r) = serde_json::from_str::<crate::context::SubAgentResult>(&json) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Store a conversation entry and update the FTS5 index.
@@ -1878,6 +1940,36 @@ mod tests_two_tier {
         let p = dir.path().join("mem.db").to_str().unwrap().to_string();
         std::mem::forget(dir); // keep tempdir alive for the test duration (Windows: file handle)
         MemoryStore::new(&p).unwrap()
+    }
+
+
+    fn sub_res(role: &str) -> crate::context::SubAgentResult {
+        crate::context::SubAgentResult {
+            run_id: format!("run-{role}"),
+            role: role.into(),
+            summary: "collected 12 artifacts".into(),
+            confidence: crate::context::Confidence::Medium,
+            token_usage: 1234,
+            evidence_refs: vec!["ev:1".into()],
+            artifact_refs: vec![],
+            case_ref: None,
+            proposed_writes: vec![],
+            status: crate::context::SubAgentStatus::Ok,
+        }
+    }
+
+    #[test]
+    fn subagent_result_persist_roundtrip() {
+        let s = tmp_store();
+        let r = sub_res("collector");
+        s.save_subagent_result("root-1", &r).unwrap();
+        let loaded = s.load_subagent_results("root-1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].role, "collector");
+        assert_eq!(loaded[0].run_id, "run-collector");
+        assert_eq!(loaded[0].status, crate::context::SubAgentStatus::Ok);
+        // Different root does not see the row.
+        assert!(s.load_subagent_results("root-2").unwrap().is_empty());
     }
 
     fn entry(hash: &str, importance: f32) -> ShallowEntry {

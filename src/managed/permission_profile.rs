@@ -187,3 +187,101 @@ pub fn check_preauthorization(
         _ => false,
     }
 }
+
+/// Reverse mapping of [`check_preauthorization`]: return the concrete tool names
+/// a worker is authorized to use (beyond its read-only base) given a profile's
+/// pre-authorized action classes. Grounded strictly on the `tool_name` arm set
+/// already recognized by [`check_preauthorization`] — actions with no recognized
+/// tool arm (IsolateHost / DeleteFilesInPath / DisableAccount) contribute none.
+/// `allow_all` is a permission-gate bypass, not a tool-set grant, so it also
+/// contributes none here.
+pub fn authorized_tool_names(profile: &PermissionProfile) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |n: &str| {
+        if !out.iter().any(|x| x == n) {
+            out.push(n.to_string());
+        }
+    };
+    for action in &profile.preauthorized {
+        match action {
+            PreauthorizedAction::KillProcess
+            | PreauthorizedAction::KillProcessNamed(_) => {
+                push("shell_exec"); // taskkill / stop-process
+                push("sys_process"); // action == "kill"
+            }
+            PreauthorizedAction::StopService => {
+                push("shell_exec"); // sc stop / stop-service
+            }
+            PreauthorizedAction::RemovePersistence => {
+                push("ir_persistence"); // action == remove/delete
+            }
+            PreauthorizedAction::IsolateHost
+            | PreauthorizedAction::DeleteFilesInPath(_)
+            | PreauthorizedAction::DisableAccount => {}
+        }
+    }
+    out
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with(actions: &[PreauthorizedAction]) -> PermissionProfile {
+        let mut p = PermissionProfile::new("p-test".to_string());
+        for a in actions {
+            p.authorize(a.clone());
+        }
+        p
+    }
+
+    #[test]
+    fn authorized_tool_names_maps_grounded_actions() {
+        let p = profile_with(&[
+            PreauthorizedAction::KillProcess,
+            PreauthorizedAction::StopService,
+            PreauthorizedAction::RemovePersistence,
+        ]);
+        let mut names = authorized_tool_names(&p);
+        names.sort();
+        // Only names recognized by check_preauthorization's tool arms.
+        assert_eq!(names, vec!["ir_persistence", "shell_exec", "sys_process"]);
+    }
+
+    #[test]
+    fn authorized_tool_names_named_kill_wildcards_to_kill() {
+        let p = profile_with(&[PreauthorizedAction::KillProcessNamed("evil.exe".into())]);
+        let names = authorized_tool_names(&p);
+        assert!(names.contains(&"shell_exec".to_string()));
+        assert!(names.contains(&"sys_process".to_string()));
+    }
+
+    #[test]
+    fn authorized_tool_names_unmapped_actions_contribute_none() {
+        let p = profile_with(&[
+            PreauthorizedAction::IsolateHost,
+            PreauthorizedAction::DeleteFilesInPath("C:\\temp".into()),
+            PreauthorizedAction::DisableAccount,
+        ]);
+        assert!(authorized_tool_names(&p).is_empty(),
+            "no recognized tool arm -> no authorized tools");
+    }
+
+    #[test]
+    fn authorized_tool_names_empty_and_allow_all_are_empty() {
+        assert!(authorized_tool_names(&PermissionProfile::new("x".into())).is_empty());
+        let mut all = PermissionProfile::new("x".into());
+        all.allow_all = true;
+        assert!(authorized_tool_names(&all).is_empty(),
+            "allow_all is a permission-gate bypass, not a tool-set grant");
+    }
+
+    #[test]
+    fn authorized_tool_names_dedupes() {
+        let p = profile_with(&[PreauthorizedAction::KillProcess, PreauthorizedAction::KillProcessNamed("a".into())]);
+        let names = authorized_tool_names(&p);
+        assert_eq!(names.iter().filter(|n| *n == "shell_exec").count(), 1);
+        assert_eq!(names.iter().filter(|n| *n == "sys_process").count(), 1);
+    }
+}

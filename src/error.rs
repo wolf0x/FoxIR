@@ -15,6 +15,7 @@ pub enum ErrorComponent {
     Server,
     Mcp,
     Skill,
+    Orchestration,
     Internal,
 }
 
@@ -29,6 +30,7 @@ impl fmt::Display for ErrorComponent {
             Self::Server => write!(f, "server"),
             Self::Mcp => write!(f, "mcp"),
             Self::Skill => write!(f, "skill"),
+            Self::Orchestration => write!(f, "orchestration"),
             Self::Internal => write!(f, "internal"),
         }
     }
@@ -155,6 +157,14 @@ impl AgentError {
 
     pub fn timeout(component: ErrorComponent, message: impl Into<String>) -> Self {
         Self::new(component, ErrorCategory::Timeout, "timeout", message)
+    }
+
+    pub fn not_available_in_mode(mode: crate::context::AgentMode) -> Self {
+        Self::new(ErrorComponent::Tool, ErrorCategory::Unavailable, "tool.not_available_in_mode", format!("orchestration tool unavailable in mode {:?}", mode))
+    }
+
+    pub fn depth_limit() -> Self {
+        Self::new(ErrorComponent::Tool, ErrorCategory::InvalidInput, "tool.depth_limit", "sub-agent depth limit exceeded")
     }
 
     pub fn not_found(component: ErrorComponent, message: impl Into<String>) -> Self {

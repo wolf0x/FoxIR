@@ -46,6 +46,8 @@ mod value;
 #[cfg(test)]
 mod tests_recall;
 mod web;
+#[cfg(test)]
+mod phase0_acceptance;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -421,6 +423,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.register(mt.clone());
     }
 
+    // Register orchestration shell tools (SDD v1.5 \u00a77.3 / Step 1). The delivery
+    // gate hides them from every model until Step 2a opens `Expert && depth == 0`.
+    crate::tool::orchestration::register_orchestration_tools(&mut registry);
+
     // Build LLM provider (implements Llm trait)
     // Load persisted model configs (from models.json in workspace, api_keys auto-decrypted)
     let model_store_path = std::path::Path::new(&workspace_dir).join("models.json");
@@ -492,10 +498,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
 
+    // SDD v1.5: build the main agent as an Expert root when orchestration is
+    // enabled so the sub-agent tools actually deliver/spawn at depth 0. When
+    // disabled (default legacy path) the agent stays Instant (zero diff).
+    let orchestration_enabled = config.agent.modes.expert.orchestration == "on";
     let agent = LlmAgent::builder()
         .name("FoxIR")
         .description("Local AI agent with Windows system tools")
         .provider(provider)
+        .mode(if orchestration_enabled {
+            crate::context::AgentMode::Expert
+        } else {
+            crate::context::AgentMode::Instant
+        })
         .tools(shared_tools.clone())
         .skill_manager(skill_manager.clone())
         .max_iterations(config.agent.max_iterations)
@@ -507,6 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skill_used_sessions(skill_used_sessions.clone())
         .sop_replay(sop_replay.clone())
         .cleanup_session(browser_session.clone())
+        .memory_store(memory_store.clone())
         .build()
         .map_err(|e| format!("Failed to build agent: {}", e))?;
     let agent: Arc<dyn agent::Agent> = Arc::new(agent);
@@ -554,6 +570,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skill_max_inline_chars(skill_max_inline_chars.clone())
         .skill_catalog_max(skill_catalog_max.clone())
         .skill_hot_top_k(skill_hot_top_k.clone())
+        .with_can_spawn(orchestration_enabled)
+        .with_mode(if orchestration_enabled {
+            crate::context::AgentMode::Expert
+        } else {
+            crate::context::AgentMode::Instant
+        })
         .build()
         .map_err(|e| format!("Failed to build runner: {}", e))?;
     let runner = Arc::new(runner);
@@ -700,6 +722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         expert_tool_timeout_secs: Arc::new(AtomicUsize::new(config.agent.expert_tool_timeout_secs)),
         expert_max_tool_retries: Arc::new(AtomicUsize::new(config.agent.expert_max_tool_retries)),
         expert_max_managed_rounds: Arc::new(AtomicUsize::new(config.agent.expert_max_managed_rounds)),
+        orchestration_limits: Arc::new(crate::config::OrchestrationLimits::from(&config.agent.modes.expert)),
         sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         permissions,
         permission_resolver,

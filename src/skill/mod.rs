@@ -264,7 +264,7 @@ impl SkillManager {
         catalog_max: usize,
         hot_top_k: usize,
     ) -> (Option<String>, bool) {
-        if matches!(strategy, SkillListingStrategy::DiscoverToolOnly) {
+        if matches!(strategy, SkillListingStrategy::DiscoverToolOnly | SkillListingStrategy::Disabled) {
             return (None, false);
         }
 
@@ -368,6 +368,7 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
                     }
                 }
             }
+            SkillListingStrategy::Disabled => unreachable!("Disabled is short-circuited at the top of build_skills_prompt"),
         }
 
         (Some(out), task_skill_active)
@@ -540,6 +541,21 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
                 skills: skills_ref.clone(),
             }) as Arc<dyn Tool>,
         ]
+    }
+
+    /// Return the union of skill tool names derived dynamically from
+    /// `build_meta_tools()` (SDD v1.5 §20.3 B4.2 / V.4, includes `improve_skill`).
+    /// Builds a throwaway manager (no disk reload) so the name set can never
+    /// drift from the tools actually registered.
+    pub fn skill_tool_names() -> Vec<String> {
+        let dummy = SkillManager {
+            skills: Arc::new(RwLock::new(Vec::new())),
+            skills_dir: PathBuf::new(),
+            state_path: PathBuf::new(),
+            skill_self_improve: Arc::new(AtomicBool::new(false)),
+            notify_tx: None,
+        };
+        dummy.build_meta_tools().iter().map(|t| t.name().to_string()).collect()
     }
 
     // --- Notifications ---
@@ -1227,6 +1243,34 @@ mod tests {
         assert!(t.contains("truncated for context budget"), "expected truncation note: {}", t);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// G-no-skill-injection: `Disabled` listing returns no skill prompt at all
+    /// (same short-circuit as `DiscoverToolOnly`).
+    #[test]
+    fn gate_disabled_listing_emits_nothing() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_gate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Alpha")).unwrap();
+        std::fs::write(tmp.join("Alpha/SKILL.md"),
+            "---\nname: Alpha\ndescription: alpha\ntriggers: [alpha]\n---\n# Alpha\nalways: true\n").unwrap();
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        assert!(!mgr.list().is_empty(), "Alpha skill should load");
+        let (p, active) = mgr.build_skills_prompt("alpha", SkillListingStrategy::Disabled, 20_000, 40, 3);
+        assert!(p.is_none(), "Disabled must not inject a skill prompt");
+        assert!(!active, "Disabled must not mark a task skill active");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// G-no-skill-tools: the skill tool-name set is exactly the 5 meta tools and
+    /// maps to a stable set used by `.minus(skill_tool_names())`.
+    #[test]
+    fn gate_skill_tool_names_are_the_five_meta_tools() {
+        let names = SkillManager::skill_tool_names();
+        assert_eq!(names.len(), 5, "expected exactly 5 skill tools, got {:?}", names);
+        for n in ["install_skill", "skill_read_file", "improve_skill", "list_skills", "remove_skill"] {
+            assert!(names.iter().any(|s| s == n), "missing skill tool {}", n);
+        }
     }
 
 }

@@ -178,6 +178,9 @@ pub struct AppState {
     pub expert_tool_timeout_secs: Arc<AtomicUsize>,
     pub expert_max_tool_retries: Arc<AtomicUsize>,
     pub expert_max_managed_rounds: Arc<AtomicUsize>,
+    /// Sub-agent orchestration limits (concurrency/timeout) sourced from
+    /// `config.agent.modes.expert`; used by the ManagedRunner parallel collect.
+    pub orchestration_limits: Arc<crate::config::OrchestrationLimits>,
     /// Per-session conversation history for multi-turn context
     pub sessions: Arc<Mutex<std::collections::HashMap<String, Vec<ChatMessage>>>>,
     /// Permission settings (category -> allowed), shared across connections
@@ -1736,6 +1739,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                         state.fallback_model.read().unwrap().clone(),
                                         state.expert_role_models.read().unwrap().clone(),
                                         state.human_intervention_enabled.clone(),
+                                        *state.orchestration_limits,
                                     );
                                     let handoff = if start_fresh { None } else { handoff };
                                     // On CONTINUE: if there is an unfinished Expert contract for this
@@ -1951,6 +1955,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             let _ = sink
                                 .send(Message::Text(json!({"type":"cleared"}).to_string().into()))
                                 .await;
+                        }
+                        "cancel_subagent" => {
+                            // Frontend Agent Card Cancel: cancel by run_id across
+                            // all live root orchestrators (Step 3 / Phase 0 精简版).
+                            let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+                            let cancelled = if run_id.is_empty() {
+                                false
+                            } else {
+                                crate::agent::orchestration::cancel_subagent_any(&run_id)
+                            };
+                            let mut sink = ws_sink.lock().await;
+                            let _ = sink.send(Message::Text(
+                                json!({"type":"subagent_cancelled","run_id":run_id,"cancelled":cancelled})
+                                    .to_string().into())).await;
                         }
                         "resume" => {
                             let cp_id = parsed["checkpoint_id"].as_str().unwrap_or("").to_string();

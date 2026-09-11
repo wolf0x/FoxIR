@@ -38,6 +38,7 @@ pub mod ir_pcap_analyze;
 pub mod ir_timeline;
 pub mod external_exec;
 pub mod computer_use;
+pub mod orchestration;
 pub mod linux_ssh;
 pub mod winrm;
 pub mod evidence;
@@ -154,6 +155,12 @@ pub trait Tool: Send + Sync {
 
     /// Whether this tool is a built-in tool (vs user-provided or MCP).
     fn is_builtin(&self) -> bool { false }
+
+    /// Whether this tool requires exclusive access to a shared resource
+    /// (e.g. a long-lived browser/WinRM session). Default: shared.
+    fn exclusivity(&self) -> crate::agent::exclusivity::Exclusivity {
+        crate::agent::exclusivity::Exclusivity::Shared
+    }
 
     /// Whether this tool is "peripheral" (e.g. MCP or external). Peripheral tools
     /// are NOT sent in full to the LLM every request; they are exposed on demand
@@ -300,6 +307,12 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.register_arc(tool);
+    }
+
+    /// Register a tool from a shared `Arc` (SDD v1.5 §13 Step 1.9 `register_arc`).
+    /// Canonical registration entry point; `register` delegates here.
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
@@ -351,8 +364,33 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Names of all read-only tools currently registered. Used to build the
+    /// default read-only allowlist for Phase 0 sub-agent workers.
+    pub fn read_only_names(&self) -> Vec<String> {
+        self.tools
+            .values()
+            .filter(|t| t.is_read_only())
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    /// Names of tools that require write/modify (allow_write) or execute
+    /// (allow_exec) capability, per the three-tier access model (SDD v1.5
+    /// §7.10). Used to expand a worker allowlist for Step 2b write/exec workers.
+    pub fn write_exec_names(&self, allow_write: bool, allow_exec: bool) -> Vec<String> {
+        self.tools
+            .values()
+            .filter(|t| {
+                let cat = t.category();
+                (allow_write && matches!(cat, "write" | "modify" | "delete"))
+                    || (allow_exec && cat == "execute")
+            })
+            .map(|t| t.name().to_string())
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -450,6 +488,35 @@ impl ToolRegistry {
             self.register(tool);
         }
     }
+
+    /// Return a new registry containing only the named tools (authorization subset).
+    /// Used in Step 2a to build a worker-scoped tool set from `authorized_tools()`.
+    pub fn subset(&self, names: &[String]) -> ToolRegistry {
+        let mut out = ToolRegistry::new();
+        for name in names {
+            if let Some(tool) = self.tools.get(name) {
+                out.register(tool.clone());
+            }
+        }
+        out
+    }
+
+    /// Iterate over all registered (name, tool) pairs (SDD v1.5 §13 Step 1.9 `iter`).
+    /// Used for registry introspection and for copying tools across registries.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn Tool>)> {
+        self.tools.iter().map(|(name, tool)| (name.as_str(), tool))
+    }
+
+    /// Remove the named tools in place. Returns the number of tools removed.
+    pub fn minus(&mut self, names: &[String]) -> usize {
+        let mut removed = 0;
+        for name in names {
+            if self.tools.remove(name).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
 }
 
 // ============================================================
@@ -490,4 +557,72 @@ pub fn resolve_binary(name: &str, workspace_dir: &str) -> String {
     // Tier 3: System PATH — return bare name, let OS resolve it
     tracing::debug!("Binary '{}' not found locally, falling back to system PATH", name);
     name.to_string()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default registry has read-only tools; `read_only_names` returns only
+    /// those, and `subset` keeps exactly the requested names.
+    #[test]
+    fn read_only_names_and_subset_filter() {
+        let reg = ToolRegistry::build_default("", None);
+        let ro = reg.read_only_names();
+        assert!(!ro.is_empty(), "expected some read-only tools");
+        assert!(ro.contains(&"file_read".to_string()), "file_read should be read-only");
+        // subset keeps only the named tools; skill/orchestration not included here.
+        let subset = reg.subset(&["file_read".to_string(), "no_such_tool".to_string()]);
+        assert_eq!(subset.tool_names(), vec!["file_read".to_string()]);
+    }
+
+    /// `iter` yields every registered (name, tool) pair; `register_arc` is the
+    /// canonical Arc-based registration used by `register` (SDD v1.5 §13 Step 1.9).
+    #[test]
+    fn iter_covers_registry_and_register_arc_inserts() {
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(file_ops::FileReadTool));
+        reg.register(Arc::new(file_ops::FileListTool));
+        assert_eq!(reg.len(), 2);
+        let mut names: Vec<&str> = reg.iter().map(|(name, _)| name).collect();
+        names.sort();
+        assert_eq!(names, vec!["file_list", "file_read"]);
+        // Every iterated tool is retrievable by name and shares the same Arc identity.
+        for (name, tool) in reg.iter() {
+            let fetched = reg.get(name).expect("iterated tool must be retrievable");
+            assert!(Arc::ptr_eq(tool, &fetched));
+        }
+    }
+
+    /// `minus` removes the named tools in place.
+    #[test]
+    fn minus_removes_named_tools() {
+        let mut reg = ToolRegistry::build_default("", None);
+        let before = reg.len();
+        let removed = reg.minus(&["file_read".to_string()]);
+        assert_eq!(removed, 1);
+        assert_eq!(reg.len(), before - 1);
+        assert!(reg.get("file_read").is_none());
+    }
+
+    /// `write_exec_names` admits only the opt-in capability tiers (SDD v1.5
+    /// §7.10 layer 2): allow_write -> write/modify/delete, allow_exec -> execute.
+    #[test]
+    fn write_exec_names_admits_optin_tiers() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(file_ops::FileReadTool));   // read
+        reg.register(Arc::new(file_ops::FileWriteTool));  // write
+        reg.register(Arc::new(shell_exec::ShellExecTool)); // execute
+        let none = reg.write_exec_names(false, false);
+        assert!(none.is_empty(), "no opt-in => no write/exec tools, got {none:?}");
+        let w = reg.write_exec_names(true, false);
+        assert!(w.contains(&"file_write".to_string()), "allow_write admits file_write, got {w:?}");
+        assert!(!w.contains(&"shell_exec".to_string()), "allow_write must not admit shell_exec");
+        let e = reg.write_exec_names(false, true);
+        assert!(e.contains(&"shell_exec".to_string()), "allow_exec admits shell_exec, got {e:?}");
+        assert!(!e.contains(&"file_write".to_string()), "allow_exec must not admit file_write");
+        let both = reg.write_exec_names(true, true);
+        assert!(both.contains(&"file_write".to_string()) && both.contains(&"shell_exec".to_string()));
+    }
 }

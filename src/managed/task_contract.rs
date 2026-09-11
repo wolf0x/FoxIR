@@ -142,6 +142,13 @@ pub struct TaskRecord {
     /// When this record was last verified.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Task-tree parent (the round/subtask this record belongs to). Spec §7.8.1.
+    /// Absent for round-level records.
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    /// Task-tree dependencies (ids this record depends on). Spec §7.8.1.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 fn default_pending() -> String {
@@ -558,6 +565,8 @@ impl TaskContract {
             phase: None,
             round_index: self.current_round,
             updated_at: Some(Utc::now()),
+            parent_task_id: None,
+            depends_on: Vec::new(),
         });
         if self.records.len() > 100 {
             self.records.remove(0);
@@ -576,3 +585,31 @@ impl TaskContract {
         serde_json::from_str(json).map_err(|e| format!("Failed to deserialize TaskContract: {}", e))
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_record_old_json_backward_compatible() {
+        // A legacy blob without the new tree fields must still deserialize,
+        // defaulting to "no parent / no deps" (spec §7.8.1 additive).
+        let old = r#"{"id":"x","kind":"artifact","title":"t","status":"completed","integrity":"clean","evidence_summary":"s","evidence_path":null,"phase":null,"round_index":0,"updated_at":null}"#;
+        let r: TaskRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.parent_task_id, None);
+        assert!(r.depends_on.is_empty());
+    }
+
+    #[test]
+    fn task_record_tree_fields_roundtrip() {
+        let json = r#"{"id":"sub-1","kind":"subtask","title":"Parallel worker: scan","status":"completed","integrity":"clean","evidence_summary":"found","evidence_path":null,"phase":"collection","round_index":0,"updated_at":null,"parent_task_id":"round-0","depends_on":["d1"]}"#;
+        let r: TaskRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(r.parent_task_id.as_deref(), Some("round-0"));
+        assert_eq!(r.depends_on, vec!["d1"]);
+        // And it round-trips.
+        let back: TaskRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.parent_task_id.as_deref(), Some("round-0"));
+    }
+}
+

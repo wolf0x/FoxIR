@@ -166,6 +166,9 @@ pub struct ManagedRunner {
     role_models: crate::config::RoleModelsConfig,
     /// Whether to use LLM to simulate human intervention when blocked.
     human_intervention_enabled: Arc<AtomicBool>,
+    /// Sub-agent orchestration limits (concurrency / timeout), sourced from
+    /// `config.agent.modes.expert` so parallel collect uses real bounds (T5.5).
+    orchestration_limits: crate::config::OrchestrationLimits,
 }
 
 /// Compact signature of the most recent verified/active content.
@@ -209,6 +212,7 @@ impl ManagedRunner {
         fallback_model: Option<String>,
         role_models: crate::config::RoleModelsConfig,
         human_intervention_enabled: Arc<AtomicBool>,
+        orchestration_limits: crate::config::OrchestrationLimits,
     ) -> Self {
         Self {
             inner,
@@ -229,6 +233,7 @@ impl ManagedRunner {
             fallback_model,
             role_models,
             human_intervention_enabled,
+            orchestration_limits,
         }
     }
 
@@ -385,7 +390,9 @@ impl ManagedRunner {
         let tool_timeout_secs = self.tool_timeout_secs;
         let max_tool_retries = self.max_tool_retries;
         let skill_manager = self.skill_manager.clone();
+        let working_dir = self.working_dir.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let orchestration_limits = self.orchestration_limits;
         let computer_use_enabled = self.computer_use_enabled.clone();
         let human_intervention_enabled = self.human_intervention_enabled.clone();
         let provider = self.provider.clone();
@@ -773,6 +780,89 @@ impl ManagedRunner {
                     b
                 };
 
+                // ── T5.5: Parallel collect phase ──
+                // If the Manager declared parallel read-only subtasks, dispatch
+                // them as Orchestrator workers (depth-1, can_spawn=false),
+                // fold the condensed brief + Manager notes into this round.
+                // Single-writer: workers only collect read-only results; the
+                // verified state still flows through the Executor/Auditor path.
+                let brief = {
+                    let mut b = brief;
+                    if !plan.parallel_subtasks.is_empty() {
+                        let parl = crate::managed::parallel::ParallelEnv {
+                            provider: provider.clone(),
+                            tools: tools.clone(),
+                            working_dir: working_dir.clone(),
+                            workspace_dir: workspace_dir.clone(),
+                            model: executor_model.clone(),
+                            max_iterations: max_executor_iterations,
+                            context_window,
+                            max_inline_chars: 120_000,
+                            tool_timeout_secs,
+                            max_tool_retries,
+                            two_tier_memory: false,
+                            limits: orchestration_limits,
+                            memory_store: Some(memory_store.clone()),
+                            permissions: permissions.clone(),
+                            permission_pending: permission_pending.clone(),
+                            preauth_profile: Some(permission_profile.clone()),
+                        };
+                        let p_results = crate::managed::parallel::run_parallel_collect(
+                            &parl, &plan.parallel_subtasks, &contract_id, &session).await;
+                        let p_brief = crate::managed::parallel::render_collect_brief(&p_results);
+                        if !p_brief.is_empty() {
+                            b.push_str(&p_brief);
+                        }
+                        let round_task_id = format!("round-{}", round);
+                        // §7.5 single-writer gate: the deterministic auditor
+                        // runs BEFORE state is persisted. Pass => promote worker
+                        // results into trustworthy records; Fail/Uncertain =>
+                        // degrade to untrusted + open lead (partial results +
+                        // divergence note), never enter verified state.
+                        let disposition = crate::managed::parallel::collect_disposition(&p_results);
+                        let promote = matches!(disposition, crate::managed::parallel::CollectDisposition::Promote);
+                        for r in &p_results {
+                            let ok = r.status == crate::context::SubAgentStatus::Ok;
+                            let st = if ok { "ok" } else { "non-ok" };
+                            contract.manager_notes.push(format!(
+                                "Round {} parallel [{}] {}: {}", round + 1, st, r.role, r.summary));
+                            // Task tree (spec §7.8.1): each worker is a child of
+                            // this round's subtask. Trustworthiness comes from
+                            // the audit disposition, not the raw status.
+                            contract.records.push(crate::managed::task_contract::TaskRecord {
+                                id: format!("sub-{}", r.run_id),
+                                kind: "subtask".to_string(),
+                                title: format!("Parallel worker: {}", r.role),
+                                status: if promote && ok { "completed".to_string() } else { "untrusted".to_string() },
+                                integrity: if promote && ok { "clean".to_string() } else { "suspect".to_string() },
+                                evidence_summary: r.summary.clone(),
+                                evidence_path: None,
+                                phase: Some(format!("{:?}", contract.phase).to_lowercase()),
+                                round_index: round,
+                                updated_at: Some(chrono::Utc::now()),
+                                parent_task_id: Some(round_task_id.clone()),
+                                depends_on: Vec::new(),
+                            });
+                        }
+                        // §7.5 degradation (option B): record partial results and
+                        // divergence as a structured open lead + note.
+                        if !promote {
+                            let reason = match disposition {
+                                crate::managed::parallel::CollectDisposition::Degrade(r) => r,
+                                _ => "unknown".to_string(),
+                            };
+                            contract.add_lead(
+                                &format!("Parallel collect not certified (round {})", round + 1),
+                                &reason,
+                            );
+                            contract.manager_notes.push(format!(
+                                "Round {} parallel audit: {}", round + 1, reason));
+                        }
+                        info!("[managed:{}] Parallel collect: {} worker(s), {} result(s)", session, plan.parallel_subtasks.len(), p_results.len());
+                    }
+                    b
+                };
+
                 info!("[managed:{}] Executor starting with brief ({} chars)", session, brief.len());
 
                 // Run the Executor with the brief as the user message
@@ -1045,6 +1135,8 @@ impl ManagedRunner {
                                 phase: Some(format!("{:?}", contract.phase).to_lowercase()),
                                 round_index: round,
                                 updated_at: Some(chrono::Utc::now()),
+                                parent_task_id: Some(format!("round-{}", round)),
+                                depends_on: Vec::new(),
                             });
                         } else {
                             // Not promoted to verified state: keep as untrusted/pending record.
@@ -1059,6 +1151,8 @@ impl ManagedRunner {
                                 phase: Some(format!("{:?}", contract.phase).to_lowercase()),
                                 round_index: round,
                                 updated_at: Some(chrono::Utc::now()),
+                                parent_task_id: Some(format!("round-{}", round)),
+                                depends_on: Vec::new(),
                             });
                             let reason = if audit.verified {
                                 "round not independently certified (auditor verdict not complete/clean)".to_string()

@@ -59,6 +59,7 @@
 pub mod task_contract;
 pub mod manager;
 pub mod runner;
+pub mod parallel;
 pub mod auditor;
 pub mod permission_profile;
 
@@ -68,6 +69,8 @@ pub use task_contract::TaskContract;
 pub use task_contract::{VerifiedFinding, VerifiedAction, IrPhase};
 #[allow(unused_imports)]
 pub use runner::ManagedRunner;
+#[allow(unused_imports)]
+pub use parallel::run_parallel_collect;
 #[allow(unused_imports)]
 pub use auditor::Auditor;
 #[allow(unused_imports)]

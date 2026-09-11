@@ -16,6 +16,95 @@ use crate::model::ChatMessage;
 use crate::permission::PendingMap;
 use crate::checkpoint::ATaskCheckpointer;
 
+/// Agent operational mode. Orchestration is only available in Expert mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    #[default]
+    Instant,
+    Expert,
+}
+
+/// Classifies a session: main user session, cron-triggered, or a sub-agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    #[default]
+    Main,
+    Cron,
+    SubAgent,
+}
+
+impl SessionKind {
+    /// Infer the kind from a session id prefix (`sub-` / `cron-` / otherwise Main).
+    pub fn from_session_id(session_id: &str) -> Self {
+        if session_id.starts_with("sub-") {
+            Self::SubAgent
+        } else if session_id.starts_with("cron-") {
+            Self::Cron
+        } else {
+            Self::Main
+        }
+    }
+}
+
+/// Terminal lifecycle status of a sub-agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SubAgentStatus {
+    Pending,
+    Running,
+    Ok,
+    Failed,
+    Cancelled,
+    Timeout,
+}
+
+/// Heuristic confidence for a sub-agent result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+/// A single pending write intent returned by a worker; executed by the Manager
+/// single-writer. Kept generic for Step 1 (concrete kinds wired in Step 2a).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProposedWrite {
+    pub kind: String,
+    pub target: String,
+    pub payload: serde_json::Value,
+}
+
+/// Structured result returned by a sub-agent (the only thing Orchestrator reads).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubAgentResult {
+    pub run_id: String,
+    pub role: String,
+    pub summary: String,
+    pub confidence: Confidence,
+    pub token_usage: u64,
+    pub evidence_refs: Vec<String>,
+    pub artifact_refs: Vec<String>,
+    pub case_ref: Option<String>,
+    pub proposed_writes: Vec<ProposedWrite>,
+    pub status: SubAgentStatus,
+}
+
+/// Spec passed to `spawn_subagent` describing a worker run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubAgentSpec {
+    pub role: String,
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub tools_allowlist: Vec<String>,
+    pub allow_write: bool,
+    pub allow_exec: bool,
+    pub model: Option<String>,
+    pub timeout: Option<u64>,
+    pub max_tokens: Option<usize>,
+    pub max_iterations: Option<usize>,
+    pub skills: Vec<String>,
+}
+
 /// Base identity context — immutable, passed through the entire pipeline.
 /// Modeled after ADK-RUST's ReadonlyContext.
 #[derive(Debug, Clone)]
@@ -70,6 +159,10 @@ pub struct ToolContext {
     pub function_call_id: String,
     pub working_dir: String,
     pub workspace_dir: String,
+    pub mode: AgentMode,
+    pub depth: u8,
+    pub can_spawn: bool,
+    pub run_id: Option<String>,
     /// Override for the artifact/output directory. Empty → defaults to
     /// `workspace_dir/output`. Used by Expert mode to write each round's
     /// artifacts directly into `managed/<contract>/round_NNN/`.
@@ -98,6 +191,10 @@ impl ToolContext {
             context_window: 128000,
             enable_context_scaling: true,
             max_inline_chars: 120_000,
+            mode: AgentMode::Instant,
+            depth: 0,
+            can_spawn: false,
+            run_id: None,
         }
     }
 
@@ -119,6 +216,10 @@ impl ToolContext {
             context_window: 128000,
             enable_context_scaling: true,
             max_inline_chars: 120_000,
+            mode: AgentMode::Instant,
+            depth: 0,
+            can_spawn: false,
+            run_id: None,
         }
     }
 
@@ -263,10 +364,68 @@ pub struct InvocationContext {
     pub preauth_profile: Option<std::sync::Arc<crate::managed::permission_profile::PermissionProfile>>,
     /// Optional per-invocation artifact/output directory override (Expert rounds).
     pub tool_output_dir: Option<String>,
+    pub mode: AgentMode,
+    pub depth: u8,
+    pub can_spawn: bool,
+    pub root_invocation_id: Option<String>,
+    pub parent_invocation_id: Option<String>,
+    pub session_kind: SessionKind,
     ended: Arc<AtomicBool>,
 }
 
+/// Parameters for the unified sub-agent child-context pass-through path
+/// (SDD v1.5 §7.1 / Step 1.4). Everything the worker inherits from the parent
+/// run travels through this one struct instead of ad-hoc field copies.
+pub struct SubagentChildParams {
+    pub run_id: String,
+    pub role: String,
+    pub model: String,
+    pub max_iterations: usize,
+    pub parent_invocation_id: String,
+    pub root_invocation_id: String,
+    pub parent_depth: u8,
+    pub permissions: Arc<Mutex<HashMap<String, bool>>>,
+    pub permission_pending: PendingMap,
+    pub preauth_profile: Option<std::sync::Arc<crate::managed::permission_profile::PermissionProfile>>,
+    pub context_window: usize,
+    pub enable_context_scaling: bool,
+    pub max_inline_chars: usize,
+    pub tool_timeout_secs: u64,
+    pub max_tool_retries: usize,
+    /// Cancellation flag the worker observes (root-ended or per-worker ended).
+    pub ended: Arc<AtomicBool>,
+}
+
 impl InvocationContext {
+    /// Unified pass-through constructor for a sub-agent worker context
+    /// (SDD v1.5 §7.4.1): `mode = Expert`, `depth = parent + 1`,
+    /// `can_spawn = false`, `session_kind = SubAgent`, strategy-level skill
+    /// shutdown (`Disabled`), and the §7.6 isolation semantics (fresh history,
+    /// no inherited scratchpad — `new()` defaults already provide those).
+    pub fn subagent_child(p: SubagentChildParams) -> Self {
+        let session_id = format!("sub-{}", p.run_id);
+        let base = ReadonlyContext::new(p.run_id.clone(), p.role.clone(), session_id);
+        let mut ctx = Self::new(base, p.role, p.model, p.max_iterations);
+        ctx.session_kind = SessionKind::SubAgent;
+        ctx.mode = AgentMode::Expert;
+        debug_assert_eq!(ctx.mode, AgentMode::Expert, "§7.4.1 child mode must be Expert");
+        ctx.depth = p.parent_depth + 1;
+        ctx.can_spawn = false;
+        ctx.root_invocation_id = Some(p.root_invocation_id);
+        ctx.parent_invocation_id = Some(p.parent_invocation_id);
+        ctx.permissions = p.permissions;
+        ctx.permission_pending = p.permission_pending;
+        ctx.preauth_profile = p.preauth_profile;
+        ctx.context_window = p.context_window;
+        ctx.enable_context_scaling = p.enable_context_scaling;
+        ctx.max_inline_chars = p.max_inline_chars;
+        ctx.tool_timeout_secs = p.tool_timeout_secs;
+        ctx.max_tool_retries = p.max_tool_retries;
+        ctx.skill_listing_strategy = crate::skill::SkillListingStrategy::Disabled;
+        ctx.set_ended(p.ended);
+        ctx
+    }
+
     pub fn new(
         base: ReadonlyContext,
         agent_name: String,
@@ -309,6 +468,12 @@ impl InvocationContext {
             event_log_path: None,
             preauth_profile: None,
             tool_output_dir: None,
+            mode: AgentMode::Instant,
+            depth: 0,
+            can_spawn: false,
+            root_invocation_id: None,
+            parent_invocation_id: None,
+            session_kind: SessionKind::Main,
             ended: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -441,6 +606,20 @@ impl InvocationContext {
         self
     }
 
+    /// Enable sub-agent orchestration spawning for this run (SDD v1.5 2.x).
+    /// Gated at runtime by `mode == Expert && depth == 0` in the agent loop.
+    pub fn with_can_spawn(mut self, enabled: bool) -> Self {
+        self.can_spawn = enabled;
+        self
+    }
+
+    /// Set the operational mode for this run (Instant by default; Expert unlocks
+    /// sub-agent orchestration at depth 0). SDD v1.5 2.x.
+    pub fn with_mode(mut self, mode: AgentMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
 
     pub fn with_resume_state(mut self, history: Vec<ChatMessage>, start_iteration: usize) -> Self {
         self.resume_history = Some(history);
@@ -487,8 +666,73 @@ impl InvocationContext {
     }
 
     /// Check if the invocation has been signaled to end.
+    pub fn set_ended(&mut self, ended: Arc<AtomicBool>) {
+        self.ended = ended;
+    }
+
+    pub fn ended_flag(&self) -> Arc<AtomicBool> {
+        self.ended.clone()
+    }
+
+    /// Worker-authorized tool names derived from this invocation's
+    /// `preauth_profile` (Step 2a/2b): the write/exec tools the profile
+    /// pre-authorizes, on top of the read-only base. Empty when no profile or
+    /// the profile grants no recognized tool set. Reverse of
+    /// `permission_profile::check_preauthorization` (SDD v1.5 §7.10).
+    pub fn authorized_tools(&self) -> Vec<String> {
+        match &self.preauth_profile {
+            Some(profile) => crate::managed::permission_profile::authorized_tool_names(profile),
+            None => Vec::new(),
+        }
+    }
+
     pub fn is_ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
     }
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> ReadonlyContext {
+        ReadonlyContext::new("inv-1".into(), "agent".into(), "sess".into())
+    }
+
+    #[test]
+    fn can_spawn_defaults_to_false_and_setter_toggles() {
+        let ctx = InvocationContext::new(base(), "agent".into(), "m".into(), 5);
+        assert!(!ctx.can_spawn);
+        let ctx = ctx.with_can_spawn(true);
+        assert!(ctx.can_spawn);
+        let ctx = ctx.with_can_spawn(false);
+        assert!(!ctx.can_spawn);
+    }
+
+    #[test]
+    fn root_and_parent_invocation_roundtrip() {
+        let mut ctx = InvocationContext::new(base(), "agent".into(), "m".into(), 5);
+        ctx.root_invocation_id = Some("root-1".into());
+        ctx.parent_invocation_id = Some("parent-1".into());
+        assert_eq!(ctx.root_invocation_id.as_deref(), Some("root-1"));
+        assert_eq!(ctx.parent_invocation_id.as_deref(), Some("parent-1"));
+    }
+
+    #[test]
+    fn authorized_tools_empty_without_profile_and_derived_with_containment() {
+        use crate::managed::permission_profile::{PermissionProfile, PreauthorizedAction};
+        let plain = InvocationContext::new(base(), "agent".into(), "m".into(), 5);
+        assert!(plain.authorized_tools().is_empty(), "no profile -> no authorized tools");
+
+        let mut profile = PermissionProfile::new("t".into());
+        profile.authorize(PreauthorizedAction::KillProcess);
+        profile.authorize(PreauthorizedAction::RemovePersistence);
+        let ctx = InvocationContext::new(base(), "agent".into(), "m".into(), 5)
+            .with_preauth_profile(Some(std::sync::Arc::new(profile)));
+        let mut names = ctx.authorized_tools();
+        names.sort();
+        assert_eq!(names, vec!["ir_persistence", "shell_exec", "sys_process"]);
+    }
+}

@@ -131,6 +131,17 @@ function handleServerEvent(msg) {
             scrollToBottom();
             break;
 
+        case 'budget_update':
+            upsertSubagentCard(msg.run_id, msg.role, 'running', null);
+            setSubagentBudget(msg.run_id, msg.prompt_tokens, msg.completion_tokens, msg.total_tokens);
+            scrollToBottom();
+            break;
+
+        case 'subagent':
+            upsertSubagentCard(msg.run_id, msg.role, msg.status, msg.summary);
+            scrollToBottom();
+            break;
+
         case 'error':
             hideTyping();
             ensureAssistantMsg();
@@ -345,6 +356,48 @@ function clearChat() {
     if (ws) ws.send(JSON.stringify({ type: 'clear' }));
     document.getElementById('messages').innerHTML = '';
     resetAssistant();
+}
+
+// --- Sub-agent Agent Card (Phase 0 精简版: 仅 Agent Card + 取消) ---
+const subagentCards = {};
+
+function upsertSubagentCard(runId, role, status, summary) {
+    let card = subagentCards[runId];
+    if (!card) {
+        card = document.createElement('div');
+        card.className = 'subagent-card';
+        card.innerHTML = `
+            <div class="subagent-row">
+                <span class="subagent-role"></span>
+                <span class="subagent-status"></span>
+                <button class="subagent-cancel" onclick="cancelSubagent('${runId}')">Cancel</button>
+            </div>
+            <div class="subagent-summary"></div>
+            <div class="subagent-budget"></div>`;
+        document.getElementById('messages').appendChild(card);
+        subagentCards[runId] = card;
+    }
+    card.querySelector('.subagent-role').textContent = role || runId;
+    card.querySelector('.subagent-status').textContent = status || 'running';
+    if (summary) {
+        card.querySelector('.subagent-summary').textContent = summary;
+    }
+    if (status && status !== 'running' && status !== 'Running' && status !== 'Pending') {
+        const btn = card.querySelector('.subagent-cancel');
+        if (btn) btn.style.display = 'none';
+    }
+}
+
+function setSubagentBudget(runId, prompt, completion, total) {
+    const card = subagentCards[runId];
+    if (card) {
+        card.querySelector('.subagent-budget').textContent =
+            `tokens: ${prompt} prompt / ${completion} completion / ${total} total`;
+    }
+}
+
+function cancelSubagent(runId) {
+    if (ws) ws.send(JSON.stringify({ type: 'cancel_subagent', run_id: runId }));
 }
 
 // --- Sidebar ---

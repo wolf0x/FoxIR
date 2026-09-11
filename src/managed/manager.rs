@@ -38,6 +38,22 @@ pub struct ManagerPlan {
     /// Raw LLM output of the Manager (original reasoning + structured plan).
     /// Persisted to round_dir/plan_raw.md by the runner for audit replay.
     pub raw_output: String,
+    /// Independently parallelizable read-only subtasks to dispatch as workers
+    /// before/within this round (T5.5). Empty => no parallel dispatch.
+    #[serde(default)]
+    pub parallel_subtasks: Vec<ParallelSubtask>,
+}
+
+/// One independently executable, read-only subtask that the Manager wants
+/// dispatched as a parallel worker (SDD v1.5 §7.8.1 / T5.5). The Manager's
+/// primary `subtask` remains the round objective; these are its delegate-able
+/// pieces. When empty, no parallel dispatch happens (legacy single-Executor).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParallelSubtask {
+    /// Worker role label (e.g. "port_scan", "log_parse").
+    pub role: String,
+    /// One-sentence, self-contained read-only task for that worker.
+    pub task: String,
 }
 
 /// What happens after the Executor completes a subtask.
@@ -67,6 +83,8 @@ pub struct PendingPlan {
     pub route: ManagerRoute,
     pub channel: String,
     pub remaining_work: Vec<String>,
+    #[serde(default)]
+    pub parallel_subtasks: Vec<ParallelSubtask>,
 }
 
 impl PendingPlan {
@@ -78,6 +96,7 @@ impl PendingPlan {
             route: p.route.clone(),
             channel: p.channel.clone(),
             remaining_work: p.remaining_work.clone(),
+            parallel_subtasks: p.parallel_subtasks.clone(),
         }
     }
     pub fn to_plan(&self) -> ManagerPlan {
@@ -90,6 +109,7 @@ impl PendingPlan {
             channel: self.channel.clone(),
             remaining_work: self.remaining_work.clone(),
             raw_output: String::new(),
+            parallel_subtasks: self.parallel_subtasks.clone(),
         }
     }
     pub fn to_json(&self) -> Result<String, String> {
@@ -166,6 +186,8 @@ fn manager_system_prompt(lang: &str, domain: TaskDomain, tool_defs: &[ToolDefini
 
     prompt.push_str("17. If Remaining Work (from the task state) is non-empty, the next subtask MUST be the first unaddressed item in Remaining Work. Treat Remaining Work as the authoritative to-do list for deciding the next step, NOT a suggestion.\n");
     prompt.push_str("\n18. BUDGET AWARENESS: If remaining rounds ≤ 20% of max_rounds, focus on completing existing items in Remaining Work rather than opening new leads. In the final rounds, prioritize wrapping up over exploration.\n");
+    prompt.push_str("19. PARALLEL DISPATCH (optional, T5.5): If the next round contains 2 or more INDEPENDENT, read-only collection/analysis steps that share no data dependency, list them under a \"Parallel Subtasks:\" section as one bullet per worker line, format `- role | one-sentence self-contained task` (e.g. `- port_scan | enumerate open TCP ports on 10.0.0.5`). Each must be complete stand-alone and read-only (no writes, no containment). Keep the main \"Subtask:\" as the round objective that consumes/advances on those parallel results. If nothing is safely parallel, omit the Parallel Subtasks section entirely (single-Executor fallback). Limit to the concurrency bound.
+");
     prompt.push_str(&format!("\n{}\n", tool_ref));
     prompt.push_str(&format!("\nLANGUAGE: The original task is written in {lang}. Write all free-text fields (Subtask, Success Criteria, Expected Evidence, reason) in {lang}; keep structure and tool names in English.\n"));
     prompt
@@ -329,6 +351,7 @@ pub fn parse_manager_plan(output: &str) -> ManagerPlan {
     let mut phase: Option<IrPhase> = None;
     let mut channel = "cli".to_string();
     let mut remaining_work: Vec<String> = Vec::new();
+    let mut parallel_subtasks: Vec<ParallelSubtask> = Vec::new();
 
     let mut current_section = "";
 
@@ -380,6 +403,16 @@ pub fn parse_manager_plan(output: &str) -> ManagerPlan {
                 else if ch.starts_with("ask") { "ask".to_string() }
                 else { "cli".to_string() };
             current_section = "";
+        } else if trimmed.starts_with("Parallel Subtasks:") {
+            current_section = "parallel";
+        } else if !trimmed.is_empty() && current_section == "parallel" {
+            let item = trimmed.trim_start_matches('-').trim();
+            if let Some(pipe) = item.find('|') {
+                parallel_subtasks.push(ParallelSubtask {
+                    role: item[..pipe].trim().to_string(),
+                    task: item[pipe + 1..].trim().to_string(),
+                });
+            }
         } else if trimmed.starts_with("Remaining Work:") {
             let item = trimmed.trim_start_matches("Remaining Work:").trim();
             if !item.is_empty() { remaining_work.push(item.to_string()); }
@@ -412,6 +445,7 @@ pub fn parse_manager_plan(output: &str) -> ManagerPlan {
         channel,
         remaining_work,
         raw_output: output.to_string(),
+        parallel_subtasks,
     }
 }
 
@@ -556,3 +590,42 @@ pub async fn summarize_prior(
         .map_err(|e| format!("Prior summary LLM call failed: {}", e))?;
     Ok(content.trim().to_string())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_plan_without_parallel_is_backward_compatible() {
+        let out = "Subtask: enumerate services on host\nSuccess Criteria: service list\nExpected Evidence: output/services.txt\nRoute: continue\n";
+        let p = parse_manager_plan(out);
+        assert_eq!(p.subtask, "enumerate services on host");
+        assert!(p.parallel_subtasks.is_empty(), "missing section => empty (legacy)");
+    }
+
+    #[test]
+    fn parse_plan_parallel_subtasks_section() {
+        let out = "Subtask: aggregate parallel recon\nSuccess Criteria: merged report\nExpected Evidence: output/report.txt\nParallel Subtasks:\n- port_scan | enumerate open TCP ports on 10.0.0.5\n- log_parse | parse recent security logs for anomalies\nRoute: continue\n";
+        let p = parse_manager_plan(out);
+        assert!(p.route == ManagerRoute::Continue);
+        assert_eq!(p.subtask, "aggregate parallel recon");
+        assert_eq!(p.parallel_subtasks.len(), 2);
+        assert_eq!(p.parallel_subtasks[0].role, "port_scan");
+        assert!(p.parallel_subtasks[0].task.contains("10.0.0.5"));
+        assert_eq!(p.parallel_subtasks[1].role, "log_parse");
+    }
+
+    #[test]
+    fn pending_plan_roundtrip_preserves_parallel() {
+        let p = parse_manager_plan("Subtask: a\nSuccess Criteria: b\nExpected Evidence: c\nParallel Subtasks:\n- x | do x\nRoute: continue\n");
+        let pp = PendingPlan::from_plan(&p);
+        let json = pp.to_json().unwrap();
+        let back = PendingPlan::from_json(&json).unwrap();
+        assert_eq!(back.parallel_subtasks.len(), 1);
+        assert_eq!(back.parallel_subtasks[0].role, "x");
+        // to_plan carries them through for an exact bare-resume.
+        assert_eq!(pp.to_plan().parallel_subtasks.len(), 1);
+    }
+}
+

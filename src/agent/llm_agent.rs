@@ -242,12 +242,59 @@ fn trim_history_by_value(history: &mut Vec<ChatMessage>, max_tokens: usize) {
 /// 2. Send messages + tool schemas to LLM (streaming)
 /// 3. If LLM returns tool_calls → execute tools → loop back
 /// 4. If LLM returns text → done
+/// Orchestration tool names. Hidden from the model via delivery gating unless
+/// the mode/depth allowset opens (SDD \u00a77.3). Step 1 keeps allowset empty
+/// for all modes (Expert included) so there is zero behavior diff.
+const ALL_ORCH: [&str; 7] = [
+    "spawn_subagent",
+    "wait_subagent",
+    "list_subagents",
+    "cancel_subagent",
+    "get_subagent_result",
+    "update_plan",
+    "read_subagent_log",
+];
+
+/// Delivery-gate truth table. Step 1: returns empty for every mode/depth.
+/// Step 2a opens `Expert && depth == 0` to ALL_ORCH.
+pub(crate) fn is_orchestration_name(name: &str) -> bool {
+    ALL_ORCH.contains(&name)
+}
+
+pub(crate) fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec<String> {
+    // Step 2a opens the delivery gate for the Expert root run (depth 0) so the
+    // manager can call the orchestration tools. Workers (depth >= 1) never get them.
+    if mode == crate::context::AgentMode::Expert && depth == 0 {
+        ALL_ORCH.iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Delivery-gate predicate (SDD \u00a77.3). An orchestration tool is delivered
+/// to the model only when its name is *not* in `ALL_ORCH`, or when the allowset
+/// explicitly opens it. Step 1 returns an empty allowset so the gate strips all
+/// seven orchestration tools from every mode (zero behavior diff).
+pub(crate) fn orchestration_delivered(name: &str, allowset: &[String]) -> bool {
+    !ALL_ORCH.contains(&name) || allowset.iter().any(|n| n == name)
+}
+
+/// True only for the user's main interactive session. Sub/cron sessions are
+/// excluded so they write to session-scoped files and never see the main TODO.
+pub(crate) fn is_main_session(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && !session_id.starts_with("cron-")
+        && !session_id.starts_with("sub-")
+}
+
 pub struct LlmAgent {
     name: String,
     description: String,
     provider: Arc<OpenAiProvider>,
     tools: Arc<tokio::sync::RwLock<ToolRegistry>>,
-    skill_manager: Arc<SkillManager>,
+    skill_manager: Option<Arc<SkillManager>>,
+    mode: crate::context::AgentMode,
+    depth: u8,
     max_iterations: usize,
     working_dir: String,
     workspace_dir: String,
@@ -269,6 +316,10 @@ pub struct LlmAgent {
     sop_replay: Arc<std::sync::atomic::AtomicBool>,
     /// Sessions to clean up after the agent loop completes.
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
+    /// Optional memory store for persisting sub-agent results (SDD v1.5 2.4).
+    memory_store: Option<Arc<crate::memory::MemoryStore>>,
+    /// Orchestration limits for spawned sub-agents (SDD v1.5 §9).
+    orchestration_limits: crate::config::OrchestrationLimits,
 }
 
 /// Builder for LlmAgent (modeled after ADK-RUST's LlmAgentBuilder).
@@ -278,6 +329,9 @@ pub struct LlmAgentBuilder {
     provider: Option<Arc<OpenAiProvider>>,
     tools: Option<Arc<tokio::sync::RwLock<ToolRegistry>>>,
     skill_manager: Option<Arc<SkillManager>>,
+    skill_manager_disabled: bool,
+    mode: crate::context::AgentMode,
+    depth: u8,
     max_iterations: usize,
     working_dir: String,
     workspace_dir: String,
@@ -290,6 +344,8 @@ pub struct LlmAgentBuilder {
     skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     sop_replay: Arc<std::sync::atomic::AtomicBool>,
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
+    memory_store: Option<Arc<crate::memory::MemoryStore>>,
+    orchestration_limits: crate::config::OrchestrationLimits,
 }
 
 impl LlmAgentBuilder {
@@ -300,6 +356,9 @@ impl LlmAgentBuilder {
             provider: None,
             tools: None,
             skill_manager: None,
+            skill_manager_disabled: false,
+            mode: crate::context::AgentMode::Instant,
+            depth: 0,
             max_iterations: 100,
             working_dir: ".".to_string(),
             workspace_dir: String::new(),
@@ -312,6 +371,8 @@ impl LlmAgentBuilder {
             skill_used_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             sop_replay: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cleanup_sessions: Vec::new(),
+            memory_store: None,
+            orchestration_limits: crate::config::OrchestrationLimits::default(),
         }
     }
 
@@ -320,6 +381,12 @@ impl LlmAgentBuilder {
     pub fn provider(mut self, provider: Arc<OpenAiProvider>) -> Self { self.provider = Some(provider); self }
     pub fn tools(mut self, tools: Arc<tokio::sync::RwLock<ToolRegistry>>) -> Self { self.tools = Some(tools); self }
     pub fn skill_manager(mut self, sm: Arc<SkillManager>) -> Self { self.skill_manager = Some(sm); self }
+    /// Explicitly disable skill injection for this agent (SDD \u00a720.3 B4.3).
+    /// Preserves the old default attach for builders that do NOT call this, so
+    /// existing Instant/Expert agents keep `SkillManager` (G-instant-diff).
+    pub fn without_skills(mut self) -> Self { self.skill_manager_disabled = true; self.skill_manager = None; self }
+    pub fn mode(mut self, mode: crate::context::AgentMode) -> Self { self.mode = mode; self }
+    pub fn depth(mut self, depth: u8) -> Self { self.depth = depth; self }
     pub fn max_iterations(mut self, n: usize) -> Self { self.max_iterations = n; self }
     pub fn working_dir(mut self, dir: &str) -> Self { self.working_dir = dir.to_string(); self }
     pub fn workspace_dir(mut self, dir: &str) -> Self { self.workspace_dir = dir.to_string(); self }
@@ -342,12 +409,19 @@ impl LlmAgentBuilder {
     pub fn cleanup_session(mut self, session: Arc<crate::tool::browser_cdp::BrowserSession>) -> Self {
         self.cleanup_sessions.push(session); self
     }
+    /// Attach the optional memory store used to persist sub-agent results.
+    pub fn memory_store(mut self, ms: Arc<crate::memory::MemoryStore>) -> Self {
+        self.memory_store = Some(ms); self
+    }
 
     pub fn build(self) -> AgentResult<LlmAgent> {
         let provider = self.provider.ok_or_else(|| AgentError::config("LlmAgent requires a provider"))?;
         let tools = self.tools.ok_or_else(|| AgentError::config("LlmAgent requires tools"))?;
-        let skill_manager = self.skill_manager
-            .unwrap_or_else(|| Arc::new(SkillManager::new("skills")));
+        let skill_manager = if self.skill_manager_disabled {
+            None
+        } else {
+            Some(self.skill_manager.unwrap_or_else(|| Arc::new(SkillManager::new("skills"))))
+        };
 
         Ok(LlmAgent {
             name: self.name,
@@ -355,6 +429,8 @@ impl LlmAgentBuilder {
             provider,
             tools,
             skill_manager,
+            mode: self.mode,
+            depth: self.depth,
             max_iterations: self.max_iterations,
             working_dir: self.working_dir,
             workspace_dir: self.workspace_dir,
@@ -367,6 +443,8 @@ impl LlmAgentBuilder {
             skill_used_sessions: self.skill_used_sessions,
             sop_replay: self.sop_replay,
             cleanup_sessions: self.cleanup_sessions,
+            memory_store: self.memory_store,
+            orchestration_limits: self.orchestration_limits,
         })
     }
 }
@@ -876,17 +954,21 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         // build_skills_prompt returns (Option<String>, bool); the bool reports whether
         // a task-matched (non-always) skill body was inlined — this turn is driven by a
         // SKILL. Used to suppress a competing SOP replay at the injection point below.
-        let (skills_opt, skill_activated) = self.skill_manager.build_skills_prompt(
-            &matching_context,
-            skill_strategy,
-            skill_max_inline_chars,
-            skill_catalog_max,
-            skill_hot_top_k,
-        );
         let mut task_skill_active = false;
-        if let Some(skills_section) = skills_opt {
-            task_skill_active = skill_activated;
-            prompt.push_str(&skills_section);
+        // Agents built with `.without_skills()` have no SkillManager (B4.3) and
+        // get no skill listing/body injection at all.
+        if let Some(sm) = &self.skill_manager {
+            let (skills_opt, skill_activated) = sm.build_skills_prompt(
+                &matching_context,
+                skill_strategy,
+                skill_max_inline_chars,
+                skill_catalog_max,
+                skill_hot_top_k,
+            );
+            if let Some(skills_section) = skills_opt {
+                task_skill_active = skill_activated;
+                prompt.push_str(&skills_section);
+            }
         }
 
         (prompt, task_skill_active)
@@ -1167,8 +1249,7 @@ impl Agent for LlmAgent {
             self.skill_used_sessions.lock().unwrap().insert(session_id.clone());
         }
         let todo_item_timeout_secs = ctx.todo_item_timeout_secs;
-        let is_main_session = !session_id.is_empty()
-            && !session_id.starts_with("cron-");
+        let is_main_session = is_main_session(&session_id);
         if is_main_session {
             // #3 (converged + resume-safe): always embed the full list/status
             // dump on checkpoint resume (history may be stale/partial, the model
@@ -1200,7 +1281,12 @@ impl Agent for LlmAgent {
         let (core_tool_defs, load_schema_def) = {
             let reg = self.tools.read().await;
             let periph = reg.peripheral_tools();
-            let defs = reg.core_definitions();
+            let mut defs = reg.core_definitions();
+            // Delivery gate: hide orchestration tools unless the mode/depth
+            // allowset opens them (SDD \u00a77.3). Step 1 keeps allowset empty
+            // for every mode, so no orchestration tool is delivered.
+            let orch_allowset = orchestration_allowset(ctx.mode, ctx.depth);
+            defs.retain(|d| orchestration_delivered(&d.function.name, &orch_allowset));
             let ls = if periph.is_empty() {
                 None
             } else {
@@ -1237,6 +1323,8 @@ impl Agent for LlmAgent {
         let tools = self.tools.clone();
         let working_dir = self.working_dir.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let mode = ctx.mode;
+        let depth = ctx.depth;
         let output_dir_override = match &ctx.tool_output_dir {
             Some(d) if !d.is_empty() => d.clone(),
             _ => String::new(),
@@ -1282,6 +1370,57 @@ impl Agent for LlmAgent {
         let resume_iteration = ctx.resume_iteration;
         let event_log_path = ctx.event_log_path.clone();
         let cleanup_sessions = self.cleanup_sessions.clone();
+
+        // ── Sub-agent orchestration (SDD v1.5 Step 2a) ──
+        // When this run is the Expert root allowed to spawn, create a per-run
+        // Orchestrator and register it under this invocation id so the
+        // orchestration tools can resolve it during the run. It is unregistered
+        // when the returned event stream is fully consumed.
+        let orch: Option<Arc<crate::agent::orchestration::Orchestrator>> = if ctx.can_spawn
+            && ctx.mode == crate::context::AgentMode::Expert
+            && ctx.depth == 0
+        {
+            let env = crate::agent::orchestration::OrchestratorEnv {
+                provider: self.provider.clone(),
+                tools: self.tools.clone(),
+                working_dir: self.working_dir.clone(),
+                workspace_dir: self.workspace_dir.clone(),
+                model_configs: self.model_configs.clone(),
+                max_iterations: self.max_iterations,
+                parallel_ir_tools: self.parallel_ir_tools,
+                user_given_name: self.user_given_name.clone(),
+                two_tier_memory: self.two_tier_memory,
+                sop_replay: self.sop_replay.clone(),
+                parent_model: ctx.model_name.clone(),
+                permissions: ctx.permissions.clone(),
+                permission_pending: ctx.permission_pending.clone(),
+                preauth_profile: ctx.preauth_profile.clone(),
+                context_window: ctx.context_window,
+                enable_context_scaling: ctx.enable_context_scaling,
+                max_inline_chars: ctx.max_inline_chars,
+                tool_timeout_secs: ctx.tool_timeout_secs,
+                max_tool_retries: ctx.max_tool_retries,
+                max_concurrent_subagents: self.orchestration_limits.max_concurrent_subagents,
+                default_timeout_secs: self.orchestration_limits.default_timeout_secs,
+                memory_store: self.memory_store.clone(),
+            };
+            let root_ended = ctx.ended_flag();
+            let orch = crate::agent::orchestration::Orchestrator::new(
+                env,
+                ctx.base.invocation_id.clone(),
+                ctx.base.session_id.clone(),
+                root_ended,
+                crate::agent::orchestration::DEFAULT_MAX_DEPTH,
+                Some(tx.clone()),
+            );
+            let orch = Arc::new(orch);
+            let key = ctx.base.invocation_id.clone();
+            crate::agent::orchestration::register_orchestrator(key, orch.clone());
+            Some(orch)
+        } else {
+            None
+        };
+        let orch_key = ctx.base.invocation_id.clone();
 
         tokio::spawn(async move {
             // ── Initialize event log for crash recovery ──
@@ -1883,7 +2022,7 @@ impl Agent for LlmAgent {
                                         &invocation_id, &author
                                     ))).await;
                                     let msgs = execute_tools_concurrent(
-                                        &tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars,
+                                        &tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id,
                                     ).await;
                                     history.extend(msgs);
                                 } else {
@@ -1891,7 +2030,7 @@ impl Agent for LlmAgent {
                                     for tc in &tool_calls {
                                         inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
-                                            &tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, event_log.as_mut(),
+                                            &tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id, event_log.as_mut(),
                                         ).await;
                                         history.push(msg);
                                     }
@@ -1914,14 +2053,14 @@ impl Agent for LlmAgent {
                                 if all_read_only && tool_calls.len() > 1 {
                                     info!("[session:{}] Executing {} tool call(s) concurrently", session_id, tool_calls.len());
                                     let msgs = execute_tools_concurrent(
-                                        &*tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars,
+                                        &*tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id,
                                     ).await;
                                     history.extend(msgs);
                                 } else {
                                     for tc in &tool_calls {
                                         inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
-                                            &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, event_log.as_mut(),
+                                            &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id, event_log.as_mut(),
                                         ).await;
                                         history.push(msg);
                                     }
@@ -2128,6 +2267,22 @@ impl Agent for LlmAgent {
 
         // Convert mpsc Receiver into a Stream
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        // If this run owns an orchestrator, keep it alive for the whole stream and
+        // unregister it once the stream is fully consumed so the process does not
+        // accumulate per-run orchestrator state.
+        if let Some(ref orch) = orch {
+            let key = orch_key.clone();
+            let _keep = orch.clone();
+            let stream = async_stream::stream! {
+                use futures::StreamExt as _;
+                let mut inner = Box::pin(stream);
+                while let Some(item) = inner.next().await {
+                    yield item;
+                }
+                crate::agent::orchestration::unregister_orchestrator(&key);
+            };
+            return Ok(Box::pin(stream));
+        }
         Ok(Box::pin(stream))
     }
 }
@@ -2413,6 +2568,10 @@ async fn execute_tool_call(
     context_window: usize,
     inline_scaling_enabled: bool,
     max_inline_chars: usize,
+    mode: crate::context::AgentMode,
+    depth: u8,
+    can_spawn: bool,
+    run_id: &str,
     mut event_log: Option<&mut EventLog>,
 ) -> ChatMessage {
     let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
@@ -2518,13 +2677,29 @@ async fn execute_tool_call(
                         invocation_id.to_string(), author.to_string(), session_id.to_string(),
                     );
                     let cb = crate::context::CallbackContext::new(base);
-                    let ctx = ToolContext::new(
+                    let mut ctx = ToolContext::new(
                         cb, tc.id.clone(), working_dir.to_string(), workspace_dir.to_string(),
                     )
                         .with_output_dir(output_dir.to_string())
                         .with_progress(progress_tx)
                         .with_inline_limits(context_window, inline_scaling_enabled, max_inline_chars);
+                    ctx.mode = mode;
+                    ctx.depth = depth;
+                    ctx.can_spawn = can_spawn;
+                    ctx.run_id = Some(run_id.to_string());
                     let args_clone = args.clone();
+
+                    // Acquire an exclusive per-name lock for tools that opt into
+                    // `Exclusivity::Exclusive` (long-lived CDP/WinRM sessions), and
+                    // hold it across the whole tool execution so they never race.
+                    // Bind the Arc first so the tokio guard borrows a live slot.
+                    // §7.4.3: async acquire returns an OwnedMutexGuard held across
+                    // the whole tool execution (drop => releases the slot).
+                    let _excl_guard = if tool.exclusivity() == crate::agent::exclusivity::Exclusivity::Exclusive {
+                        Some(crate::agent::exclusivity::global().acquire(tool_name).await)
+                    } else {
+                        None
+                    };
 
                     // Spawn the actual tool execution as a separate task
                     let mut tool_handle = tokio::spawn(async move {
@@ -2742,10 +2917,14 @@ async fn execute_tools_concurrent<'a>(
     context_window: usize,
     inline_scaling_enabled: bool,
     max_inline_chars: usize,
+    mode: crate::context::AgentMode,
+    depth: u8,
+    can_spawn: bool,
+    run_id: &'a str,
 ) -> Vec<ChatMessage> {
     use futures::future::join_all;
     let futs = tool_calls.iter().map(|tc| {
-        execute_tool_call(tools, tc, working_dir, workspace_dir, output_dir, invocation_id, author, session_id, tx, permission, tool_timeout_secs, max_retries, context_window, inline_scaling_enabled, max_inline_chars, None)
+        execute_tool_call(tools, tc, working_dir, workspace_dir, output_dir, invocation_id, author, session_id, tx, permission, tool_timeout_secs, max_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, can_spawn, run_id, None)
     });
     join_all(futs).await
 }
@@ -3205,7 +3384,101 @@ mod tests {
         assert!(!is_structured_tool_error(r#"{"success":true}"#));
         assert!(!is_structured_tool_error(r#"{"is_error":false}"#));
     }
+
+    // ---- Step 1 gates (SDD v1.5) ----
+
+    /// G-gate-truth + G-instant-tools: with an empty allowset the delivery gate
+    /// strips every orchestration tool (including Instant), and opening a mode to
+    /// the allowset delivers it again.
+    #[test]
+    fn gate_gate_truth_open_and_closed() {
+        let empty: Vec<String> = Vec::new();
+        for name in ALL_ORCH.iter() {
+            assert!(!orchestration_delivered(name, &empty), "{} must be hidden with empty allowset", name);
+        }
+        let open_set = vec!["spawn_subagent".to_string()];
+        assert!(orchestration_delivered("spawn_subagent", &open_set));
+        assert!(!orchestration_delivered("wait_subagent", &open_set));
+        assert!(orchestration_delivered("file_read", &empty));
+        assert!(orchestration_allowset(crate::context::AgentMode::Instant, 0).is_empty());
+        // Step 2a opens the delivery gate for the Expert root only (depth 0).
+        assert_eq!(orchestration_allowset(crate::context::AgentMode::Expert, 0).len(), ALL_ORCH.len());
+        assert!(orchestration_allowset(crate::context::AgentMode::Expert, 1).is_empty());
+        assert!(orchestration_allowset(crate::context::AgentMode::Instant, 1).is_empty());
+    }
+
+    /// G-open-gate-truth: a mode explicitly opened to the allowset delivers each
+    /// orchestration tool; an unopened mode hides them all.
+    #[test]
+    fn gate_open_delivers_all_after_step2a() {
+        let allow = orchestration_allowset(crate::context::AgentMode::Expert, 0);
+        for name in ALL_ORCH.iter() {
+            assert!(orchestration_delivered(name, &allow), "{} should be delivered to Expert root", name);
+        }
+        // Workers / Instant: hidden.
+        let empty: Vec<String> = Vec::new();
+        assert!(!orchestration_delivered("spawn_subagent", &empty));
+    }
+
+    /// G-name-disjoint: orchestration names must not collide with skill tool names.
+    #[test]
+    fn gate_name_disjoint() {
+        let skill_names = crate::skill::SkillManager::skill_tool_names();
+        for name in ALL_ORCH.iter() {
+            assert!(!skill_names.iter().any(|s| s.as_str() == *name), "orchestration tool {} collides with a skill tool", name);
+        }
+    }
+
+    /// G-sub-not-main: sub/cron sessions are never treated as the main session.
+    #[test]
+    fn gate_sub_not_main() {
+        assert!(is_main_session("abc-123"));
+        assert!(!is_main_session(""));
+        assert!(!is_main_session("sub-xx"));
+        assert!(!is_main_session("cron-midnight"));
+        assert_eq!(
+            crate::context::SessionKind::from_session_id("sub-abc"),
+            crate::context::SessionKind::SubAgent
+        );
+    }
+
+    /// G-no-skill-injection: `.without_skills()` must null the SkillManager so a
+    /// worker gets neither skill listing nor skill tools.
+    #[test]
+    fn gate_no_skill_injection_builder_flag() {
+        let b = LlmAgentBuilder::new().without_skills();
+        assert!(b.skill_manager_disabled, "without_skills must disable attach");
+        assert!(b.skill_manager.is_none());
+        let d = LlmAgentBuilder::new();
+        assert!(!d.skill_manager_disabled, "default builder keeps legacy attach");
+    }
+
+    /// G-instant-tools (regression): the step-2a instrument delivery ALWAYS keys
+    /// off the runtime InvocationContext.mode/depth, never the agent's static
+    /// builder mode. An Instant top-level run (ctx.mode=Instant) must receive an
+    /// EMPTY allowset even if the shared LlmAgent was built with mode=Expert
+    /// (orchestration on), so a plain Instant chat never sees spawn_subagent etc.
+    #[test]
+    fn gate_instrument_delivery_reads_ctx_not_agent_static_mode() {
+        // The agent may be built as Expert (orchestration on), but a run whose
+        // InvocationContext is Instant must be opaque to orchestration tools.
+        let agent_built_expert = crate::context::AgentMode::Expert;
+        let run_ctx_is_instant = crate::context::AgentMode::Instant;
+        let delivered = orchestration_allowset(run_ctx_is_instant, 0);
+        assert!(delivered.is_empty(), "Instant run must get no orchestration tools even if agent mode={:?}", agent_built_expert);
+
+        // The reverse guard: only a real Expert root (ctx.mode=Expert && depth 0)
+        // opens the full ALL_ORCH allowset — proving the decision is ctx-driven.
+        let expert_root = orchestration_allowset(crate::context::AgentMode::Expert, 0);
+        assert_eq!(expert_root.len(), ALL_ORCH.len());
+        for name in ALL_ORCH.iter() {
+            assert!(expert_root.iter().any(|n| n == name), "{} missing from Expert-root allowset", name);
+        }
+        // depth>=1 workers never open it.
+        assert!(orchestration_allowset(crate::context::AgentMode::Expert, 1).is_empty());
+    }
 }
+
 
 
 

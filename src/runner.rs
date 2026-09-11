@@ -44,6 +44,10 @@ pub struct Runner {
     skill_max_inline_chars: Arc<AtomicUsize>,
     skill_catalog_max: Arc<AtomicUsize>,
     skill_hot_top_k: Arc<AtomicUsize>,
+    /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
+    can_spawn: bool,
+    /// Operational mode for this run (Expert unlocks orchestration at depth 0).
+    mode: crate::context::AgentMode,
 }
 
 /// Builder for Runner (modeled after ADK-RUST's RunnerConfig builder).
@@ -64,6 +68,10 @@ pub struct RunnerBuilder {
     skill_max_inline_chars: Arc<AtomicUsize>,
     skill_catalog_max: Arc<AtomicUsize>,
     skill_hot_top_k: Arc<AtomicUsize>,
+    /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
+    can_spawn: bool,
+    /// Operational mode for this run (Expert unlocks orchestration at depth 0).
+    mode: crate::context::AgentMode,
 }
 
 impl RunnerBuilder {
@@ -85,6 +93,8 @@ impl RunnerBuilder {
             skill_max_inline_chars: Arc::new(AtomicUsize::new(6000)),
             skill_catalog_max: Arc::new(AtomicUsize::new(40)),
             skill_hot_top_k: Arc::new(AtomicUsize::new(3)),
+            can_spawn: false,
+            mode: crate::context::AgentMode::Instant,
         }
     }
 
@@ -165,6 +175,16 @@ impl RunnerBuilder {
         self
     }
 
+    pub fn with_can_spawn(mut self, enabled: bool) -> Self {
+        self.can_spawn = enabled;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: crate::context::AgentMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     pub fn build(self) -> AgentResult<Runner> {
         let agent = self.agent.ok_or_else(|| AgentError::config("Runner requires an agent"))?;
         let session_service = self.session_service
@@ -189,6 +209,8 @@ impl RunnerBuilder {
             skill_max_inline_chars: self.skill_max_inline_chars,
             skill_catalog_max: self.skill_catalog_max,
             skill_hot_top_k: self.skill_hot_top_k,
+            can_spawn: self.can_spawn,
+            mode: self.mode,
         })
     }
 }
@@ -256,6 +278,8 @@ impl Runner {
          .with_skill_hot_top_k(self.skill_hot_top_k.load(Ordering::SeqCst))
          .with_tool_timeout_secs(tool_timeout_secs)
          .with_max_tool_retries(max_tool_retries)
+         .with_can_spawn(self.can_spawn)
+         .with_mode(self.mode)
          .with_tool_output_dir(output_dir);
 
         // Wire checkpoint/resume state if provided.
@@ -309,4 +333,82 @@ impl Runner {
 
 
 use futures::StreamExt;
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::AgentMode;
+    use futures::stream;
+
+    /// Fake agent that captures the runtime ctx it receives from Runner::run.
+    struct CaptureAgent {
+        captured: Arc<std::sync::Mutex<Option<(AgentMode, u8, bool)>>>,
+    }
+    #[async_trait::async_trait]
+    impl Agent for CaptureAgent {
+        fn name(&self) -> &str { "capture" }
+        fn description(&self) -> &str { "capture ctx" }
+        async fn run(
+            &self,
+            ctx: &InvocationContext,
+            _user_message: &str,
+            _images: Vec<String>,
+        ) -> AgentResult<EventStream> {
+            *self.captured.lock().unwrap() = Some((ctx.mode, ctx.depth, ctx.can_spawn));
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn perms() -> Arc<Mutex<HashMap<String, bool>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn runner_expert_mode_propagates_to_runtime_ctx() {
+        // SDD v1.5 2.x wiring: an Expert orchestration root must reach the agent
+        // as ctx.mode == Expert && depth == 0 && can_spawn, so the Orchestrator
+        // creation branch (llm_agent.rs) actually triggers instead of staying dead.
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let fake = CaptureAgent { captured: captured.clone() };
+        let runner = Runner::builder()
+            .agent(Arc::new(fake))
+            .logger(Arc::new(ConversationLogger::new(std::env::temp_dir().to_str().unwrap())))
+            .with_can_spawn(true)
+            .with_mode(AgentMode::Expert)
+            .build()
+            .unwrap();
+        let _ = runner.run(
+            "hi", "sess", "m", 5, vec![],
+            perms(), Arc::new(Mutex::new(HashMap::new())), None, None,
+            3, 64000, 80, 60, 3, vec![], None, None, None,
+        ).await.unwrap();
+        let (mode, depth, can_spawn) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(mode, AgentMode::Expert, "Expert mode must reach the agent ctx");
+        assert_eq!(depth, 0, "root run depth must be 0");
+        assert!(can_spawn, "Expert orchestration root must be allowed to spawn");
+    }
+
+    #[tokio::test]
+    async fn runner_default_stays_instant_non_spawning() {
+        // Default (legacy) runner must remain an Instant, non-spawning agent —
+        // zero diff when orchestration is disabled.
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let fake = CaptureAgent { captured: captured.clone() };
+        let runner = Runner::builder()
+            .agent(Arc::new(fake))
+            .logger(Arc::new(ConversationLogger::new(std::env::temp_dir().to_str().unwrap())))
+            .build()
+            .unwrap();
+        let _ = runner.run(
+            "hi", "sess", "m", 5, vec![],
+            perms(), Arc::new(Mutex::new(HashMap::new())), None, None,
+            3, 64000, 80, 60, 3, vec![], None, None, None,
+        ).await.unwrap();
+        let (mode, depth, can_spawn) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(mode, AgentMode::Instant);
+        assert_eq!(depth, 0);
+        assert!(!can_spawn);
+    }
+}
 
