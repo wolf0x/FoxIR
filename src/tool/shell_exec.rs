@@ -28,7 +28,7 @@ impl Tool for ShellExecTool {
             "required": ["command"]
         })
     }
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> AgentResult<Value> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         let command = args["command"].as_str().ok_or_else(|| "Missing 'command'".to_string())?;
         let shell = args["shell"].as_str().unwrap_or("powershell");
         let timeout = args["timeout_secs"].as_u64().unwrap_or(30);
@@ -56,6 +56,20 @@ impl Tool for ShellExecTool {
                 // Proceed — user has authorized via Permission gate or accepts risk
             }
             IntentVerdict::Pass => { /* silent */ }
+        }
+
+        // ── Local Recycle Bin interceptor ──
+        // A direct, literal-path delete (single statement, no pipeline / chaining /
+        // wildcard / variable) is unambiguous enough to safely move to the OS
+        // Recycle Bin instead of hard-deleting. Anything ambiguous returns `None`
+        // here and falls through to normal execution (Delete permission gate
+        // + audit still apply). On any recycle failure we error out and refuse to
+        // run the raw hard delete.
+        if let Some(paths) = crate::tool::recycle::parse_delete_paths(command, shell) {
+            return match crate::tool::recycle::recycle_paths(ctx, shell, command, &paths) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e),
+            };
         }
 
         let mut cmd = match shell {

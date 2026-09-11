@@ -1,5 +1,6 @@
 pub mod file_ops;
 pub mod shell_exec;
+pub mod recycle;
 pub mod sys_info;
 pub mod sys_eventlog;
 pub mod sys_process;
