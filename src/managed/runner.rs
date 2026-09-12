@@ -190,6 +190,53 @@ fn take(n: usize, s: &str) -> &str {
     &s[..n]
 }
 
+/// Resolves once the cancellation flag is set (polled every 200ms). Raced
+/// against long-horizon awaits with `tokio::select!` so a user STOP can always
+/// interrupt a round even when the underlying await is blocked and never yields.
+async fn cancelled_fut(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Outcome of a bounded parallel collect.
+enum ParallelOutcome {
+    /// Collect finished and returned aggregated worker results.
+    Done(Vec<crate::context::SubAgentResult>),
+    /// The whole collect exceeded its hard wall-clock cap; degraded (no hang).
+    TimedOut,
+    /// A user STOP interrupted the collect.
+    Cancelled,
+}
+
+/// Run the parallel collect but bound it with a hard wall-clock cap AND race it
+/// against STOP. This guarantees that (a) a stuck sub-agent can never deadlock
+/// the round forever, and (b) Stop always works even while inside the parallel
+/// orchestration (which otherwise performs no cancellation checks and waits on
+/// `Orchestrator::wait` with no per-round select).
+async fn bounded_parallel_collect(
+    parl: &crate::managed::parallel::ParallelEnv,
+    subtasks: &[crate::managed::manager::ParallelSubtask],
+    template: crate::config::OrchestrationTemplate,
+    cap_secs: u64,
+    contract_id: &str,
+    session: &str,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ParallelOutcome {
+    let fut = crate::managed::parallel::run_template_collect(
+        parl, subtasks, template, contract_id, session);
+    tokio::pin!(fut);
+    tokio::select! {
+        _ = cancelled_fut(cancelled) => ParallelOutcome::Cancelled,
+        res = &mut fut => ParallelOutcome::Done(res),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(cap_secs.max(1))) => ParallelOutcome::TimedOut,
+    }
+}
+
 fn progress_marker(c: &TaskContract) -> String {
     let find = c.verified_findings
         .last()
@@ -877,9 +924,27 @@ impl ManagedRunner {
                         // budget is not exhausted, re-run the read-only collect before
                         // folding option-B (partial results + divergence).
                         let round_obj = format!("round {} objective: {}", round + 1, plan.subtask);
-                        let mut p_results = crate::managed::parallel::run_template_collect(
+                        // Bound the parallel collect with STOP + a hard wall-clock cap so a
+                        // stuck sub-agent can never deadlock the round and Stop always works.
+                        let cap_secs = orchestration_limits.default_timeout_secs.max(1);
+                        let mut p_results = match bounded_parallel_collect(
                             &parl, &plan.parallel_subtasks, orchestration_limits.template,
-                            &contract_id, &session).await;
+                            cap_secs, &contract_id, &session, &cancelled_flag,
+                        ).await {
+                            ParallelOutcome::Done(r) => r,
+                            ParallelOutcome::TimedOut => {
+                                warn!("[managed:{}] Parallel collect timed out; degrading round {}",
+                                    session, round + 1);
+                                contract.manager_notes.push(format!(
+                                    "Round {} parallel collect timed out - degraded", round + 1));
+                                Vec::new()
+                            }
+                            ParallelOutcome::Cancelled => {
+                                info!("[managed:{}] Round {} aborted by STOP during parallel collect", session, round + 1);
+                                break;
+                            }
+                        };
+                        let mut abort_round = false;
                         let mut semantic_reason: Option<String> = None;
                         let mut verdict = crate::agent::orchestration::audit_aggregate(&p_results);
                         const PARALLEL_RERUN_CAP: usize = 2;
@@ -902,16 +967,33 @@ impl ManagedRunner {
                                 parallel_reruns += 1;
                                 info!("[managed:{}] Parallel degradation-A re-run {}/{}",
                                     session, attempt, PARALLEL_RERUN_CAP);
-                                let p2 = crate::managed::parallel::run_template_collect(
+                                match bounded_parallel_collect(
                                     &parl, &plan.parallel_subtasks, orchestration_limits.template,
-                            &contract_id, &session).await;
-                                p_results = p2;
+                                    cap_secs, &contract_id, &session, &cancelled_flag,
+                                ).await {
+                                    ParallelOutcome::Done(r) => { p_results = r; }
+                                    ParallelOutcome::TimedOut => {
+                                        warn!("[managed:{}] Parallel re-run timed out; degrading",
+                                            session);
+                                        p_results = Vec::new();
+                                    }
+                                    ParallelOutcome::Cancelled => {
+                                        abort_round = true;
+                                    }
+                                }
+                                if abort_round {
+                                    break false;
+                                }
                                 semantic_reason = None;
                                 verdict = crate::agent::orchestration::audit_aggregate(&p_results);
                                 continue;
                             }
                             break prom;
                         };
+                        if abort_round {
+                            info!("[managed:{}] Round {} aborted by STOP during parallel re-run", session, round + 1);
+                            break;
+                        }
                         // Brief reflects the FINAL (possibly re-run) results.
                         let p_brief = crate::managed::parallel::render_collect_brief(&p_results);
                         if !p_brief.is_empty() {
@@ -989,25 +1071,35 @@ impl ManagedRunner {
 
                 // Run the Executor with the brief as the user message
                 // This uses the existing agent loop with fresh context
-                let executor_result = inner.run(
-                    &brief,
-                    &format!("{}-exec-{}", session, round),
-                    &executor_model,
-                    max_executor_iterations,
-                    vec![], // fresh history for each Executor round
-                    permissions.clone(),
-                    permission_pending.clone(),
-                    Some(permission_profile.clone()), // Phase 6 pre-authorization profile
-                    executor_fallback.clone(),
-                    rabbit_hole_threshold,
-                    context_window,
-                    80,   // context window threshold
-                    tool_timeout_secs,
-                    max_tool_retries,
-                    vec![], // no images
-                    None, None, // no checkpoint resume
-                    Some(archive_dir.to_string_lossy().to_string()), // shared contract artifact output dir
-                ).await;
+                // D-fix: race the Executor start against STOP so a user Stop can
+                // interrupt a round even if `inner.run` gets stuck before emitting
+                // any event (the per-event loop only observes Stop after a yield).
+                let exec_session = format!("{}-exec-{}", session, round);
+                let executor_result = tokio::select! {
+                    _ = cancelled_fut(&cancelled_flag) => {
+                        info!("[managed:{}] STOP during Executor round {} start - aborting", session, round + 1);
+                        break;
+                    }
+                    res = inner.run(
+                        &brief,
+                        &exec_session,
+                        &executor_model,
+                        max_executor_iterations,
+                        vec![], // fresh history for each Executor round
+                        permissions.clone(),
+                        permission_pending.clone(),
+                        Some(permission_profile.clone()), // Phase 6 pre-authorization profile
+                        executor_fallback.clone(),
+                        rabbit_hole_threshold,
+                        context_window,
+                        80,   // context window threshold
+                        tool_timeout_secs,
+                        max_tool_retries,
+                        vec![], // no images
+                        None, None, // no checkpoint resume
+                        Some(archive_dir.to_string_lossy().to_string()), // shared contract artifact output dir
+                    ) => res,
+                };
 
                 let mut executor_output = String::new();
                 // ── Tool-call trace (per-round): pair ToolCall/ToolResult events
