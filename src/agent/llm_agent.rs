@@ -271,6 +271,14 @@ pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec
     }
 }
 
+/// D10: delivery gate AND route gate are one. Orchestration tools are delivered
+/// only when the cheap pre-filter flags the run as a fan-out candidate.
+pub fn orchestration_delivered_for(
+    mode: crate::context::AgentMode, depth: u8, candidate: bool,
+) -> Vec<String> {
+    if candidate { orchestration_allowset(mode, depth) } else { Vec::new() }
+}
+
 /// Cheap rule-based pre-filter (D2 layer 1 / D10). Zero LLM cost. Conservative:
 /// a false negative only means "stay on the main loop", never a wrong fan-out.
 pub fn orchestration_prefilter(user_message: &str) -> bool {
@@ -1322,14 +1330,22 @@ impl Agent for LlmAgent {
         // (MCP / external) are exposed on demand via `load_tool_schema`, and a
         // peripheral tool is re-added once loaded. This bounds the per-request
         // tool payload regardless of how many servers/tools are registered.
+        // D10 pre-filter (P5): a single cheap boolean gates BOTH orchestration
+        // tool delivery and Orchestrator construction. Computed here while
+        // `user_message` is still the borrowed &str (it is shadowed to String
+        // further down). When false the allowset stays empty and no Orchestrator
+        // is built — the zero-overhead promise for non-fan-out runs.
+        let orch_candidate = ctx.mode == crate::context::AgentMode::Instant
+            && ctx.depth == 0
+            && orchestration_prefilter(user_message);
         let (core_tool_defs, load_schema_def) = {
             let reg = self.tools.read().await;
             let periph = reg.peripheral_tools();
             let mut defs = reg.core_definitions();
-            // Delivery gate: hide orchestration tools unless the mode/depth
-            // allowset opens them (SDD \u00a77.3). Step 1 keeps allowset empty
-            // for every mode, so no orchestration tool is delivered.
-            let orch_allowset = orchestration_allowset(ctx.mode, ctx.depth);
+            // Delivery gate: hide orchestration tools unless the cheap pre-filter
+            // flags this run as a fan-out candidate AND the mode/depth allowset
+            // opens them (SDD §7.3 / D10). Zero overhead when prefilter misses.
+            let orch_allowset = orchestration_delivered_for(ctx.mode, ctx.depth, orch_candidate);
             defs.retain(|d| orchestration_delivered(&d.function.name, &orch_allowset));
             let ls = if periph.is_empty() {
                 None
@@ -1423,6 +1439,7 @@ impl Agent for LlmAgent {
         let orch: Option<Arc<crate::agent::orchestration::Orchestrator>> = if ctx.can_spawn
             && ctx.mode == crate::context::AgentMode::Instant
             && ctx.depth == 0
+            && orch_candidate
         {
             let env = crate::agent::orchestration::OrchestratorEnv {
                 provider: self.provider.clone(),
@@ -3527,6 +3544,15 @@ mod tests {
     #[test]
     fn prefilter_many_sources_is_true() {
         assert!(orchestration_prefilter("把进程、服务、注册表和日志都拉一遍做时间线"));
+    }
+
+    #[test]
+    fn delivered_for_gates_on_candidate() {
+        use crate::context::AgentMode::*;
+        assert!(orchestration_delivered_for(Instant, 0, false).is_empty());
+        assert_eq!(orchestration_delivered_for(Instant, 0, true).len(), ALL_ORCH.len());
+        assert!(orchestration_delivered_for(Expert, 0, true).is_empty());
+        assert!(orchestration_delivered_for(Instant, 1, true).is_empty());
     }
 }
 
