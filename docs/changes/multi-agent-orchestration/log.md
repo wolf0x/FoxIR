@@ -440,3 +440,7 @@
 - **前端**（`static/index.html`）：右滑 Expert 抽屉（容器 + CSS + toggle 按钮），复用既有 WS 通道经 handleMsg 新增 5 个 case 进入 `expertHandleMsg`；渲染 Overview 统计（spawned/done/failed/tokens）、Plan/Task Queue、Budget 抽屉、Log 抽屉（worker 摘要）、Agent Cards（可展开 summary + evidence 引用点击跳 `/workspace/<rel>`）。mode 切换沿用既有 Instant/Expert 通道（chat 消息带 `managed`）。
 - **验证**：`node --check` 两个 `<script>` 块均语法通过（无浏览器、未做像素级视觉回归，声明为「未在浏览器实测」）；`cargo test --bin FoxIR` → **304 passed / 1 env fail**（+1 新事件序列化测试 `subagent_and_plan_events_serialize_with_expected_ws_types`，无回归）；integration 9 passed。
 - **诚实标注**：证据引用跳转依赖已有 `/workspace/{path}` 守卫端点（路径穿越已防护）；subagent 事件仅在 Manager 声明并行子任务（非空 `parallel_subtasks`）的 Expert 轮次真实发射，legacy 单 Executor 轮只发 `plan_updated`。UI 像素效果需用户本地浏览器核验。
+## 2026-09-12 · T1.10 / T2.9 收口（T6.8 解除阻塞）
+
+- T1.10（门禁聚合）：独立 `tests/step1_gates.rs` 已随 T6.8 落地（5 测），内嵌门禁现可外部运行，标记完成。
+- T2.9（测试）：独立 `tests/phase0_e2e.rs` / `tests/mock_llm.rs` + `tests/common/mod.rs` 已随 T6.8 落地（各 2 测），lib target 解除「纯 bin crate 不可行」阻塞，标记完成。

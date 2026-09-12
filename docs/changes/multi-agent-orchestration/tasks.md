@@ -22,7 +22,7 @@
 - [x] T1.7 配置：`[modes.*]` + 上限 + `skill_strategy="disabled"` + 校验（`config.rs`）
 - [x] T1.8 `SkillListingStrategy::Disabled` 三映射 + `build_skills_prompt` 早退 + `skill_tool_names`（含 `improve_skill`；但为静态数组，非 V.4「动态求并集」）
 - [x] T1.9 `ToolRegistry::subset`/`minus`/`iter`/`register_arc` 全部就位（`register` 委托 `register_arc`；`iter` 产出 (&str, &Arc<dyn Tool>)；单测 `tool::tests::iter_covers_registry_and_register_arc_inserts`）
-- [>] T1.10 门禁 —— 无独立 `tests/step1_gates.rs`；相关单测分散内嵌（`llm_agent.rs`/`skill/mod.rs`/`tool/mod.rs`）。2026-09-11 补 G-instant 回归（投递门控读 ctx）
+- [x] T1.10 门禁 —— 2026-09-11 补 G-instant 回归（投递门控读 ctx）；**2026-09-12 T6.8 完成**：建 lib target（`src/lib.rs`）后新增独立 `tests/step1_gates.rs`（G-instant-tools / G-sub-not-main / G-expert-root / G-name-disjoint / 名字不重 5 测），把分散内嵌门禁聚合成外部集成套件
 
 ## P2 · Step 2a Phase 0 受限只读并行（spec §13 Step 2a）
 
@@ -34,7 +34,7 @@
 - [x] T2.6 三层取消树 —— Phase 0（depth-1 无孙代理）为「root_ended + per-worker cancel」两层：`root_ended`（`ctx.ended_flag` 级联所有 worker）+ 每 worker `SubAgentHandle.cancel`；`cancel(run_id)` 置该 worker flag，`run_worker` 循环 `handle.cancel || child_ctx.is_ended()` 早退并置 `Cancelled`。**行为已专项核验**（`phase0_cancel_worker_marks_cancelled`）
 - [x] T2.7 预算 per-run —— `Orchestrator.budgets: Arc<Mutex<HashMap<String, BudgetSnapshot>>>` + `run_worker` 内 `Usage` 事件累加 `prompt_sum`/`completion_sum`，终态写入 `BudgetSnapshot{run_id,role,prompt/completion/total}`；`budget(run_id)` / `budgets()` 访问器。**行为已专项核验**（`phase0_budget_per_run_populated`：mock Usage 120 = prompt100+completion20）
 - [x] T2.8 Exclusivity —— `ExclusivityRegistry::acquire` 改为 `async fn acquire(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()>`（§7.4.3）；`llm_agent.rs:2696` 工具执行前按 `tool.exclusivity()` 为 `Exclusive` 的持证锁跨全执行期持有（`drop` 释放），consumer 已对齐
-- [>] T2.9 测试 —— Phase 0 验收内嵌 `src/phase0_acceptance.rs`（wall-clock/token/20 runs/kill-9 四门禁，mock LLM）+ `phase0_report_generates_artifact`（指标落盘 `output/phase0_acceptance.json`：mock 4.76x / token +0.0% / 10 无丢失）+ `phase0_live_end_to_end`（真实端点，`FOXIR_LIVE_E2E=1`；解密 key，实测 3.08x / -0.5%，落盘 `output/phase0_live.json`）。**独立 `tests/phase0_e2e.rs`/`mock_llm.rs` 纯 bin crate 下不可行**（无 `src/lib.rs`，标准集成测试无法 `use` crate 内部）——需先建 lib target，属明确后续
+- [x] T2.9 测试 —— Phase 0 验收内嵌 `src/phase0_acceptance.rs`（四门禁）+ 指标落盘 artifact 见原文。**2026-09-12 T6.8 完成**：建 lib target 后新增独立 `tests/phase0_e2e.rs`（模板默认/解析 + contract 计划同步往返）+ `tests/mock_llm.rs`（canned Manager 输出→并行/串行解析门控）+ `tests/common/mod.rs`；阻塞解除，floor 原「纯 bin crate 不可行」段落已突破
 
 ## P3 · Step 2b Phase 1 全量编排（spec §13 Step 2b）
 
