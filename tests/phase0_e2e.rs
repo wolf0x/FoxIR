@@ -22,7 +22,7 @@ fn phase0_contract_plan_sync_roundtrip() {
     // contract (contract <-> update_plan path) without data loss.
     let mut c = TaskContract::new("e2e-1".into(), "task".into(), "scope".into(), 5);
     assert_eq!(c.orchestrator_plan, None, "fresh contract has no plan");
-    let plan = serde_json::json!({ "subtask": "recon", "parallel_subtasks": [] });
+    let plan = serde_json::json!({ "subtask": "recon", "remaining_work": [] });
     c.set_orchestrator_plan(&plan);
     let back = TaskContract::from_json(&c.to_json().unwrap()).unwrap();
     assert_eq!(back.orchestrator_plan_value(), Some(plan), "plan survives contract round-trip");

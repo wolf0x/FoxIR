@@ -485,77 +485,6 @@ impl Auditor {
             gaps: collect_audit_list(&output, "gaps"),
         })
     }
-    /// LLM semantic audit over the aggregated parallel sub-agent results
-    /// (§7.5 Manager-layer Auditor). Input = the declared parallel subtasks,
-    /// every gathered `SubAgentResult`, and a bounded context string (round
-    /// objective / manager framing). Returns:
-    /// - `None` when no LLM provider is configured (code-only mode) — the
-    ///   deterministic `audit_aggregate` gate stands alone;
-    /// - `Some(audit)` with `passed=false` when the semantic layer is configured
-    ///   but the LLM call fails or the evidence does not support certification.
-    /// Only demotion is possible here: `passed=true` requires the caller to have
-    /// already received a deterministic `Pass` (verified state is never granted
-    /// by the semantic layer alone).
-    pub async fn audit_subagent_aggregate(
-        &self,
-        subtasks: &[crate::managed::manager::ParallelSubtask],
-        results: &[crate::context::SubAgentResult],
-        context: &str,
-    ) -> Option<SubagentAggregateAudit> {
-        if self.provider.is_none() {
-            return None;
-        }
-        let mut user = String::from(
-            "You are the independent AUDITOR over a set of PARALLEL read-only sub-agent results.
-            ROLE: read-only. You reason about the evidence handed to you; you never execute tools.
-            The aggregate set is CERTIFIED (complete) only if every worker's claim is supported by
-            its listed evidence_refs, no worker's result contradicts another, and no proposed_write
-            references a target or evidence that does not exist. A worker's own claim is NEVER
-            sufficient. Mark integrity concerns and contradictions as incomplete.
-");
-        if !context.is_empty() {
-            user.push_str(&format!("
-Round context/objective: {}
-", context));
-        }
-        user.push_str("
-Declared parallel subtasks:
-");
-        for t in subtasks {
-            user.push_str(&format!("- [{}] {}
-", t.role, t.task));
-        }
-        user.push_str("
-Worker results (bounded):
-");
-        for r in results {
-            let evs: Vec<&str> = r.evidence_refs.iter().take(6).map(|s| s.as_str()).collect();
-            let writes: Vec<&str> = r.proposed_writes.iter().map(|w| w.target.as_str()).collect();
-            let summary: String = r.summary.chars().take(400).collect();
-            user.push_str(&format!(
-                "- [{}] conf={:?} status={:?} evidence_refs={:?} proposed_writes={:?} summary={}
-",
-                r.role, r.confidence, r.status, evs, writes, summary));
-        }
-        user.push_str("
-Return EXACTLY, one field per line:
-completion: complete|incomplete|blocked
-note: <one sentence>
-");
-        let messages = vec![
-            crate::model::ChatMessage::system(
-                "You are the independent read-only AUDITOR of a parallel sub-agent aggregation in a long-horizon task loop."),
-            crate::model::ChatMessage::user(&user),
-        ];
-        match self.semantic_chat(&messages).await {
-            Ok(o) => Some(parse_aggregate_verdict(&o)),
-            Err(e) => Some(SubagentAggregateAudit {
-                passed: false,
-                reason: format!("aggregate audit call failed: {e}"),
-            }),
-        }
-    }
-
     /// Verify a process is no longer running.
     async fn verify_process_gone(&self, action_desc: &str) -> AuditResult {
         // Extract process name from action description
@@ -750,18 +679,5 @@ note: contradiction with prior verified state");
     fn parse_aggregate_verdict_garbage_demotes() {
         let v = parse_aggregate_verdict("some unrelated llm reply");
         assert!(!v.passed, "unparseable output must not certify");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn audit_subagent_aggregate_returns_none_without_provider() {
-        // No LLM provider configured => code-only mode: semantic layer is not
-        // invoked and returns None, leaving the deterministic gate to stand.
-        let auditor = Auditor::new(
-            std::sync::Arc::new(tokio::sync::RwLock::new(crate::tool::ToolRegistry::new())),
-            ".".into(),
-            ".".into(),
-        );
-        let aud = auditor.audit_subagent_aggregate(&[], &[], "obj").await;
-        assert!(aud.is_none(), "no provider => None (semantic unavailable)");
     }
 }
