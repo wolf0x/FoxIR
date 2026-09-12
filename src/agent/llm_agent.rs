@@ -256,15 +256,15 @@ pub const ALL_ORCH: [&str; 7] = [
 ];
 
 /// Delivery-gate truth table. Step 1: returns empty for every mode/depth.
-/// Step 2a opens `Expert && depth == 0` to ALL_ORCH.
+/// Step 2a opens `Instant && depth == 0` to ALL_ORCH.
 pub(crate) fn is_orchestration_name(name: &str) -> bool {
     ALL_ORCH.contains(&name)
 }
 
 pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec<String> {
-    // Step 2a opens the delivery gate for the Expert root run (depth 0) so the
+    // Step 2a opens the delivery gate for the Instant root run (depth 0) so the
     // manager can call the orchestration tools. Workers (depth >= 1) never get them.
-    if mode == crate::context::AgentMode::Expert && depth == 0 {
+    if mode == crate::context::AgentMode::Instant && depth == 0 {
         ALL_ORCH.iter().map(|s| s.to_string()).collect()
     } else {
         Vec::new()
@@ -1392,12 +1392,12 @@ impl Agent for LlmAgent {
         let cleanup_sessions = self.cleanup_sessions.clone();
 
         // ── Sub-agent orchestration (SDD v1.5 Step 2a) ──
-        // When this run is the Expert root allowed to spawn, create a per-run
+        // When this run is the Instant root allowed to spawn, create a per-run
         // Orchestrator and register it under this invocation id so the
         // orchestration tools can resolve it during the run. It is unregistered
         // when the returned event stream is fully consumed.
         let orch: Option<Arc<crate::agent::orchestration::Orchestrator>> = if ctx.can_spawn
-            && ctx.mode == crate::context::AgentMode::Expert
+            && ctx.mode == crate::context::AgentMode::Instant
             && ctx.depth == 0
         {
             let env = crate::agent::orchestration::OrchestratorEnv {
@@ -3399,9 +3399,9 @@ mod tests {
 
     // ---- Step 1 gates (SDD v1.5) ----
 
-    /// G-gate-truth + G-instant-tools: with an empty allowset the delivery gate
-    /// strips every orchestration tool (including Instant), and opening a mode to
-    /// the allowset delivers it again.
+    /// G-gate-truth + G-instant-root: with an empty allowset the delivery gate
+    /// strips every orchestration tool, and opening a mode to the allowset
+    /// delivers it again.
     #[test]
     fn gate_gate_truth_open_and_closed() {
         let empty: Vec<String> = Vec::new();
@@ -3412,9 +3412,9 @@ mod tests {
         assert!(orchestration_delivered("spawn_subagent", &open_set));
         assert!(!orchestration_delivered("wait_subagent", &open_set));
         assert!(orchestration_delivered("file_read", &empty));
-        assert!(orchestration_allowset(crate::context::AgentMode::Instant, 0).is_empty());
-        // Step 2a opens the delivery gate for the Expert root only (depth 0).
-        assert_eq!(orchestration_allowset(crate::context::AgentMode::Expert, 0).len(), ALL_ORCH.len());
+        // Step 2a opens the delivery gate for the Instant root only (depth 0).
+        assert_eq!(orchestration_allowset(crate::context::AgentMode::Instant, 0).len(), ALL_ORCH.len());
+        assert!(orchestration_allowset(crate::context::AgentMode::Expert, 0).is_empty());
         assert!(orchestration_allowset(crate::context::AgentMode::Expert, 1).is_empty());
         assert!(orchestration_allowset(crate::context::AgentMode::Instant, 1).is_empty());
     }
@@ -3423,11 +3423,11 @@ mod tests {
     /// orchestration tool; an unopened mode hides them all.
     #[test]
     fn gate_open_delivers_all_after_step2a() {
-        let allow = orchestration_allowset(crate::context::AgentMode::Expert, 0);
+        let allow = orchestration_allowset(crate::context::AgentMode::Instant, 0);
         for name in ALL_ORCH.iter() {
-            assert!(orchestration_delivered(name, &allow), "{} should be delivered to Expert root", name);
+            assert!(orchestration_delivered(name, &allow), "{} should be delivered to Instant root", name);
         }
-        // Workers / Instant: hidden.
+        // Workers / Expert: hidden.
         let empty: Vec<String> = Vec::new();
         assert!(!orchestration_delivered("spawn_subagent", &empty));
     }
@@ -3467,26 +3467,24 @@ mod tests {
 
     /// G-instant-tools (regression): the step-2a instrument delivery ALWAYS keys
     /// off the runtime InvocationContext.mode/depth, never the agent's static
-    /// builder mode. An Instant top-level run (ctx.mode=Instant) must receive an
-    /// EMPTY allowset even if the shared LlmAgent was built with mode=Expert
-    /// (orchestration on), so a plain Instant chat never sees spawn_subagent etc.
+    /// builder mode. An Instant top-level run (ctx.mode=Instant) must receive the
+    /// FULL allowset even if the shared LlmAgent was built with mode=Expert, so
+    /// the orchestration tools follow the run-time context, not the static mode.
     #[test]
     fn gate_instrument_delivery_reads_ctx_not_agent_static_mode() {
-        // The agent may be built as Expert (orchestration on), but a run whose
-        // InvocationContext is Instant must be opaque to orchestration tools.
+        // The agent may be built as Expert, but a run whose InvocationContext is
+        // Instant (depth 0) is the one that opens the orchestration allowset.
         let agent_built_expert = crate::context::AgentMode::Expert;
         let run_ctx_is_instant = crate::context::AgentMode::Instant;
         let delivered = orchestration_allowset(run_ctx_is_instant, 0);
-        assert!(delivered.is_empty(), "Instant run must get no orchestration tools even if agent mode={:?}", agent_built_expert);
+        assert_eq!(delivered.len(), ALL_ORCH.len(), "Instant run must get the full orchestration allowset even if agent mode={:?}", agent_built_expert);
 
-        // The reverse guard: only a real Expert root (ctx.mode=Expert && depth 0)
-        // opens the full ALL_ORCH allowset — proving the decision is ctx-driven.
+        // The reverse guard: an Expert run (ctx.mode=Expert) never opens the
+        // allowset — proving the decision is ctx-driven toward Instant.
         let expert_root = orchestration_allowset(crate::context::AgentMode::Expert, 0);
-        assert_eq!(expert_root.len(), ALL_ORCH.len());
-        for name in ALL_ORCH.iter() {
-            assert!(expert_root.iter().any(|n| n == name), "{} missing from Expert-root allowset", name);
-        }
-        // depth>=1 workers never open it.
+        assert!(expert_root.is_empty());
+        // depth>=1 workers never open it (in either mode).
+        assert!(orchestration_allowset(crate::context::AgentMode::Instant, 1).is_empty());
         assert!(orchestration_allowset(crate::context::AgentMode::Expert, 1).is_empty());
     }
 }
