@@ -271,7 +271,31 @@ pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec
     }
 }
 
-/// Delivery-gate predicate (SDD \u00a77.3). An orchestration tool is delivered
+/// Cheap rule-based pre-filter (D2 layer 1 / D10). Zero LLM cost. Conservative:
+/// a false negative only means "stay on the main loop", never a wrong fan-out.
+pub fn orchestration_prefilter(user_message: &str) -> bool {
+    use std::sync::OnceLock;
+    static IP_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let lower = user_message.to_lowercase();
+    const PARALLEL_WORDS: &[&str] =
+        &["分别", "并行", "各自", "同时", "逐个", "respectively", "in parallel", "each of"];
+    if PARALLEL_WORDS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    let ip_re = IP_RE.get_or_init(|| regex::Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap());
+    let ips: std::collections::HashSet<&str> =
+        ip_re.find_iter(&lower).map(|m| m.as_str()).collect();
+    if ips.len() >= 2 {
+        return true;
+    }
+    const SOURCES: &[&str] = &[
+        "进程", "服务", "注册表", "日志", "文件", "网络", "内存",
+        "prefetch", "evtx", "pcap", "process", "service", "registry", "log",
+    ];
+    SOURCES.iter().filter(|s| lower.contains(**s)).count() >= 3
+}
+
+/// Delivery-gate predicate (SDD §7.3). An orchestration tool is delivered
 /// to the model only when its name is *not* in `ALL_ORCH`, or when the allowset
 /// explicitly opens it. Step 1 returns an empty allowset so the gate strips all
 /// seven orchestration tools from every mode (zero behavior diff).
@@ -3486,6 +3510,23 @@ mod tests {
         // depth>=1 workers never open it (in either mode).
         assert!(orchestration_allowset(crate::context::AgentMode::Instant, 1).is_empty());
         assert!(orchestration_allowset(crate::context::AgentMode::Expert, 1).is_empty());
+    }
+
+    #[test]
+    fn prefilter_simple_task_is_false() {
+        assert!(!orchestration_prefilter("总结一下这个进程在做什么"));
+    }
+    #[test]
+    fn prefilter_parallel_wording_is_true() {
+        assert!(orchestration_prefilter("分别检查这两台主机的持久化项"));
+    }
+    #[test]
+    fn prefilter_multi_ip_is_true() {
+        assert!(orchestration_prefilter("扫描 10.0.0.5 和 10.0.0.6 的开放端口"));
+    }
+    #[test]
+    fn prefilter_many_sources_is_true() {
+        assert!(orchestration_prefilter("把进程、服务、注册表和日志都拉一遍做时间线"));
     }
 }
 
