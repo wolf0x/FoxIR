@@ -426,3 +426,10 @@
 - **runner 接线**：并行块在 collect 前若 contract 无 `orchestrator_plan` 则把当前 ManagerPlan（subtask/success_criteria/expected_evidence/route/parallel_subtasks）落种并持久化；collect 的 Orchestrator 从 contract seed，`update_plan` 通过 sink 以 load-modify-save（`get_task_contract`→`from_json`→`set_orchestrator_plan`→`persist_contract`）写回，避免借用冲突。
 - **测试**：`task_contract::tests::orchestrator_plan_roundtrips_and_defaults_none`（缺省 None + 往返）；`phase0_plan_bidirectional_sync_seed_and_persist`（种子→内存、seed 与 update_plan 均入 sink 共 2 次，双向断言）。全量 `cargo test --bin FoxIR` → **303 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+2 新测）。
 - **诚实标注**：managed 路径的 Manager 是纯规划（无 tool 循环），`update_plan` 工具在当前 managed 主流程不被调用，因此 sink 在并行 collect 上是"已接线、待 tool 触发"；本同步机制由 selftest/workflow/未来 tool 驱动 Expert Executor 路径真实触发。种/取双向语义已由上述测试确定性覆盖。
+## 2026-09-12 · T6.8：建 lib target + 门禁聚合（工程前置）
+
+- **lib target（dual-compile）**：新增 `src/lib.rs`，与 `main.rs` 声明同一模块树（`pub mod`），`main.rs` 不动 → bin 零改动零回归；`forensics` 等模块的 `test_shimcache` 环境基线在 lib 下同样存在（与 bin 一致）。`#[cfg(test)] mod phase0_acceptance/tests_recall` **未**并入 lib（避免双跑重测 + 时序 flake）。
+- **pub 暴露**：`llm_agent::orchestration_allowset` / `orchestration_delivered` / `ALL_ORCH` 由 `pub(crate)`/私有提为 `pub`，供外部集成测试调用。
+- **tests/ 独立目录**：`tests/common/mod.rs`（canned Manager 输出 helper）+ `tests/step1_gates.rs`（G-instant-tools / G-sub-not-main / G-expert-root / G-name-disjoint / 名字不重，5 测）+ `tests/mock_llm.rs`（canned 并行/串行→`parse_manager_plan` 门控，2 测）+ `tests/phase0_e2e.rs`（模板默认/解析 + contract 计划同步往返 T6.5，2 测）。
+- **验证**：`cargo build --bin FoxIR` OK；`cargo test --bin FoxIR` → **303 passed / 1 env fail**（无回归）；integration `--test step1_gates --test mock_llm --test phase0_e2e` → **9 passed**。lib 自身模块单测 275 passed / 1 env fail（shimcache 同基线）。`cargo test`（全 target）因 lib 亦含 env 基线失败而提前退出，规范做法：`cargo test --bin FoxIR` + `--test …`。
+- **T3.5 批注订正**：§20.7 Skill opt-in 原文「未触发」→「已决策」（T6.7 结论：worker 构造即 skill-off 为既定默认，B1/B2 留待 Step 2b）。

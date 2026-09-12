@@ -245,7 +245,7 @@ fn trim_history_by_value(history: &mut Vec<ChatMessage>, max_tokens: usize) {
 /// Orchestration tool names. Hidden from the model via delivery gating unless
 /// the mode/depth allowset opens (SDD \u00a77.3). Step 1 keeps allowset empty
 /// for all modes (Expert included) so there is zero behavior diff.
-const ALL_ORCH: [&str; 7] = [
+pub const ALL_ORCH: [&str; 7] = [
     "spawn_subagent",
     "wait_subagent",
     "list_subagents",
@@ -261,7 +261,7 @@ pub(crate) fn is_orchestration_name(name: &str) -> bool {
     ALL_ORCH.contains(&name)
 }
 
-pub(crate) fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec<String> {
+pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec<String> {
     // Step 2a opens the delivery gate for the Expert root run (depth 0) so the
     // manager can call the orchestration tools. Workers (depth >= 1) never get them.
     if mode == crate::context::AgentMode::Expert && depth == 0 {
@@ -275,7 +275,7 @@ pub(crate) fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8)
 /// to the model only when its name is *not* in `ALL_ORCH`, or when the allowset
 /// explicitly opens it. Step 1 returns an empty allowset so the gate strips all
 /// seven orchestration tools from every mode (zero behavior diff).
-pub(crate) fn orchestration_delivered(name: &str, allowset: &[String]) -> bool {
+pub fn orchestration_delivered(name: &str, allowset: &[String]) -> bool {
     !ALL_ORCH.contains(&name) || allowset.iter().any(|n| n == name)
 }
 
