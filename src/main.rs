@@ -499,19 +499,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
 
-    // SDD v1.5: build the main agent as an Expert root when orchestration is
-    // enabled so the sub-agent tools actually deliver/spawn at depth 0. When
-    // disabled (default legacy path) the agent stays Instant (zero diff).
+    // SDD v1.5 H2: main agent is always Instant; Expert mode is handled by
+    // ManagedRunner (separate code path). orchestration_enabled only controls
+    // can_spawn on the shared runner so Instant root can deliver sub-agent tools.
     let orchestration_enabled = config.agent.modes.orchestration_enabled();
     let agent = LlmAgent::builder()
         .name("FoxIR")
         .description("Local AI agent with Windows system tools")
         .provider(provider)
-        .mode(if orchestration_enabled {
-            crate::context::AgentMode::Expert
-        } else {
-            crate::context::AgentMode::Instant
-        })
+        .mode(crate::context::AgentMode::Instant)
         .tools(shared_tools.clone())
         .skill_manager(skill_manager.clone())
         .max_iterations(config.agent.max_iterations)
@@ -572,11 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skill_catalog_max(skill_catalog_max.clone())
         .skill_hot_top_k(skill_hot_top_k.clone())
         .with_can_spawn(orchestration_enabled)
-        .with_mode(if orchestration_enabled {
-            crate::context::AgentMode::Expert
-        } else {
-            crate::context::AgentMode::Instant
-        })
+        .with_mode(crate::context::AgentMode::Instant)
         .build()
         .map_err(|e| format!("Failed to build runner: {}", e))?;
     let runner = Arc::new(runner);

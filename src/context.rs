@@ -607,14 +607,14 @@ impl InvocationContext {
     }
 
     /// Enable sub-agent orchestration spawning for this run (SDD v1.5 2.x).
-    /// Gated at runtime by `mode == Expert && depth == 0` in the agent loop.
+    /// Gated at runtime by `mode == Instant && depth == 0` in the agent loop.
     pub fn with_can_spawn(mut self, enabled: bool) -> Self {
         self.can_spawn = enabled;
         self
     }
 
-    /// Set the operational mode for this run (Instant by default; Expert unlocks
-    /// sub-agent orchestration at depth 0). SDD v1.5 2.x.
+    /// Set the operational mode for this run. The shared runner is always Instant;
+    /// Expert mode is used by ManagedRunner (separate code path). SDD v1.5 H2.
     pub fn with_mode(mut self, mode: AgentMode) -> Self {
         self.mode = mode;
         self
