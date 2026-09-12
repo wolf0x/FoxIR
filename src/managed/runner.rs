@@ -622,7 +622,13 @@ impl ManagedRunner {
                     } else {
                         // No pending plan, fall through to re-plan
                         let anchor = None;
-                        match manager::plan_next(&provider, &manager_model, manager_fallback.as_deref(), &contract, &skills, &tool_defs, anchor).await {
+                        match tokio::select! {
+                            _ = cancelled_fut(&cancelled_flag) => {
+                                info!("[managed:{}] STOP during Manager planning (round {}) - aborting", session, round + 1);
+                                break;
+                            }
+                            res = manager::plan_next(&provider, &manager_model, manager_fallback.as_deref(), &contract, &skills, &tool_defs, anchor) => res,
+                        } {
                             Ok(p) => p,
                             Err(e) => {
                                 error!("[managed:{}] Manager planning failed: {}", session, e);
@@ -641,7 +647,13 @@ impl ManagedRunner {
                     } else {
                         None
                     };
-                    match manager::plan_next(&provider, &manager_model, manager_fallback.as_deref(), &contract, &skills, &tool_defs, anchor).await {
+                    match tokio::select! {
+                        _ = cancelled_fut(&cancelled_flag) => {
+                            info!("[managed:{}] STOP during Manager planning (round {}) - aborting", session, round + 1);
+                            break;
+                        }
+                        res = manager::plan_next(&provider, &manager_model, manager_fallback.as_deref(), &contract, &skills, &tool_defs, anchor) => res,
+                    } {
                         Ok(p) => p,
                         Err(e) => {
                             error!("[managed:{}] Manager planning failed: {}", session, e);
@@ -1116,15 +1128,26 @@ impl ManagedRunner {
                         let mut exec_fwd_n: usize = 0;
                         let mut exec_last_got = std::time::Instant::now();
                         let mut exec_last_sent = std::time::Instant::now();
-                        while let Some(result) = stream.next().await {
+                        loop {
+                            // STOP must interrupt the wait for the next Executor event:
+                            // while the inner agent is mid-LLM-call (or otherwise yields
+                            // nothing) `stream.next().await` would hang, so the per-event
+                            // cancel check below would never be reached. Racing it against
+                            // cancelled_fut makes STOP immediate even between events.
+                            let result = tokio::select! {
+                                _ = cancelled_fut(&cancelled_flag) => {
+                                    info!("[managed:{}] STOP during Executor round {} - aborting executor", session, round + 1);
+                                    break;
+                                }
+                                r = stream.next() => match r { Some(v) => v, None => break },
+                            };
                             exec_fwd_n += 1;
                             if exec_last_got.elapsed().as_secs() >= 5 {
                                 info!("[managed:{}] exec round {} [hb] GOT event #{} (pre-forward)", session, round + 1, exec_fwd_n);
                                 exec_last_got = std::time::Instant::now();
                             }
-                            // STOP during an Executor round: abort so the underlying
-                            // agent loop sees its consumer close and stops issuing
-                            // tools (e.g. browser_cdp) instead of running on.
+                            // Belt-and-suspenders: a STOP that landed after the select
+                            // resolved but before this iteration still aborts here.
                             if cancelled_flag.load(Ordering::SeqCst) {
                                 info!("[managed:{}] STOP during Executor round {} - aborting executor", session, round + 1);
                                 break;
@@ -1277,16 +1300,23 @@ impl ManagedRunner {
                     s
                 };
                 
-                let round_report = auditor.audit_round(
-                    &contract.original_task,
-                    &plan.subtask,
-                    &plan.success_criteria,
-                    &plan.expected_evidence,
-                    &executor_summary_bounded,
-                    &format!("{:?}", contract.phase),
-                    &recent_verified,
-                    &final_state_block,
-                ).await;
+                let phase_str = format!("{:?}", contract.phase);
+                let round_report = tokio::select! {
+                    _ = cancelled_fut(&cancelled_flag) => {
+                        info!("[managed:{}] STOP during Auditor round {} - aborting", session, round + 1);
+                        break;
+                    }
+                    res = auditor.audit_round(
+                        &contract.original_task,
+                        &plan.subtask,
+                        &plan.success_criteria,
+                        &plan.expected_evidence,
+                        &executor_summary_bounded,
+                        &phase_str,
+                        &recent_verified,
+                        &final_state_block,
+                    ) => res,
+                };
                 let round_ok = round_report.as_ref()
                     .map(|r| r.completion == "complete" && r.integrity != "violation")
                     .unwrap_or(true); // no LLM auditor configured -> do not block
