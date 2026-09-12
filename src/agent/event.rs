@@ -109,6 +109,61 @@ pub enum AgentEvent {
         /// Total tokens (prompt + completion).
         total_tokens: u64,
     },
+
+    /// A worker sub-agent has been dispatched (Expert orchestration, T6.5+).
+    #[serde(rename = "subagent_spawned")]
+    SubagentSpawned {
+        #[serde(flatten)]
+        meta: EventMeta,
+        #[serde(rename = "run_id")]
+        run_id: String,
+        role: String,
+    },
+
+    /// A worker sub-agent reached a terminal non-failure status.
+    #[serde(rename = "subagent_completed")]
+    SubagentCompleted {
+        #[serde(flatten)]
+        meta: EventMeta,
+        #[serde(rename = "run_id")]
+        run_id: String,
+        role: String,
+        status: String,
+        confidence: String,
+        summary: String,
+        #[serde(rename = "evidence_refs")]
+        evidence_refs: Vec<String>,
+    },
+
+    /// A worker sub-agent failed / timed out / was cancelled.
+    #[serde(rename = "subagent_failed")]
+    SubagentFailed {
+        #[serde(flatten)]
+        meta: EventMeta,
+        #[serde(rename = "run_id")]
+        run_id: String,
+        role: String,
+        reason: String,
+    },
+
+    /// Per-worker token usage for the budget drawer.
+    #[serde(rename = "budget_update")]
+    BudgetUpdate {
+        #[serde(flatten)]
+        meta: EventMeta,
+        #[serde(rename = "run_id")]
+        run_id: String,
+        role: String,
+        tokens: u64,
+    },
+
+    /// The Manager published/updated the shared plan (task tree source).
+    #[serde(rename = "plan_updated")]
+    PlanUpdated {
+        #[serde(flatten)]
+        meta: EventMeta,
+        plan: serde_json::Value,
+    },
 }
 
 /// Event metadata — identity, timing, and provenance.
@@ -238,6 +293,51 @@ impl AgentEvent {
         }
     }
 
+    pub fn subagent_spawned(run_id: &str, role: &str, invocation_id: &str, author: &str) -> Self {
+        AgentEvent::SubagentSpawned {
+            meta: EventMeta::new(invocation_id, author),
+            run_id: run_id.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    pub fn subagent_completed(run_id: &str, role: &str, status: &str, confidence: &str, summary: &str, evidence_refs: Vec<String>, invocation_id: &str, author: &str) -> Self {
+        AgentEvent::SubagentCompleted {
+            meta: EventMeta::new(invocation_id, author),
+            run_id: run_id.to_string(),
+            role: role.to_string(),
+            status: status.to_string(),
+            confidence: confidence.to_string(),
+            summary: summary.to_string(),
+            evidence_refs,
+        }
+    }
+
+    pub fn subagent_failed(run_id: &str, role: &str, reason: &str, invocation_id: &str, author: &str) -> Self {
+        AgentEvent::SubagentFailed {
+            meta: EventMeta::new(invocation_id, author),
+            run_id: run_id.to_string(),
+            role: role.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn budget_update(run_id: &str, role: &str, tokens: u64, invocation_id: &str, author: &str) -> Self {
+        AgentEvent::BudgetUpdate {
+            meta: EventMeta::new(invocation_id, author),
+            run_id: run_id.to_string(),
+            role: role.to_string(),
+            tokens,
+        }
+    }
+
+    pub fn plan_updated(plan: serde_json::Value, invocation_id: &str, author: &str) -> Self {
+        AgentEvent::PlanUpdated {
+            meta: EventMeta::new(invocation_id, author),
+            plan,
+        }
+    }
+
     // --- Getters ---
 
     pub fn meta(&self) -> &EventMeta {
@@ -251,6 +351,11 @@ impl AgentEvent {
             | Self::PermissionRequest { meta, .. }
             | Self::PermissionResponse { meta, .. }
             | Self::Usage { meta, .. }
+            | Self::SubagentSpawned { meta, .. }
+            | Self::SubagentCompleted { meta, .. }
+            | Self::SubagentFailed { meta, .. }
+            | Self::BudgetUpdate { meta, .. }
+            | Self::PlanUpdated { meta, .. }
             | Self::Done { meta } => meta,
         }
     }
@@ -268,5 +373,42 @@ impl AgentEvent {
             Self::TextDelta { content, .. } => Some(content.as_str()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_and_plan_events_serialize_with_expected_ws_types() {
+        let spawned = AgentEvent::subagent_spawned("sub-1", "port_scan", "root", "orchestrator");
+        let v: Value = serde_json::from_str(&spawned.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "subagent_spawned");
+        assert_eq!(v["run_id"], "sub-1");
+        assert_eq!(v["role"], "port_scan");
+
+        let done = AgentEvent::subagent_completed("sub-1", "port_scan", "completed", "High",
+            "found open port 445", vec!["output/services.txt".to_string()], "root", "orchestrator");
+        let v: Value = serde_json::from_str(&done.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "subagent_completed");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["confidence"], "High");
+        assert_eq!(v["evidence_refs"][0], "output/services.txt");
+
+        let budget = AgentEvent::budget_update("sub-1", "port_scan", 12345, "root", "orchestrator");
+        let v: Value = serde_json::from_str(&budget.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "budget_update");
+        assert_eq!(v["tokens"], 12345);
+
+        let failed = AgentEvent::subagent_failed("sub-2", "log_parse", "timeout", "root", "orchestrator");
+        let v: Value = serde_json::from_str(&failed.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "subagent_failed");
+        assert_eq!(v["reason"], "timeout");
+
+        let plan = AgentEvent::plan_updated(serde_json::json!({"round": 1, "subtask": "recon"}), "root", "manager");
+        let v: Value = serde_json::from_str(&plan.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "plan_updated");
+        assert_eq!(v["plan"]["subtask"], "recon");
     }
 }

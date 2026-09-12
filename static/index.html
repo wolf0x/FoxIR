@@ -707,6 +707,41 @@ input:checked+.slider:before{transform:translateX(20px)}
 .slash-popup-desc{font-size:12px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .slash-popup-empty{padding:14px 16px;color:var(--t3);font-size:13px;text-align:center}
 </style>
+/* ── Expert multi-agent view (T6.6) ── */
+#expertToggle{position:fixed;top:12px;right:292px;z-index:1200;padding:6px 10px;font-size:12px;border:none;border-radius:8px;background:#5b6bf0;color:#fff;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.15)}
+#expertToggle:hover{background:#4553d0}
+.expert-drawer{position:fixed;top:0;right:0;bottom:0;width:340px;z-index:1100;background:#fbfcfe;border-left:1px solid var(--border);display:flex;flex-direction:column;box-shadow:-4px 0 20px rgba(0,0,0,.12);transition:transform .18s ease}
+.expert-drawer.hidden{transform:translateX(110%)}
+.expert-hdr{display:flex;align-items:center;gap:8px;padding:12px 14px;background:linear-gradient(135deg,#5b6bf0,#8a5cf0);color:#fff;flex:0 0 auto}
+.expert-hdr .t{font-weight:600;flex:1;font-size:13px}
+.expert-hdr .close{cursor:pointer;font-size:16px;opacity:.85;border:none;background:none;color:#fff}
+.expert-body{flex:1;overflow:auto;padding:12px}
+.expert-sec{margin-bottom:14px}
+.expert-sec h4{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#8b95a5;margin:0 0 6px}
+.expert-stats{display:flex;gap:8px;flex-wrap:wrap}
+.expert-chip{flex:1;min-width:60px;background:#eef0fb;border-radius:8px;padding:8px;text-align:center}
+.expert-chip b{display:block;font-size:16px;color:#3a4bd6}
+.expert-chip span{font-size:10px;color:#8b95a5}
+.expert-plan{background:#fff;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px}
+.expert-plan .p-sub{font-weight:600;font-size:13px;margin-bottom:4px}
+.expert-plan .p-meta{font-size:11px;color:#8b95a5}
+.expert-plan ul{margin:6px 0 0;padding-left:16px;font-size:12px;color:#555}
+.expert-queue{background:#fff;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;padding:8px;font-size:12px;display:flex;align-items:center;gap:8px}
+.expert-queue .st{flex:0 0 auto;font-size:10px;padding:2px 7px;border-radius:10px;color:#fff}
+.st-pending{background:#9aa3b2}.st-running{background:#5b6bf0}.st-completed{background:#2e9e5b}.st-failed{background:#d9534f}.st-cancelled{background:#b2862a}.st-timeout{background:#b2862a}
+.expert-queue .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.expert-agent{background:#fff;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;overflow:hidden}
+.expert-agent .ag-hdr{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer}
+.expert-agent .ag-role{font-weight:600;font-size:13px;flex:1}
+.expert-agent .ag-tok{font-size:10px;color:#8b95a5}
+.expert-agent .ag-body{display:none;padding:0 10px 10px;font-size:12px;color:#444;border-top:1px dashed var(--border)}
+.expert-agent.open .ag-body{display:block}
+.expert-agent .ag-sum{white-space:pre-wrap;margin:8px 0}
+.expert-agent .ag-ev{margin-top:6px}
+.expert-agent .ag-ev a{color:#3a4bd6;text-decoration:none;display:block;font-size:11px;padding:2px 0}
+.expert-agent .ag-ev a:hover{text-decoration:underline}
+.expert-empty{color:#aab2c0;font-size:12px;padding:8px;text-align:center}
+@media(max-width:1000px){#expertToggle{right:12px} .expert-drawer{width:86vw}}
 </head>
 <body>
 <!-- Image lightbox overlay -->
@@ -1309,6 +1344,19 @@ input:checked+.slider:before{transform:translateX(20px)}
   </div>
 </div>
 
+<!-- Expert multi-agent drawer (T6.6) -->
+<button id="expertToggle" onclick="toggleExpertDrawer()" title="Expert multi-agent view">&#129304; Expert</button>
+<div id="expertView" class="expert-drawer hidden">
+  <div class="expert-hdr"><span class="t">&#129304; Expert Multi-Agent</span><button class="close" onclick="toggleExpertDrawer()">&#10005;</button></div>
+  <div class="expert-body">
+    <div class="expert-sec"><h4>Overview</h4><div class="expert-stats" id="expertStats"></div></div>
+    <div class="expert-sec" id="expertPlanSec" style="display:none"><h4>Plan / Task Queue</h4><div id="expertPlan"></div><div id="expertQueue"></div></div>
+    <div class="expert-sec"><h4>Budget</h4><div id="expertBudget">No worker budget yet</div></div>
+    <div class="expert-sec"><h4>Log</h4><div id="expertLog" class="expert-empty">Aggregated worker summaries appear here.</div></div>
+    <div class="expert-sec"><h4>Agents</h4><div id="expertAgents" class="expert-empty">No sub-agents yet.</div></div>
+  </div>
+</div>
+
 <script>
 // 閳光偓閳光偓 State 閳光偓閳光偓
 let ws=null,connected=false,msgHist=[],logHist=[];
@@ -1492,6 +1540,13 @@ function handleMsg(msg){
       break;
     case 'usage':
       // Usage events handled by token usage dashboard on load
+      break;
+    case 'subagent_spawned':
+    case 'budget_update':
+    case 'subagent_completed':
+    case 'subagent_failed':
+    case 'plan_updated':
+      expertHandleMsg(msg);
       break;
     case 'error':
       hideTyping();finalizeThink();finalizeTextBlock();
@@ -3834,6 +3889,159 @@ document.addEventListener('click',function(e){
     hideSlashPopup();
   }
 });
+// ── Expert multi-agent view (T6.6) ─────────────────────────────────────
+// Consumes the subagent/budget/plan WS events emitted by the ManagedRunner and
+// renders an Expert drawer: task queue, agent cards, budget, log, evidence links.
+const expertState = { agents: {}, queue: [], plan: null, order: [] };
+
+function toggleExpertDrawer() {
+  const d = document.getElementById('expertView');
+  if (d) d.classList.toggle('hidden');
+}
+
+function normalizeEvidenceRef(ref) {
+  if (!ref) return '';
+  let s = String(ref).replace(/\\/g, '/');
+  // Strip an absolute workspace prefix if present (e.g. C:/Users/.../workspace/)
+  const m = s.match(/([A-Za-z]:\/[^/]*\/workspace\/)/i);
+  if (m) s = s.slice(m[1].length);
+  s = s.replace(/^\.\/+/, '').replace(/^\/+/, '');
+  return s;
+}
+
+function evidenceHref(ref) {
+  const rel = normalizeEvidenceRef(ref);
+  return rel ? '/workspace/' + rel : null;
+}
+
+function expertHandleMsg(msg) {
+  try {
+    if (msg.type === 'plan_updated') {
+      expertState.plan = msg.plan || null;
+      renderExpert();
+    } else if (msg.type === 'subagent_spawned') {
+      const a = expertState.agents[msg.run_id] || { role: msg.role, status: 'running', tokens: 0, summary: '', evidence: [] };
+      a.status = 'running'; a.role = msg.role;
+      expertState.agents[msg.run_id] = a;
+      if (expertState.order.indexOf(msg.run_id) < 0) expertState.order.push(msg.run_id);
+      expertState.queue.push({ run_id: msg.run_id, role: msg.role, status: 'running' });
+      renderExpert();
+    } else if (msg.type === 'budget_update') {
+      const a = expertState.agents[msg.run_id] || { role: msg.role, status: 'running', tokens: 0, summary: '', evidence: [] };
+      a.tokens = (msg.tokens || 0);
+      expertState.agents[msg.run_id] = a;
+      renderExpert();
+    } else if (msg.type === 'subagent_completed' || msg.type === 'subagent_failed') {
+      const done = msg.type === 'subagent_completed';
+      const a = expertState.agents[msg.run_id] || { role: msg.role, tokens: 0 };
+      a.status = done ? 'completed' : (msg.reason || 'failed');
+      a.summary = msg.summary || (done ? '' : (msg.reason || 'failed'));
+      a.evidence = (msg.evidence_refs || []).slice();
+      expertState.agents[msg.run_id] = a;
+      const q = expertState.queue.find(x => x.run_id === msg.run_id);
+      if (q) q.status = a.status;
+      renderExpert();
+    }
+  } catch (err) { console.error('expertHandleMsg', err); }
+}
+
+function esc(s) {
+  const div = document.createElement('div');
+  div.textContent = s == null ? '' : String(s);
+  return div.innerHTML;
+}
+
+function statusClass(st) {
+  const s = String(st).toLowerCase();
+  if (s.indexOf('completed') >= 0 || s === 'ok') return 'st-completed';
+  if (s.indexOf('fail') >= 0) return 'st-failed';
+  if (s.indexOf('cancel') >= 0) return 'st-cancelled';
+  if (s.indexOf('timeout') >= 0) return 'st-timeout';
+  return 'st-running';
+}
+
+function renderExpert() {
+  const statsEl = document.getElementById('expertStats');
+  if (statsEl) {
+    const ids = Object.keys(expertState.agents);
+    const completed = ids.filter(id => expertState.agents[id].status === 'completed').length;
+    const failed = ids.filter(id => statusClass(expertState.agents[id].status) === 'st-failed').length;
+    const totalTok = ids.reduce((s, id) => s + (expertState.agents[id].tokens || 0), 0);
+    statsEl.innerHTML =
+      '<div class="expert-chip"><b>' + ids.length + '</b><span>spawned</span></div>' +
+      '<div class="expert-chip"><b>' + completed + '</b><span>done</span></div>' +
+      '<div class="expert-chip"><b>' + failed + '</b><span>failed</span></div>' +
+      '<div class="expert-chip"><b>' + totalTok + '</b><span>tokens</span></div>';
+  }
+  const planSec = document.getElementById('expertPlanSec');
+  const planEl = document.getElementById('expertPlan');
+  if (expertState.plan) {
+    if (planSec) planSec.style.display = '';
+    if (planEl && expertState.plan.subtask) {
+      const rw = (expertState.plan.remaining_work || []).map(w => '<li>' + esc(w) + '</li>').join('');
+      planEl.innerHTML = '<div class="expert-plan"><div class="p-sub">' + esc(expertState.plan.subtask) + '</div>' +
+        '<div class="p-meta">round ' + esc(expertState.plan.round) + ' · route ' + esc(expertState.plan.route) + '</div>' +
+        (rw ? '<ul>' + rw + '</ul>' : '') + '</div>';
+    }
+  } else if (planSec) { planSec.style.display = 'none'; }
+  const qEl = document.getElementById('expertQueue');
+  if (qEl) {
+    qEl.innerHTML = expertState.queue.length
+      ? expertState.queue.slice().reverse().map(q =>
+          '<div class="expert-queue"><span class="st ' + statusClass(q.status) + '">' + esc(q.status) + '</span>' +
+          '<span class="txt">' + esc(q.role) + '</span></div>').join('')
+      : '<div class="expert-empty">No tasks yet.</div>';
+  }
+  const budgetEl = document.getElementById('expertBudget');
+  if (budgetEl) {
+    const rows = expertState.order.map(rid => {
+      const a = expertState.agents[rid];
+      return '<div class="expert-queue"><span class="st ' + statusClass(a.status) + '">' + esc(a.role) + '</span>' +
+        '<span class="txt">' + (a.tokens || 0) + ' tokens</span></div>';
+    }).join('');
+    budgetEl.innerHTML = expertState.order.length
+      ? '<div class="expert-queue"><span class="txt">Total: ' +
+        expertState.order.reduce((s, rid) => s + (expertState.agents[rid].tokens || 0), 0) + ' tokens</span></div>' + rows
+      : '<span class="expert-empty">No worker budget yet</span>';
+  }
+  const logEl = document.getElementById('expertLog');
+  if (logEl) {
+    const logs = expertState.order.filter(rid => expertState.agents[rid].summary).map(rid => {
+      const a = expertState.agents[rid];
+      return '<div class="expert-queue"><span class="st ' + statusClass(a.status) + '">' + esc(a.role) + '</span>' +
+        '<span class="txt">' + esc(a.summary.slice(0, 120)) + '</span></div>';
+    }).join('');
+    logEl.innerHTML = logs || '<span class="expert-empty">Aggregated worker summaries appear here.</span>';
+  }
+  const agEl = document.getElementById('expertAgents');
+  if (agEl) {
+    if (!expertState.order.length) { agEl.innerHTML = '<div class="expert-empty">No sub-agents yet.</div>'; }
+    else {
+      agEl.innerHTML = expertState.order.map(rid => {
+        const a = expertState.agents[rid];
+        const ev = (a.evidence || []).map(ref => {
+          const href = evidenceHref(ref);
+          return href
+            ? '<a href="' + href + '" target="_blank" title="Open evidence">&#128196; ' + esc(normalizeEvidenceRef(ref)) + '</a>'
+            : '<span style="font-size:11px;color:#8b95a5">&#128196; ' + esc(ref) + '</span>';
+        }).join('');
+        return '<div class="expert-agent" data-ag="' + esc(rid) + '">' +
+          '<div class="ag-hdr" onclick="toggleAgent(this)">' +
+            '<span class="st ' + statusClass(a.status) + '">' + esc(a.status) + '</span>' +
+            '<span class="ag-role">' + esc(a.role) + '</span>' +
+            '<span class="ag-tok">' + (a.tokens || 0) + ' tok</span></div>' +
+          '<div class="ag-body"><div class="ag-sum">' + esc(a.summary) + '</div>' +
+          (ev ? '<div class="ag-ev"><b>Evidence</b>' + ev + '</div>' : '') + '</div></div>';
+      }).join('');
+    }
+  }
+}
+
+function toggleAgent(hdr) {
+  const card = hdr.closest('.expert-agent');
+  if (card) card.classList.toggle('open');
+}
+
 </script>
 </html>
 

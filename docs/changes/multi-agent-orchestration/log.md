@@ -433,3 +433,10 @@
 - **tests/ 独立目录**：`tests/common/mod.rs`（canned Manager 输出 helper）+ `tests/step1_gates.rs`（G-instant-tools / G-sub-not-main / G-expert-root / G-name-disjoint / 名字不重，5 测）+ `tests/mock_llm.rs`（canned 并行/串行→`parse_manager_plan` 门控，2 测）+ `tests/phase0_e2e.rs`（模板默认/解析 + contract 计划同步往返 T6.5，2 测）。
 - **验证**：`cargo build --bin FoxIR` OK；`cargo test --bin FoxIR` → **303 passed / 1 env fail**（无回归）；integration `--test step1_gates --test mock_llm --test phase0_e2e` → **9 passed**。lib 自身模块单测 275 passed / 1 env fail（shimcache 同基线）。`cargo test`（全 target）因 lib 亦含 env 基线失败而提前退出，规范做法：`cargo test --bin FoxIR` + `--test …`。
 - **T3.5 批注订正**：§20.7 Skill opt-in 原文「未触发」→「已决策」（T6.7 结论：worker 构造即 skill-off 为既定默认，B1/B2 留待 Step 2b）。
+## 2026-09-12 · T6.6：Step 3 前端 UI — Expert 多 Agent 视图
+
+- **后端 WS 事件类型**（`src/agent/event.rs`）：`AgentEvent` 新增 `SubagentSpawned` / `SubagentCompleted` / `SubagentFailed` / `BudgetUpdate` / `PlanUpdated` 变体（serde rename 出 `subagent_spawned`/`subagent_completed`/`subagent_failed`/`budget_update`/`plan_updated`）+ 对应构造器 + `meta()` 收口。`to_ws_message()` 自动序列化。
+- **runner 发射**（`src/managed/runner.rs`）：manager 定案后 `plan_updated`（round/subtask/success_criteria/route/remaining_work）；并行 collect 后每 worker 发 `subagent_spawned`→`budget_update`→`subagent_completed|subagent_failed`（带 role/status/confidence/summary/evidence_refs/token_usage），供 UI 实时渲染。
+- **前端**（`static/index.html`）：右滑 Expert 抽屉（容器 + CSS + toggle 按钮），复用既有 WS 通道经 handleMsg 新增 5 个 case 进入 `expertHandleMsg`；渲染 Overview 统计（spawned/done/failed/tokens）、Plan/Task Queue、Budget 抽屉、Log 抽屉（worker 摘要）、Agent Cards（可展开 summary + evidence 引用点击跳 `/workspace/<rel>`）。mode 切换沿用既有 Instant/Expert 通道（chat 消息带 `managed`）。
+- **验证**：`node --check` 两个 `<script>` 块均语法通过（无浏览器、未做像素级视觉回归，声明为「未在浏览器实测」）；`cargo test --bin FoxIR` → **304 passed / 1 env fail**（+1 新事件序列化测试 `subagent_and_plan_events_serialize_with_expected_ws_types`，无回归）；integration 9 passed。
+- **诚实标注**：证据引用跳转依赖已有 `/workspace/{path}` 守卫端点（路径穿越已防护）；subagent 事件仅在 Manager 声明并行子任务（非空 `parallel_subtasks`）的 Expert 轮次真实发射，legacy 单 Executor 轮只发 `plan_updated`。UI 像素效果需用户本地浏览器核验。

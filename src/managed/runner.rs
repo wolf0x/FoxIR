@@ -615,6 +615,15 @@ impl ManagedRunner {
                     plan.route, plan.channel
                 ));
                 let _ = tx.send(Ok(AgentEvent::text(&plan_event, &contract_id, "manager"))).await;
+                // T6.6: publish the shared plan (task tree source) so the Expert
+                // Task Queue / plan panel can render without guessing.
+                let _ = tx.send(Ok(AgentEvent::plan_updated(serde_json::json!({
+                    "round": round + 1,
+                    "subtask": plan.subtask,
+                    "success_criteria": plan.success_criteria,
+                    "route": format!("{:?}", plan.route),
+                    "remaining_work": plan.remaining_work,
+                }), &contract_id, "manager"))).await;
                 // G2: the Manager forecasts Remaining Work AFTER this subtask. Keep it
                 // local here; only commit it to the contract once the round is actually
                 // audited & verified (see reconcile step below), so a failed/partial
@@ -890,6 +899,30 @@ impl ManagedRunner {
                         let p_brief = crate::managed::parallel::render_collect_brief(&p_results);
                         if !p_brief.is_empty() {
                             b.push_str(&p_brief);
+                        }
+                        // T6.6: emit live worker events so the Expert Agent Cards / Task
+                        // Queue / budget drawer render the run (spawned -> budget ->
+                        // completed|failed) from the real WS stream.
+                        for r in &p_results {
+                            let _ = tx.send(Ok(AgentEvent::subagent_spawned(
+                                &r.run_id, &r.role, &contract_id, "orchestrator"))).await;
+                            let _ = tx.send(Ok(AgentEvent::budget_update(
+                                &r.run_id, &r.role, r.token_usage, &contract_id, "orchestrator"))).await;
+                            if r.status == crate::context::SubAgentStatus::Ok {
+                                let _ = tx.send(Ok(AgentEvent::subagent_completed(
+                                    &r.run_id, &r.role, "completed",
+                                    &format!("{:?}", r.confidence), &r.summary,
+                                    r.evidence_refs.clone(), &contract_id, "orchestrator"))).await;
+                            } else {
+                                let status_s = match r.status {
+                                    crate::context::SubAgentStatus::Timeout => "timeout",
+                                    crate::context::SubAgentStatus::Cancelled => "cancelled",
+                                    crate::context::SubAgentStatus::Failed => "failed",
+                                    _ => "non-ok",
+                                };
+                                let _ = tx.send(Ok(AgentEvent::subagent_failed(
+                                    &r.run_id, &r.role, status_s, &contract_id, "orchestrator"))).await;
+                            }
                         }
                         for r in &p_results {
                             let ok = r.status == crate::context::SubAgentStatus::Ok;
