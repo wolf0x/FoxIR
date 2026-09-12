@@ -190,9 +190,6 @@ pub struct ExpertModeConfig {
     /// Per-worker wall-clock timeout in seconds (SDD v1.5 §7.4.1 / §9).
     #[serde(default = "default_subagent_timeout_secs")]
     pub default_timeout_secs: u64,
-    /// Parallel-collect workflow template: "sequential" | "parallel" (§10).
-    #[serde(default = "default_orchestration_template")]
-    pub orchestration_template: String,
     /// Per-worker token budget; exceeding it cancels that worker (SDD §7.7 / §9).
     #[serde(default = "default_max_tokens_per_run")]
     pub max_tokens_per_run: u64,
@@ -201,33 +198,6 @@ pub struct ExpertModeConfig {
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: u64,
 }
-
-
-/// Orchestration workflow template selected for the parallel-collect dispatch
-/// (SDD v1.5 §10: Sequential / Parallel; Loop is the outer multi-round manager loop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrchestrationTemplate {
-    Sequential,
-    Parallel,
-}
-
-impl Default for OrchestrationTemplate {
-    fn default() -> Self { OrchestrationTemplate::Parallel }
-}
-
-impl OrchestrationTemplate {
-    pub fn as_str(&self) -> &'static str {
-        match self { OrchestrationTemplate::Sequential => "sequential", OrchestrationTemplate::Parallel => "parallel" }
-    }
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "sequential" => OrchestrationTemplate::Sequential,
-            _ => OrchestrationTemplate::Parallel,
-        }
-    }
-}
-
-fn default_orchestration_template() -> String { "parallel".to_string() }
 
 /// Runtime-carried orchestration limits (SDD v1.5 §9), derived from
 /// `ExpertModeConfig` and threaded through the agent builder into the
@@ -238,8 +208,6 @@ pub struct OrchestrationLimits {
     pub default_timeout_secs: u64,
     pub max_tokens_per_run: u64,
     pub max_total_tokens: u64,
-    /// Parallel-collect dispatch template (§10 / T6.3).
-    pub template: OrchestrationTemplate,
 }
 
 impl Default for OrchestrationLimits {
@@ -249,7 +217,6 @@ impl Default for OrchestrationLimits {
             default_timeout_secs: default_subagent_timeout_secs(),
             max_tokens_per_run: default_max_tokens_per_run(),
             max_total_tokens: default_max_total_tokens(),
-            template: OrchestrationTemplate::default(),
         }
     }
 }
@@ -261,7 +228,6 @@ impl From<&ExpertModeConfig> for OrchestrationLimits {
             default_timeout_secs: c.default_timeout_secs,
             max_tokens_per_run: c.max_tokens_per_run,
             max_total_tokens: c.max_total_tokens,
-            template: OrchestrationTemplate::parse(&c.orchestration_template),
         }
     }
 }
@@ -285,10 +251,6 @@ impl ModesConfig {
             tracing::warn!("[config] modes.expert.skill_strategy invalid; falling back to 'attached'");
             self.expert.skill_strategy = default_mode_skill_strategy();
         }
-        if !matches!(self.expert.orchestration_template.as_str(), "sequential" | "parallel") {
-            tracing::warn!("[config] modes.expert.orchestration_template invalid; falling back to 'parallel'");
-            self.expert.orchestration_template = default_orchestration_template();
-        }
         if !matches!(self.subagent.skill_strategy.as_str(), "disabled" | "attached") {
             tracing::warn!("[config] modes.subagent.skill_strategy invalid; falling back to 'disabled'");
             self.subagent.skill_strategy = "disabled".to_string();
@@ -306,7 +268,6 @@ impl Default for ExpertModeConfig {
             default_timeout_secs: default_subagent_timeout_secs(),
             max_tokens_per_run: default_max_tokens_per_run(),
             max_total_tokens: default_max_total_tokens(),
-            orchestration_template: default_orchestration_template(),
         }
     }
 }
@@ -1005,20 +966,4 @@ mod tests {
         assert_eq!(m.subagent.max_depth, 1);
         assert!(m.subagent.authorized_tools.is_empty());
     }
-
-    #[test]
-    fn orchestration_template_defaults_parallel_and_parses() {
-        assert_eq!(OrchestrationTemplate::default(), OrchestrationTemplate::Parallel);
-        assert_eq!(OrchestrationTemplate::parse("sequential"), OrchestrationTemplate::Sequential);
-        assert_eq!(OrchestrationTemplate::parse("parallel"), OrchestrationTemplate::Parallel);
-        assert_eq!(OrchestrationTemplate::parse("bogus"), OrchestrationTemplate::Parallel,
-            "unknown template falls back to Parallel");
-        assert_eq!(OrchestrationTemplate::Parallel.as_str(), "parallel");
-        // From<&ExpertModeConfig> propagates the template into limits.
-        let mut cfg = ExpertModeConfig::default();
-        cfg.orchestration_template = "sequential".to_string();
-        assert_eq!(OrchestrationLimits::from(&cfg).template, OrchestrationTemplate::Sequential);
-        assert_eq!(OrchestrationLimits::default().template, OrchestrationTemplate::Parallel);
-    }
 }
-
