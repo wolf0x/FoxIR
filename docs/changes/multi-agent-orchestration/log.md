@@ -385,3 +385,36 @@
 - **委托**：`context.rs::InvocationContext::authorized_tools()` 从 `preauth_profile` 调 `authorized_tool_names`（原空占位）。
 - **接线（安全）**：`orchestration.rs` 在 `spec.allow_write || spec.allow_exec` 且 `tools_allowlist` 为空时，将授权工具名追加进 worker `allow`；Phase 0 只读 worker（双 allow=false）保持纯只读，读保护不变。
 - **测试**：`permission_profile::tests::authorized_tool_names_*`（映射 / 通配 / 未映射 / 空与 allow_all / 去重，5 测）+ `context::tests::authorized_tools_empty_without_profile_and_derived_with_containment`。全量 `cargo test --bin FoxIR` → **292 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+6 新测）。
+
+
+## 2026-09-12 · T6.1 / T6.2：§7.5 LLM 语义层 Auditor + 降级方案 A
+
+- **T6.1 语义层**（`src/managed/auditor.rs`）：新增 `SubagentAggregateAudit{passed,reason}`、`parse_aggregate_verdict(output)`、`Auditor::audit_subagent_aggregate(subtasks, results, context)`。输入 = 声明的并行子任务 + 全部 `SubAgentResult`（role/confidence/status/evidence_refs/proposed_writes/截断 summary）+ round 目标。provider=None（纯 code 模式）→ 返回 `None`，确定性门控独立成立；有 provider → LLM 输出 `completion: complete|incomplete|blocked`+`note`，解析为 verdict，**仅降不升**，调用失败也 demote（同 `audit_round` 的保守策略）。
+- **runner 接线**：并行块先跑确定性 `audit_aggregate`；Pass/Uncertain 时调用语义层，语义不通过则 `promote=false` 并记录 `semantic_reason`；硬 Fail 直接降级不烧 token。降级 reason 优先取语义 reason，否则取确定性 reason。
+- **T6.2 降级方案 A**：runner 并行块 `loop` 有界 re-run（`PARALLEL_RERUN_CAP=2`，跨轮 `parallel_reruns`），未认证且预算未耗尽则重跑只读 collect（幂等）再审计；耗尽后回落方案 B（add_lead + manager note）。
+- **测试**：`managed::auditor::tests::parse_aggregate_verdict_*`（4）+ `audit_subagent_aggregate_returns_none_without_provider`。全量 `cargo test --bin FoxIR` → **297 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+5 新测）。
+- **诚实标注**：①语义层"对矛盾结果读 worker events"仅传 evidence_refs/截断 summary，未接完整 event 日志；②方案 A 是有界重跑（同一批只读子任务），非 LLM 重新规划出不同任务的语义重规划；③语义层每次并行轮都会烧 token（仅 Pass/Uncertain 时调用，硬 Fail 不调）。
+
+
+## 2026-09-12 · T6.3：工作流模板接入 ManagedRunner 主循环（§10）
+
+- **config**（`src/config.rs`）：新增 `OrchestrationTemplate{Sequential,Parallel}`（Copy+Eq，Default=Parallel，`as_str`/`parse`，未知回落 Parallel）；`ExpertModeConfig.orchestration_template`（serde default `"parallel"` + `validate_orchestration` 校验）；`OrchestrationLimits.template` 字段（`From<&ExpertModeConfig>` 透传）。
+- **分发**（`src/managed/parallel.rs`）：新增 `run_template_collect(env, subtasks, template, root, session)`，把 `ParallelSubtask` 映射为 `WorkflowStep`（带默认超时）后分发到共享 `workflow::sequential`（保序/单步）或 `workflow::parallel`（并发/聚合）；空输入保持 legacy 单 Executor 路径。
+- **runner**：并行块（含 T6.2 re-run 重试处）改走 `run_template_collect`，按 `orchestration_limits.template` 选择 Sequential/Parallel。
+- **测试**：`config::tests::orchestration_template_defaults_parallel_and_parses`（默认/解析/透传）+ `phase0_template_collect_dispatches_sequential_and_parallel`（seq 保序 3/3 Ok、par 3/3 Ok）。全量 `cargo test --bin FoxIR` → **299 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+2 新测）。
+- **诚实标注**：Loop 由外层多轮 Manager 主循环承担（非并行块选择项）；`workflow::loop_until` 仍独立未由 runner 直接调用（保持 §10 的 Loop 语义落在主循环轮次上）。
+
+
+## 2026-09-12 · T6.7：§20.7 Skill opt-in Review（执行并决策）
+
+- **审查事实**：worker 构造路径固定 skill-off —— `InvocationContext::subagent_child` 设 `SkillListingStrategy::Disabled`（`context.rs:424`）+ `orchestration.rs:404` `.without_skills()`；`SubAgentSpec.skills` 字段在编排路径无消费点 → **当前无任何 worker skill opt-in 通道**。
+- **决策（§20.7 清单）**：Phase 0 维持"worker 无 Skill 双关闭"为既定默认；B1/B2 的 builder 附加 opt-in 留待 Step 2b（需要时经 `spec.skills` + builder 附加），本 change 不开放。
+- **固化**：新增 `context::tests::subagent_child_keeps_skills_disabled_read_only`（构造后 `skill_listing_strategy=Disabled`、`mode=Expert`、`can_spawn=false`、`session_kind=SubAgent`）。全量 `cargo test --bin FoxIR` → 见下轮计数。
+## 2026-09-12 · Orchestrator CLI 自测（--orch-self-test）+ loop 测试固化
+
+- **动机/诊断**：Expert 并行派生的触发依赖 Manager plan 含 `Parallel Subtasks:` 段且 `plan.parallel_subtasks` 非空（解析在 `src/managed/manager.rs:407`，分发在 runner 并行块 `if !plan.parallel_subtasks.is_empty()`）。实测（contract 8b3b3ae9）Round 1 plan 无该段 → 正确回落到单 Executor 多轮，日志无 `Parallel collect`、jsonl 无 `subagent_spawned`。这不是"未接入"，而是数据条件门控。为让编排"确定可触发且可观察"，新增绕过 Manager LLM、直接驱动 Orchestrator 的确定性 CLI 自测。
+- **新增**：`src/orch_selftest.rs`——`run(workspace_dir, template, n, provider, tools, model)`（seq/parallel，构建 `ParallelEnv` + `subtasks(n)` 后经 `run_template_collect` 分发）、`run_loop(workspace_dir, role, rounds, ...)`（经 `run_loop_collect` 有界深潜）；`_emit` 打印每 worker 的 role/run_id/status/confidence/evidence/summary 与完成计数。模式沿用 phase0_acceptance 的 `ParallelEnv` 构造（memory_store 从 `workspace/memory/memory.db` 建、`default_permissions()`、`PermissionResolver::new().1`）。
+- **接线**：`src/managed/parallel.rs` 新增 `pub async fn run_loop_collect(env, role, plan_prompt, max_rounds, root_id, root_session)`（内部调 `workflow::loop_until`，max_rounds=0 直接空返回；清掉多余 `WorkflowStep` 引用）。`src/main.rs` 加 `mod orch_selftest;` + CLI 分支 `--orch-self-test <sequential|parallel|loop> [n]`（取 `model_names.first()`，key 由 `load_configs` 进程内解密；loop 调 `run_loop`，其余调 `run`，返回后 `return Ok(())`）。
+- **测试**：新增 `phase0_run_loop_collect_produces_bounded_unique_rounds`（≤max_rounds、只收 Ok、每轮 role 唯一）。全量 `cargo test --bin FoxIR` → **301 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+1 新测）。release 构建通过：`target/release/FoxIR.exe`。
+- **用法**：`FoxIR.exe --orch-self-test parallel 3` / `sequential 3` / `loop 2`（需 `models.json` 配好模型）。
+- **诚实标注**：`run_loop_collect`/CLI 用的真模型输出质量受当前 `models.json` 配置影响；selftest 是确定性驱动 Orchestrator 而非端到端 Manager 排产，后者仍受 Manager plan 是否声明 `Parallel Subtasks` 门控。

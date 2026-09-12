@@ -1059,3 +1059,98 @@ async fn phase0_live_end_to_end() {
     let _ = std::fs::write("output/phase0_live.json", serde_json::to_string_pretty(&report).unwrap());
     eprintln!("PHASE0 LIVE report: {}", serde_json::to_string(&report).unwrap());
 }
+
+
+// ---------------------------------------------------------------------------
+// T6.3: template dispatch wiring — run_template_collect routes the declared
+// parallel subtasks through the shared workflow::* templates by selector.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase0_template_collect_dispatches_sequential_and_parallel() {
+    use crate::managed::parallel::{ParallelEnv, run_template_collect};
+    use crate::managed::manager::ParallelSubtask;
+    use crate::config::{OrchestrationTemplate, OrchestrationLimits};
+
+    let b = Bench::new(2).await;
+    let subtasks = vec![
+        ParallelSubtask { role: "t1".into(), task: "x".into() },
+        ParallelSubtask { role: "t2".into(), task: "y".into() },
+        ParallelSubtask { role: "t3".into(), task: "z".into() },
+    ];
+    let make_env = |ms: Arc<MemoryStore>| ParallelEnv {
+        provider: b.provider.clone(),
+        tools: b.tools.clone(),
+        working_dir: b.working.to_string_lossy().to_string(),
+        workspace_dir: b.workspace.to_string_lossy().to_string(),
+        model: "mock".into(),
+        max_iterations: 5,
+        context_window: 128000,
+        max_inline_chars: 120000,
+        tool_timeout_secs: 30,
+        max_tool_retries: 0,
+        two_tier_memory: false,
+        limits: OrchestrationLimits::default(),
+        memory_store: Some(ms.clone()),
+        permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
+        permission_pending: PermissionResolver::new().1,
+        preauth_profile: None,
+    };
+
+    // Sequential: one-at-a-time, order preserved, all Ok.
+    let r1 = run_template_collect(&make_env(b.mem_store()), &subtasks,
+        OrchestrationTemplate::Sequential, "root-tseq", "s").await;
+    assert_eq!(r1.len(), 3);
+    let roles1: Vec<&str> = r1.iter().map(|x| x.role.as_str()).collect();
+    assert_eq!(roles1, vec!["t1", "t2", "t3"], "sequential must preserve order");
+    assert!(r1.iter().all(|x| x.status == SubAgentStatus::Ok));
+
+    // Parallel: all workers, all Ok, aggregated.
+    let r2 = run_template_collect(&make_env(b.mem_store()), &subtasks,
+        OrchestrationTemplate::Parallel, "root-tpar", "s").await;
+    assert_eq!(r2.len(), 3);
+    assert!(r2.iter().all(|x| x.status == SubAgentStatus::Ok));
+    eprintln!("PHASE0 template-collect dispatch: seq={} par={}", r1.len(), r2.len());
+}
+// ---------------------------------------------------------------------------
+// T10: run_loop_collect bounded deep-dive rounds (single role, loop template).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase0_run_loop_collect_produces_bounded_unique_rounds() {
+    use crate::managed::parallel::{ParallelEnv, run_loop_collect};
+    use crate::config::OrchestrationLimits;
+
+    let b = Bench::new(2).await;
+    let make_env = |ms: Arc<MemoryStore>| ParallelEnv {
+        provider: b.provider.clone(),
+        tools: b.tools.clone(),
+        working_dir: b.working.to_string_lossy().to_string(),
+        workspace_dir: b.workspace.to_string_lossy().to_string(),
+        model: "mock".into(),
+        max_iterations: 5,
+        context_window: 128000,
+        max_inline_chars: 120000,
+        tool_timeout_secs: 30,
+        max_tool_retries: 0,
+        two_tier_memory: false,
+        limits: OrchestrationLimits::default(),
+        memory_store: Some(ms.clone()),
+        permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
+        permission_pending: PermissionResolver::new().1,
+        preauth_profile: None,
+    };
+
+    let results = run_loop_collect(&make_env(b.mem_store()), "dig",
+        "bounded read-only deep-dive", 3, "root-loop", "s").await;
+    // Loop runs at most max_rounds rounds; only Ok results are retained.
+    assert!(!results.is_empty(), "loop must produce at least one round");
+    assert!(results.len() <= 3, "loop must be bounded by max_rounds");
+    // Each round is a distinct role instance (anti-collision).
+    let mut seen = std::collections::HashSet::new();
+    for r in &results {
+        assert!(seen.insert(r.role.clone()), "round role must be unique");
+        assert_eq!(r.status, SubAgentStatus::Ok);
+    }
+    eprintln!("PHASE0 run_loop_collect rounds={}", results.len());
+}

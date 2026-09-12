@@ -415,6 +415,8 @@ impl ManagedRunner {
             // F10: human-gate tracking — consecutive rounds with no progress
             // (no new findings, actions, or lead changes) trigger intervention.
             let mut stale_rounds: usize = 0;
+            // T6.2: degradation-A bounded re-run budget across rounds (parallel collect).
+            let mut parallel_reruns: usize = 0;
             // Signature of the most recent verified/active content. Robust to FIFO
             // caps on findings/leads (lengths saturate; identity still advances).
             let mut last_progress: String = progress_marker(&contract);
@@ -807,20 +809,56 @@ impl ManagedRunner {
                             permission_pending: permission_pending.clone(),
                             preauth_profile: Some(permission_profile.clone()),
                         };
-                        let p_results = crate::managed::parallel::run_parallel_collect(
-                            &parl, &plan.parallel_subtasks, &contract_id, &session).await;
+                        let round_task_id = format!("round-{}", round);
+                        // ── §7.5 single-writer gate (deterministic + LLM semantic) ──
+                        // The deterministic `audit_aggregate` runs BEFORE state is
+                        // persisted. Pass/Uncertain => the LLM semantic Auditor layer
+                        // (T6.1) also weighs in; semantic may only DEMOTE, never grant
+                        // verified state on its own. Hard Fail => degrade without LLM.
+                        // Degradation A (T6.2): if not certified and the bounded re-run
+                        // budget is not exhausted, re-run the read-only collect before
+                        // folding option-B (partial results + divergence).
+                        let round_obj = format!("round {} objective: {}", round + 1, plan.subtask);
+                        let mut p_results = crate::managed::parallel::run_template_collect(
+                            &parl, &plan.parallel_subtasks, orchestration_limits.template,
+                            &contract_id, &session).await;
+                        let mut semantic_reason: Option<String> = None;
+                        let mut verdict = crate::agent::orchestration::audit_aggregate(&p_results);
+                        const PARALLEL_RERUN_CAP: usize = 2;
+                        let mut attempt: usize = 0;
+                        let promote = loop {
+                            let mut prom = matches!(verdict, crate::agent::orchestration::AuditVerdict::Pass);
+                            if matches!(verdict, crate::agent::orchestration::AuditVerdict::Pass
+                                        | crate::agent::orchestration::AuditVerdict::Uncertain(_)) {
+                                if let Some(aud) = auditor.audit_subagent_aggregate(
+                                    &plan.parallel_subtasks, &p_results, &round_obj).await
+                                {
+                                    if !aud.passed {
+                                        prom = false;
+                                        semantic_reason = Some(aud.reason);
+                                    }
+                                }
+                            }
+                            if !prom && attempt < PARALLEL_RERUN_CAP {
+                                attempt += 1;
+                                parallel_reruns += 1;
+                                info!("[managed:{}] Parallel degradation-A re-run {}/{}",
+                                    session, attempt, PARALLEL_RERUN_CAP);
+                                let p2 = crate::managed::parallel::run_template_collect(
+                                    &parl, &plan.parallel_subtasks, orchestration_limits.template,
+                            &contract_id, &session).await;
+                                p_results = p2;
+                                semantic_reason = None;
+                                verdict = crate::agent::orchestration::audit_aggregate(&p_results);
+                                continue;
+                            }
+                            break prom;
+                        };
+                        // Brief reflects the FINAL (possibly re-run) results.
                         let p_brief = crate::managed::parallel::render_collect_brief(&p_results);
                         if !p_brief.is_empty() {
                             b.push_str(&p_brief);
                         }
-                        let round_task_id = format!("round-{}", round);
-                        // §7.5 single-writer gate: the deterministic auditor
-                        // runs BEFORE state is persisted. Pass => promote worker
-                        // results into trustworthy records; Fail/Uncertain =>
-                        // degrade to untrusted + open lead (partial results +
-                        // divergence note), never enter verified state.
-                        let disposition = crate::managed::parallel::collect_disposition(&p_results);
-                        let promote = matches!(disposition, crate::managed::parallel::CollectDisposition::Promote);
                         for r in &p_results {
                             let ok = r.status == crate::context::SubAgentStatus::Ok;
                             let st = if ok { "ok" } else { "non-ok" };
@@ -844,13 +882,15 @@ impl ManagedRunner {
                                 depends_on: Vec::new(),
                             });
                         }
-                        // §7.5 degradation (option B): record partial results and
-                        // divergence as a structured open lead + note.
+                        // §7.5 degradation (B): record partial results and divergence
+                        // as a structured open lead + note. Reason prefers the semantic
+                        // layer's verdict, else the deterministic verdict.
                         if !promote {
-                            let reason = match disposition {
-                                crate::managed::parallel::CollectDisposition::Degrade(r) => r,
+                            let reason = semantic_reason.clone().unwrap_or_else(|| match &verdict {
+                                crate::agent::orchestration::AuditVerdict::Fail(r)
+                                | crate::agent::orchestration::AuditVerdict::Uncertain(r) => r.clone(),
                                 _ => "unknown".to_string(),
-                            };
+                            });
                             contract.add_lead(
                                 &format!("Parallel collect not certified (round {})", round + 1),
                                 &reason,

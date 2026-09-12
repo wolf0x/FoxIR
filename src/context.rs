@@ -735,4 +735,34 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["ir_persistence", "shell_exec", "sys_process"]);
     }
+
+    #[test]
+    fn subagent_child_keeps_skills_disabled_read_only() {
+        use crate::context::SubagentChildParams;
+        use std::sync::atomic::AtomicBool;
+        use crate::permission::PermissionResolver;
+        let ctx = InvocationContext::subagent_child(SubagentChildParams {
+            run_id: "r1".into(),
+            role: "w".into(),
+            model: "mock".into(),
+            max_iterations: 5,
+            parent_invocation_id: "p".into(),
+            root_invocation_id: "root".into(),
+            parent_depth: 0,
+            permissions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            permission_pending: PermissionResolver::new().1,
+            preauth_profile: None,
+            context_window: 128000,
+            enable_context_scaling: true,
+            max_inline_chars: 120000,
+            tool_timeout_secs: 60,
+            max_tool_retries: 0,
+            ended: std::sync::Arc::new(AtomicBool::new(false)),
+        });
+        // §20.3 B4.3 / §7.6: worker stays strategy-level skill-off by construction.
+        assert_eq!(ctx.skill_listing_strategy, crate::skill::SkillListingStrategy::Disabled);
+        assert_eq!(ctx.mode, crate::context::AgentMode::Expert);
+        assert!(!ctx.can_spawn, "worker must be read-only (no grandchildren)");
+        assert_eq!(ctx.session_kind, crate::context::SessionKind::SubAgent);
+    }
 }

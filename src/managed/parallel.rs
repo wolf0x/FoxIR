@@ -125,6 +125,56 @@ pub async fn run_parallel_collect(
     results
 }
 
+/// Dispatch the declared parallel subtasks through the shared workflow template
+/// selected by `OrchestrationLimits.template` (SDD v1.5 §10 / T6.3). Sequential
+/// runs the workers one at a time (fail-fast); Parallel spawns all then
+/// aggregates. Empty subtasks => empty result (legacy single-Executor path kept).
+pub async fn run_template_collect(
+    env: &ParallelEnv,
+    subtasks: &[ParallelSubtask],
+    template: crate::config::OrchestrationTemplate,
+    root_id: &str,
+    root_session: &str,
+) -> Vec<SubAgentResult> {
+    use crate::agent::workflow::{parallel, sequential, WorkflowStep};
+    if subtasks.is_empty() {
+        return Vec::new();
+    }
+    let steps: Vec<WorkflowStep> = subtasks.iter().map(|ps| {
+        WorkflowStep::new(ps.role.clone(), ps.task.clone())
+            .with_timeout(Some(env.limits.default_timeout_secs))
+    }).collect();
+    let orch = env.orchestrator(root_id, root_session);
+    match template {
+        crate::config::OrchestrationTemplate::Sequential => {
+            sequential(&orch, root_id, &steps).await
+        }
+        crate::config::OrchestrationTemplate::Parallel => {
+            parallel(&orch, root_id, &steps).await
+        }
+    }
+}
+
+/// Loop template entry (SDD v1.5 §10): iterate `max_rounds` deep-dive rounds on a
+/// single role until the predicate is met or rounds are exhausted. Exposed for
+/// the deterministic CLI self-test; the ManagedRunner's outer loop already
+/// embodies Loop across rounds.
+pub async fn run_loop_collect(
+    env: &ParallelEnv,
+    role: &str,
+    plan_prompt: &str,
+    max_rounds: usize,
+    root_id: &str,
+    root_session: &str,
+) -> Vec<SubAgentResult> {
+    use crate::agent::workflow::{loop_until};
+    if max_rounds == 0 {
+        return Vec::new();
+    }
+    let orch = env.orchestrator(root_id, root_session);
+    loop_until(&orch, root_id, role, plan_prompt, max_rounds, |_| false).await
+}
+
 /// Single-writer collect disposition driven by the deterministic auditor
 /// (SDD v1.5 §7.5 "Auditor 先于落盘"). The Manager uses this to decide whether
 /// the aggregated worker results are promoted into verified/persisted state
