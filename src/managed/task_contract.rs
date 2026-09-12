@@ -717,7 +717,7 @@ mod tests {
         // set_orchestrator_plan stores a serialized JSON value; value() restores it.
         let mut c2 = TaskContract::new("c2".into(), "task".into(), "scope".into(), 5);
         assert_eq!(c2.orchestrator_plan, None);
-        let plan = serde_json::json!({ "subtask": "recon", "parallel_subtasks": [] });
+        let plan = serde_json::json!({ "subtask": "recon" });
         c2.set_orchestrator_plan(&plan);
         assert!(c2.orchestrator_plan.is_some());
         assert_eq!(c2.orchestrator_plan_value(), Some(plan.clone()));

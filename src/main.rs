@@ -26,8 +26,6 @@ mod log;
 #[allow(dead_code)]
 mod managed;
 mod memory;
-#[allow(dead_code)]
-mod orch_selftest;
 mod model;
 mod model_store;
 mod permission;
@@ -490,39 +488,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wrap registry in Arc<RwLock> for dynamic MCP tool registration
     let shared_tools = Arc::new(tokio::sync::RwLock::new(registry));
-
-    // ── Orchestrator self-test (expert multi-agent template verification) ──
-    // Deterministic: drives the Orchestrator directly with the real model, so
-    // sub-agent spawning is guaranteed and observable regardless of whether the
-    // Manager LLM volunteers `Parallel Subtasks`. Usage:
-    //   FoxIR.exe --orch-self-test <sequential|parallel|loop> [n]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if let Some(pos) = args.iter().position(|a| a == "--orch-self-test") {
-            let tmpl = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("parallel").to_lowercase();
-            let n: usize = args.get(pos + 2).and_then(|s| s.parse().ok()).unwrap_or(3);
-            if let Some(model_name) = model_names.first().cloned() {
-                println!("[orch-self-test] model={} template={} workers={}", model_name, tmpl, n);
-                if tmpl == "loop" {
-                    crate::orch_selftest::run_loop(
-                        &workspace_dir, "deepdive", n, provider.clone(), shared_tools.clone(), &model_name).await?;
-                } else {
-                    crate::orch_selftest::run(
-                        &workspace_dir,
-                        crate::config::OrchestrationTemplate::parse(&tmpl),
-                        n,
-                        provider.clone(),
-                        shared_tools.clone(),
-                        &model_name,
-                    ).await?;
-                }
-            } else {
-                println!("[orch-self-test] no model configured in models.json; nothing to run");
-            }
-            return Ok(());
-        }
-    }
-
 
     // Create browser session early so it can be shared between agent (cleanup) and tool (use)
     let browser_session = crate::tool::browser_cdp::BrowserSession::new(workspace_dir.clone());

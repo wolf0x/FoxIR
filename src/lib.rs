@@ -27,7 +27,6 @@ pub mod interject;
 pub mod log;
 pub mod managed;
 pub mod memory;
-pub mod orch_selftest;
 pub mod model;
 pub mod model_store;
 pub mod permission;

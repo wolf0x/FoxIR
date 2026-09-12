@@ -128,18 +128,31 @@ graph TB
 | D4 | Skills/MCP 能力路由 | 融入，提示词级两层决策框架，复用现有基建，不新建代码路由器 |
 | D5 | 编排器运行时 | 不重写，门控从 Expert 翻转至 Instant |
 | D6 | 子代理嵌套 | 保持 depth=1、can_spawn=false、without_skills |
+| D10 | Git 基线策略 | **留在 feature/multi-agent-orchestration 分支，不回滚到 c4a6eb7**。原因：c4a6eb7（远程 main v1.0.5）虽是干净纯串行 Expert，但**缺编排运行时**（无 orchestration.rs/event_pump，Instant 所需）且**缺 STOP 修复**（卡死 bug 仍在）。编排运行时与 Expert 并行接线虽同在 58eb55c 落地、共享 context/config 依赖，但 parallel.rs 依赖 orchestration.rs（反向不成立），故在 feature 分支上有界剥离比从 c4a6eb7 搬回运行时更低风险。P1 完成后 `merge origin/main` 吸收 shell 回收站修复（0914b81）+ v1.0.5。 |
 
 ---
 
 ## 6. 改造范围（分模块）
 
 ### 6.1 Expert 剥离（D3）
+
+**删除（Expert 专属并行接线）**：
 | 文件 | 改动 |
 |---|---|
-| [runner.rs](file:///e:/VSCode/FoxIR/src/managed/runner.rs) | 删 `bounded_parallel_collect`、`ParallelOutcome`、L876-L1078 并行分支、`audit_subagent_aggregate` 调用 |
-| [manager.rs](file:///e:/VSCode/FoxIR/src/managed/manager.rs) | 删 `ManagerPlan.parallel_subtasks` 字段、解析逻辑、`PendingPlan` 内对应字段 |
-| [parallel.rs](file:///e:/VSCode/FoxIR/src/managed/parallel.rs) | 整文件废弃（模板收集为 Expert 特有；Instant 走 agent 自主工具模式，不复用） |
+| [parallel.rs](file:///e:/VSCode/FoxIR/src/managed/parallel.rs) | 整文件删除 + managed/mod.rs 的 mod 声明（ParallelEnv/run_template_collect/run_loop_collect/spec_for） |
+| [runner.rs](file:///e:/VSCode/FoxIR/src/managed/runner.rs) | 删 `ParallelOutcome` enum（L206-214）、`bounded_parallel_collect`（L221-238）、round loop 并行分支（L876-1078）、`audit_subagent_aggregate` 调用 |
+| [manager.rs](file:///e:/VSCode/FoxIR/src/managed/manager.rs) | 删 `ParallelSubtask` struct、`ManagerPlan.parallel_subtasks`、`PendingPlan.parallel_subtasks`、解析逻辑（L385-482 相关段） |
+| [orch_selftest.rs](file:///e:/VSCode/FoxIR/src/orch_selftest.rs) | 整文件删除（并行自测）+ main.rs CLI selftest 接线（L511-512）+ mod 声明 |
+| [phase0_acceptance.rs](file:///e:/VSCode/FoxIR/src/phase0_acceptance.rs) | 删 `phase0_template_collect_dispatches_sequential_and_parallel`、run_loop_collect 用例；`phase0_audit_aggregate_verdicts` 视 audit_aggregate 去留 |
 | [task_contract.rs](file:///e:/VSCode/FoxIR/src/managed/task_contract.rs) | 清理 `orchestrator_plan` 中 parallel 相关持久化（如有） |
+
+**保留（模式无关运行时，供 Instant 复用）**：
+- [orchestration.rs](file:///e:/VSCode/FoxIR/src/agent/orchestration.rs)（Orchestrator/spawn/wait/audit_aggregate/AuditVerdict/注册表）、[event_pump.rs](file:///e:/VSCode/FoxIR/src/agent/event_pump.rs)、[tool/orchestration.rs](file:///e:/VSCode/FoxIR/src/tool/orchestration.rs)（7 工具）、context.rs SubAgent 类型、config.rs `OrchestrationLimits`。
+
+**待评估**：
+- config.rs `OrchestrationTemplate`（Sequential/Parallel）：若仅 parallel.rs 使用则删；若 Instant 复用则留。
+- server.rs `orchestration_limits` 字段（L182-183）：保留（Instant 编排复用），改注释。
+- `audit_aggregate`/`AuditVerdict`：剥离后若暂无引用，保留给 Instant 汇总或标记 dead_code。
 
 > 区分：Expert 旧并行 = **计划声明式**（plan.parallel_subtasks → 模板收集）；Instant 新编排 = **Agent 自主式**（LLM 调 spawn/wait 工具）。两者路径不同，故 parallel.rs 随 Expert 剥离废弃，orchestration.rs 保留迁 Instant。
 
