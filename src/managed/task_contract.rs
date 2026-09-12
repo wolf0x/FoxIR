@@ -216,6 +216,31 @@ pub struct OpenLead {
     pub reason: Option<String>,
 }
 
+/// A single round's independent Auditor verdict, retained as the trusted
+/// cross-round memory the Manager plans forward from (LongHorizon-Harness
+/// style: auditor reports are the authority for trusted intermediate state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundAudit {
+    /// Round index this audit belongs to (1-based, matches the displayed round).
+    #[serde(default)]
+    pub round_index: usize,
+    /// completion: complete | incomplete | blocked.
+    #[serde(default)]
+    pub completion: String,
+    /// integrity: clean | suspect | violation.
+    #[serde(default)]
+    pub integrity: String,
+    /// One-sentence reviewer note.
+    #[serde(default)]
+    pub note: String,
+    /// Facts the auditor independently corroborated.
+    #[serde(default)]
+    pub supported_facts: Vec<String>,
+    /// Unmet requirements / open gaps.
+    #[serde(default)]
+    pub gaps: Vec<String>,
+}
+
 /// The TaskContract — persistent state for a managed task.
 ///
 /// This struct is serialized to JSON and stored in SQLite. It is the sole
@@ -287,6 +312,11 @@ pub struct TaskContract {
     /// can be re-seeded onto a fresh Orchestrator on resume.
     #[serde(default)]
     pub orchestrator_plan: Option<String>,
+
+    /// Per-round independent Auditor reports (ordered), surfaced to the
+    /// Manager as the trusted cross-round memory / failure evidence.
+    #[serde(default)]
+    pub round_audits: Vec<RoundAudit>,
 }
 
 impl TaskContract {
@@ -320,6 +350,8 @@ impl TaskContract {
             prior_handoff: None,
             pending_plan: None,
             orchestrator_plan: None,
+
+            round_audits: Vec::new(),
         }
     }
 
@@ -394,10 +426,39 @@ impl TaskContract {
             brief.push('\n');
         }
 
-        if !self.manager_notes.is_empty() {
+        // D2: only surface notes that carry durable signal (audit guard / user
+        // resume / clarification / parallel guidance), plus the most recent note.
+        // Filter out verbose per-round "Round N: <executor output>" summaries so
+        // the Executor is not distracted by stale noise. Capped to the last 6.
+        let relevant_notes: Vec<&String> = self.manager_notes.iter()
+            .rev()
+            .take(6)
+            .filter(|n| {
+                n.starts_with("[Audit Guard]") || n.starts_with("[User Resume]")
+                    || n.starts_with("[Clarify]") || n.starts_with("[Parallel]")
+                    || n.starts_with("[Simulated Human Guidance]")
+                    || !n.starts_with("Round ")
+            })
+            .collect();
+        if !relevant_notes.is_empty() {
             brief.push_str("## Manager Notes\n");
-            for note in &self.manager_notes {
+            for note in relevant_notes.iter().rev() {
                 brief.push_str(&format!("- {}\n", note));
+            }
+            brief.push('\n');
+        }
+
+        // D2: surface the most recent independent Audit verdict so the Executor
+        // knows what was already verified / still open without re-discovering it.
+        if let Some(rp) = self.round_audits.last() {
+            brief.push_str("## Most Recent Audit Verdict (what this subtask builds on)\n");
+            brief.push_str(&format!("completion={}, integrity={}\n", rp.completion, rp.integrity));
+            if !rp.supported_facts.is_empty() {
+                brief.push_str(&format!("Verified: {}\n", rp.supported_facts.join("; ")));
+            }
+            if !rp.gaps.is_empty() {
+                let gaps: Vec<&str> = rp.gaps.iter().take(4).map(|s| s.as_str()).collect();
+                brief.push_str(&format!("Open: {}\n", gaps.join("; ")));
             }
             brief.push('\n');
         }
@@ -610,6 +671,29 @@ impl TaskContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_audits_default_empty_and_roundtrip() {
+        // Old contracts without the new field must load with an empty list.
+        let old = r#"{"id":"c1","original_task":"t","phase":"collection","scope":"s","hypothesis":"","verified_findings":[],"verified_actions":[],"open_leads":[],"remaining_work":[],"current_focus":null,"backtracks":0,"current_round":0,"max_rounds":10,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","manager_notes":[],"records":[]}"#;
+        let c: TaskContract = serde_json::from_str(old).unwrap();
+        assert!(c.round_audits.is_empty());
+
+        let mut c2 = TaskContract::new("c2".into(), "task".into(), "s".into(), 5);
+        c2.round_audits.push(RoundAudit {
+            round_index: 1,
+            completion: "incomplete".into(),
+            integrity: "suspect".into(),
+            note: "port scan cites no evidence".into(),
+            supported_facts: vec!["443 open".into()],
+            gaps: vec!["need process mapping".into()],
+        });
+        let json = c2.to_json().unwrap();
+        let back: TaskContract = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.round_audits.len(), 1);
+        assert_eq!(back.round_audits[0].supported_facts, vec!["443 open"]);
+        assert_eq!(back.round_audits[0].note, "port scan cites no evidence");
+    }
 
     #[test]
     fn task_record_old_json_backward_compatible() {

@@ -202,6 +202,31 @@ fn manager_user_prompt(contract: &TaskContract) -> String {
     prompt.push_str(&format!("# Current Phase\n{:?}\n\n", contract.phase));
     prompt.push_str(&format!("# Round\n{} of {}\n\n", contract.current_round + 1, contract.max_rounds));
 
+    // D1: surface the per-round independent Auditor reports as the trusted
+    // cross-round memory / failure evidence (LongHorizon-Harness style). The
+    // Manager plans forward from these VERIFIED intermediate verdicts instead
+    // of re-discovering state. Bounded to the most recent 6 rounds.
+    if !contract.round_audits.is_empty() {
+        prompt.push_str("# Prior Round Auditor Reports (TRUSTED intermediate state)\n");
+        prompt.push_str("These are independent, read-only Auditor verdicts from completed rounds. Plan forward from them; do NOT redo, re-fetch, or re-collect anything they mark complete/clean. Use their gaps to target the next subtask.\n\n");
+        let start = contract.round_audits.len().saturating_sub(6);
+        for rp in contract.round_audits.iter().skip(start) {
+            let note: String = rp.note.chars().take(1400).collect();
+            prompt.push_str(&format!("--- Round {} auditor report (completion={}, integrity={}) ---\n", rp.round_index, rp.completion, rp.integrity));
+            if !rp.supported_facts.is_empty() {
+                prompt.push_str(&format!("Verified facts:\n- {}\n", rp.supported_facts.join("\n- ")));
+            }
+            if !rp.gaps.is_empty() {
+                let gaps: Vec<&str> = rp.gaps.iter().take(5).map(|s| s.as_str()).collect();
+                prompt.push_str(&format!("Open gaps:\n- {}\n", gaps.join("\n- ")));
+            }
+            if !note.is_empty() {
+                prompt.push_str(&format!("Note: {}\n", note));
+            }
+            prompt.push('\n');
+        }
+    }
+
     // Surface distilled prior-session (Instant) context prominently so the Manager
     // plans Round 1 from prior discoveries instead of redoing completed collection.
     if let Some(ph) = &contract.prior_handoff {
@@ -322,6 +347,14 @@ fn manager_user_prompt(contract: &TaskContract) -> String {
             budget_pct
         ));
     }
+    // D4: last-round guard (LongHorizon-Harness). With only one round left, do
+    // NOT schedule a prerequisite-only subtask that deliberately postpones core
+    // requirements; route the most complete, directly executable subtask possible,
+    // or Ask/Block when completion is impossible.
+    if remaining == 1 {
+        prompt.push_str("\n⚠️ FINAL-ROUND GUARD: This is the LAST round. Do NOT schedule a prerequisite-only / data-prep / 'summarize' subtask that postpones the core deliverable. Pick the single most complete subtask you can finish now toward the original task\'s acceptance criteria. If the agreed completion is impossible in one round, either produce the best partial verified state or set Route = blocked:<reason>.\n\n");
+    }
+
 
     // If user sent a resume message, surface it prominently
     let user_resume_notes: Vec<&String> = contract.manager_notes.iter()

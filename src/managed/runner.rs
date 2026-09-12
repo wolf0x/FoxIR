@@ -1207,6 +1207,21 @@ impl ManagedRunner {
                         "supported_facts": rp.supported_facts,
                         "gaps": rp.gaps,
                     }));
+                    // D1: retain this round's independent Auditor verdict as the
+                    // trusted cross-round memory the Manager plans forward from
+                    // (LongHorizon-Harness style). Bounded to the most recent rounds.
+                    contract.round_audits.push(crate::managed::task_contract::RoundAudit {
+                        round_index: round + 1,
+                        completion: rp.completion.clone(),
+                        integrity: rp.integrity.clone(),
+                        note: rp.note.clone(),
+                        supported_facts: rp.supported_facts.clone(),
+                        gaps: rp.gaps.clone(),
+                    });
+                    if contract.round_audits.len() > 30 {
+                        let overflow = contract.round_audits.len() - 30;
+                        contract.round_audits.drain(0..overflow);
+                    }
                     info!("[managed:{}] Independent round audit: completion={}, integrity={}", session, rp.completion, rp.integrity);
                 }
                 // G0: never let a round appear "independently verified" when the auditor
