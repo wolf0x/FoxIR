@@ -1200,6 +1200,45 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
+
+/// Outcome of a best-effort, time-bounded WebSocket send.
+#[derive(Clone, Copy, PartialEq)]
+enum WsSendOutcome {
+    /// Sent and accepted by the client's read path.
+    Sent,
+    /// The send stalled (client not reading, or the shared sink mutex was
+    /// contended by another task) and the message was dropped so the agent
+    /// pipeline can keep advancing. The connection is still considered usable.
+    Dropped,
+    /// The send failed because the connection is closed / gone.
+    Closed,
+}
+
+/// Best-effort WebSocket send that is bounded in time. Without this, a slow or
+/// stalled browser tab (TCP/WS backpressure, or another task holding the shared
+/// sink mutex across a long `send` await) freezes the single server event loop,
+/// which in turn back-pressures the bounded Manager->Executor channels and can
+/// deadlock an entire multi-agent run with no recovery. On timeout we drop the
+/// message and continue instead of blocking forever.
+async fn ws_send_bounded(
+    ws_sink: &Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
+    msg: String,
+) -> WsSendOutcome {
+    use futures::SinkExt;
+    let fut = async {
+        let mut sink = ws_sink.lock().await;
+        sink.send(Message::Text(msg.into())).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+        Ok(Ok(())) => WsSendOutcome::Sent,
+        Ok(Err(_)) => WsSendOutcome::Closed,
+        Err(_) => {
+            warn!("ws send timed out; dropping 1 message to avoid pipeline deadlock");
+            WsSendOutcome::Dropped
+        }
+    }
+}
+
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     use futures::SinkExt;
 
@@ -1276,10 +1315,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     let mut notify_rx = state.notify_tx.subscribe();
     let notify_sink = ws_sink.clone();
     tokio::spawn(async move {
-        use futures::SinkExt;
         while let Ok(msg) = notify_rx.recv().await {
-            let mut sink = notify_sink.lock().await;
-            if sink.send(Message::Text(msg.into())).await.is_err() {
+            if matches!(ws_send_bounded(&notify_sink, msg).await, WsSendOutcome::Closed) {
                 break;
             }
         }
@@ -1771,22 +1808,43 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             match run_result {
                                 Ok(mut event_stream) => {
                                     let mut assistant_text = String::new();
+                                    let mut srv_events: u64 = 0;
+                                    let mut srv_last = std::time::Instant::now();
                                     loop {
                                         tokio::select! {
                                             // Agent event
                                             result = event_stream.next() => {
                                                 match result {
                                                     Some(Ok(event)) => {
+                                                        srv_events += 1;
+                                                        if srv_last.elapsed().as_secs() >= 5 {
+                                                            info!("[managed:{}] server event loop alive: {} events", session_id, srv_events);
+                                                            srv_last = std::time::Instant::now();
+                                                        }
                                                         if let AgentEvent::TextDelta { content: c, .. } = &event {
                                                             assistant_text.push_str(c);
                                                         }
                                                         // Persist token usage to database
                                                         if let AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
-                                                            let _ = state.memory_store.record_usage(model, *prompt_tokens, *completion_tokens, *total_tokens, &session_id);
+                                                            {
+                                                        // record_usage is a synchronous SQLite write guarded by a
+                                                        // std::sync::Mutex inside the async event loop. Called inline it
+                                                        // can block a runtime thread and, under DB contention, freeze the
+                                                        // whole Manager->Executor pipeline (server stops draining).
+                                                        // Move it off the hot path so the loop always keeps consuming.
+                                                        let ms = state.memory_store.clone();
+                                                        let mdl = model.clone();
+                                                        let pt = *prompt_tokens;
+                                                        let ct = *completion_tokens;
+                                                        let tt = *total_tokens;
+                                                        let sid = session_id.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
+                                                        });
+                                                    }
                                                         }
                                                         let msg_str = event.to_ws_message();
-                                                        let mut sink = ws_sink.lock().await;
-                                                        if sink.send(Message::Text(msg_str.into())).await.is_err() {
+                                                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
                                                             break;
                                                         }
                                                         if event.is_done() {
@@ -1796,8 +1854,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                                     Some(Err(e)) => {
                                                         let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                                         let msg_str = err_event.to_ws_message();
-                                                        let mut sink = ws_sink.lock().await;
-                                                        let _ = sink.send(Message::Text(msg_str.into())).await;
+                                                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                                         break;
                                                     }
                                                     None => break,
@@ -1900,11 +1957,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                             }
                                             let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
                                             let msg_str = stop_event.to_ws_message();
-                                            let mut sink = ws_sink.lock().await;
-                                            let _ = sink.send(Message::Text(msg_str.into())).await;
+                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                             let done_event = AgentEvent::done(&session_id, "system");
                                             let msg_str = done_event.to_ws_message();
-                                            let _ = sink.send(Message::Text(msg_str.into())).await;
+                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                             // Distill any durable facts from the interrupted turn so that
                                             // information provided right before Stop (e.g. target/credentials)
                                             // still lands in deep memory and survives a process restart.
@@ -1944,8 +2000,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 Err(e) => {
                                     let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                     let msg_str = err_event.to_ws_message();
-                                    let mut sink = ws_sink.lock().await;
-                                    let _ = sink.send(Message::Text(msg_str.into())).await;
+                                    let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                 }
                             }
                         }
@@ -2047,21 +2102,42 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             ).await {
                                 Ok(mut event_stream) => {
                                     let mut assistant_text = String::new();
+                                    let mut srv_events: u64 = 0;
+                                    let mut srv_last = std::time::Instant::now();
                                     loop {
                                         tokio::select! {
                                             result = event_stream.next() => {
                                                 match result {
                                                     Some(Ok(event)) => {
+                                                        srv_events += 1;
+                                                        if srv_last.elapsed().as_secs() >= 5 {
+                                                            info!("[managed:{}] server event loop alive: {} events", session_id, srv_events);
+                                                            srv_last = std::time::Instant::now();
+                                                        }
                                                         if let AgentEvent::TextDelta { content: c, .. } = &event {
                                                             assistant_text.push_str(c);
                                                         }
                                                         // Persist token usage to database
                                                         if let AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
-                                                            let _ = state.memory_store.record_usage(model, *prompt_tokens, *completion_tokens, *total_tokens, &session_id);
+                                                            {
+                                                        // record_usage is a synchronous SQLite write guarded by a
+                                                        // std::sync::Mutex inside the async event loop. Called inline it
+                                                        // can block a runtime thread and, under DB contention, freeze the
+                                                        // whole Manager->Executor pipeline (server stops draining).
+                                                        // Move it off the hot path so the loop always keeps consuming.
+                                                        let ms = state.memory_store.clone();
+                                                        let mdl = model.clone();
+                                                        let pt = *prompt_tokens;
+                                                        let ct = *completion_tokens;
+                                                        let tt = *total_tokens;
+                                                        let sid = session_id.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
+                                                        });
+                                                    }
                                                         }
                                                         let msg_str = event.to_ws_message();
-                                                        let mut sink = ws_sink.lock().await;
-                                                        if sink.send(Message::Text(msg_str.into())).await.is_err() {
+                                                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
                                                             break;
                                                         }
                                                         if event.is_done() {
@@ -2071,8 +2147,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                                     Some(Err(e)) => {
                                                         let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                                         let msg_str = err_event.to_ws_message();
-                                                        let mut sink = ws_sink.lock().await;
-                                                        let _ = sink.send(Message::Text(msg_str.into())).await;
+                                                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                                         break;
                                                     }
                                                     None => break,
@@ -2105,11 +2180,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                             info!("Agent execution stopped by user (resume)");
                                             let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
                                             let msg_str = stop_event.to_ws_message();
-                                            let mut sink = ws_sink.lock().await;
-                                            let _ = sink.send(Message::Text(msg_str.into())).await;
+                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                             let done_event = AgentEvent::done(&session_id, "system");
                                             let msg_str = done_event.to_ws_message();
-                                            let _ = sink.send(Message::Text(msg_str.into())).await;
+                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                             break;
                                         }
                                     }
@@ -2126,8 +2200,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 Err(e) => {
                                     let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                     let msg_str = err_event.to_ws_message();
-                                    let mut sink = ws_sink.lock().await;
-                                    let _ = sink.send(Message::Text(msg_str.into())).await;
+                                    let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                 }
                             }
                         }

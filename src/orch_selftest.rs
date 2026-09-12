@@ -36,9 +36,14 @@ pub async fn run(
         two_tier_memory: false,
         limits: OrchestrationLimits::default(),
         memory_store: Some(ms),
-        permissions: std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::permission::default_permissions(),
-        )),
+        permissions: {
+            // Headless selftest has no GUI/approver, so a narrowed permission map:
+            // allow the read-only `execute` category (the subtasks are explicitly
+            // read-only / no-write / no-containment), while `delete` etc. stay denied.
+            let mut perms = crate::permission::default_permissions();
+            perms.insert("execute".to_string(), true);
+            std::sync::Arc::new(tokio::sync::Mutex::new(perms))
+        },
         permission_pending: crate::permission::PermissionResolver::new().1,
         preauth_profile: None,
         plan_seed: None,
@@ -78,9 +83,14 @@ pub async fn run_loop(
         two_tier_memory: false,
         limits: OrchestrationLimits::default(),
         memory_store: Some(ms),
-        permissions: std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::permission::default_permissions(),
-        )),
+        permissions: {
+            // Headless selftest has no GUI/approver, so a narrowed permission map:
+            // allow the read-only `execute` category (the subtasks are explicitly
+            // read-only / no-write / no-containment), while `delete` etc. stay denied.
+            let mut perms = crate::permission::default_permissions();
+            perms.insert("execute".to_string(), true);
+            std::sync::Arc::new(tokio::sync::Mutex::new(perms))
+        },
         permission_pending: crate::permission::PermissionResolver::new().1,
         preauth_profile: None,
         plan_seed: None,

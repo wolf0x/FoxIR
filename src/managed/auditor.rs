@@ -106,6 +106,33 @@ pub struct AuditReport {
 /// Hybrid design:
 /// - Deterministic layer (code, zero token): file existence, process checks.
 /// - Semantic layer (LLM, optional): log interpretation, test results, evidence chains.
+/// Whether `path` lives at or under `root`, robust to the Windows path quirks
+/// that break a naive `Path::starts_with` comparison.
+///
+/// - `std::fs::canonicalize` returns a `\\?\` verbatim prefix on Windows for
+///   the (often canonicalized) root, while an artifact file's own `canonicalize`
+///   may fail and leave the plain `C:\...` form; mixing the two forms makes
+///   `starts_with` wrongly return false for a file that is actually inside.
+/// - Windows paths are case-insensitive, but `Path::starts_with` is case-sensitive.
+///
+/// We therefore normalize both sides before comparing: strip the verbatim prefix,
+/// unify separators, and (on Windows) lowercase everything.
+fn path_contained_in(path: &std::path::Path, root: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> std::path::PathBuf {
+        let mut s = p.to_string_lossy().into_owned();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") { s = rest.into(); }
+        if let Some(rest) = s.strip_prefix(r"\\?\") { s = rest.into(); }
+        s = s.replace('\\', "/");
+        if cfg!(windows) { s = s.to_lowercase(); }
+        std::path::PathBuf::from(s)
+    }
+    let pn = norm(path);
+    let rn = norm(root);
+    let pv: Vec<_> = pn.components().collect();
+    let rv: Vec<_> = rn.components().collect();
+    pv.len() >= rv.len() && pv[..rv.len()] == rv[..]
+}
+
 pub struct Auditor {
     tools: std::sync::Arc<tokio::sync::RwLock<ToolRegistry>>,
     working_dir: String,
@@ -222,7 +249,7 @@ impl Auditor {
         // canonicalized so ".." / symlink navigation cannot escape the round dir.
         let resolved = full_path.canonicalize().unwrap_or_else(|_| full_path.clone());
         let root = artifact_root.canonicalize().unwrap_or_else(|_| artifact_root.to_path_buf());
-        if !resolved.starts_with(&root) {
+        if !path_contained_in(&resolved, &root) {
             return AuditResult::fail(
                 path,
                 String::new(),
@@ -667,6 +694,32 @@ fn collect_audit_list(output: &str, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_contained_in_handles_verbatim_prefix() {
+        // The reported bug: canonicalize() returns a \\?\ verbatim prefix on
+        // Windows for the root, while an artifact's own canonicalize may fail
+        // and keep the plain C:\... form. A naive starts_with then wrongly
+        // reports the artifact as outside its round directory.
+        let root = std::path::Path::new(r"\\?\C:\Users\BUWO\.RustAgent\workspace\managed\abc");
+        let inside_plain = std::path::Path::new(r"C:/Users/BUWO/.RustAgent/workspace/managed/abc/ports.json");
+        let outside_plain = std::path::Path::new(r"C:/Users/BUWO/.RustAgent/workspace/managed/other/ports.json");
+        assert!(path_contained_in(inside_plain, root));
+        assert!(!path_contained_in(outside_plain, root));
+        // Verbatim-vs-plain is normalized on every platform.
+        let root_plain = std::path::Path::new(r"C:\Users\BUWO\.RustAgent\workspace\managed\abc");
+        assert!(path_contained_in(root_plain, root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_contained_in_is_case_insensitive_on_windows() {
+        // Windows is case-insensitive; Path::starts_with is not. Normalization
+        // lowercases both sides on Windows so .RustAgent vs .rustagent match.
+        let root = std::path::Path::new(r"C:\Users\BUWO\.rustagent\workspace\managed\abc");
+        let inside = std::path::Path::new(r"C:\Users\BUWO\.RustAgent\workspace\managed\abc\x.txt");
+        assert!(path_contained_in(inside, root));
+    }
 
     #[test]
     fn parse_aggregate_verdict_complete_means_pass() {

@@ -62,6 +62,35 @@ impl BlockRule {
         }
     }
 
+    /// Precise block for cmd-style disk format (`format C:` / `format /q`).
+    /// Only matches a `format` token followed by `/` or a drive letter + `:`,
+    /// so it cannot false-positive on PowerShell `-Format` / `Format-*` cmdlets
+    /// (which are blocked by their own dedicated rules).
+    pub fn cmd_format() -> Self {
+        Self {
+            name: "cmd_format",
+            matcher: Box::new(|intent: &ParsedIntent| {
+                let c = &intent.raw_lower;
+                let mut start = 0;
+                while let Some(idx) = c[start..].find("format") {
+                    let rest = c[start + idx + "format".len()..].trim_start();
+                    // cmd-style `format /q ...` or `format /fs:...`
+                    if rest.starts_with('/') {
+                        return true;
+                    }
+                    // cmd-style `format C:` / `format C: /q ...`
+                    let b = rest.as_bytes();
+                    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                        return true;
+                    }
+                    start = start + idx + 1;
+                }
+                false
+            }),
+            explanation: "disk format operation",
+        }
+    }
+
     /// Create a block rule for encoded/obfuscated commands.
     pub fn encoded_commands() -> Self {
         Self {
@@ -163,11 +192,11 @@ pub fn default_block_rules() -> Vec<BlockRule> {
         BlockRule::cmdlet("format_volume", "Format-Volume"),
         BlockRule::cmdlet("clear_disk", "Clear-Disk"),
         BlockRule::cmdlet("initialize_disk", "Initialize-Disk"),
-        BlockRule::pattern(
-            "cmd_format",
-            "format ",
-            "disk format operation",
-        ),
+        // Precise cmd-style disk format ONLY (`format C:` / `format /q`:), so we
+        // do NOT substring-match the bare "format " token — that false-positives
+        // on PowerShell `-Format '...'` and ordinary comments/text inside a command.
+        // Format-Volume / Clear-Disk / Initialize-Disk are already blocked above.
+        BlockRule::cmd_format(),
         BlockRule::pattern(
             "diskpart_clean",
             "clean all",
@@ -320,5 +349,26 @@ mod tests {
         let rules = default_block_rules();
         let intent = parse_intent("powershell -EncodedCommand RwBlAHQALgAuAC4A", "powershell");
         assert!(rules.iter().any(|r| r.matches(&intent)));
+    }
+
+    #[test]
+    fn test_cmd_format_blocks_cmd_disk_format_only() {
+        use crate::policy::parse::parse_intent;
+        // cmd-style disk format must be hard-blocked by the precise rule.
+        for cmd in ["format C:", "format /q", "format C: /fs:NTFS"] {
+            let intent = parse_intent(cmd, "cmd");
+            assert!(BlockRule::cmd_format().matches(&intent), "should BLOCK: {cmd}");
+        }
+        // PowerShell -Format usage / comments containing "format" must NOT match
+        // the cmd_format rule (they are not disk-format operations).
+        for (cmd, shell) in [
+            ("Get-ChildItem -Path . -Property Name | Out-String -Width 200 -Format Table", "powershell"),
+            ("# TODO: remember to format the report later", "powershell"),
+        ] {
+            let intent = parse_intent(cmd, shell);
+            assert!(!BlockRule::cmd_format().matches(&intent), "should NOT match cmd_format: {cmd}");
+            // And they must not be hard-blocked by any rule.
+            assert!(!default_block_rules().iter().any(|r| r.matches(&intent)), "should not hard-block: {cmd}");
+        }
     }
 }

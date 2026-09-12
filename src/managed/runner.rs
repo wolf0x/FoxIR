@@ -175,6 +175,21 @@ pub struct ManagedRunner {
 ///
 /// Robust to FIFO caps on findings/leads: list lengths can saturate, but the
 /// round_index/id of the newest item still advances when real work happens.
+/// Cap for a single injected skill body (chars). Full skill bodies (e.g.
+/// multi-step templates) can be tens of KB and are often irrelevant to the
+/// subtask; the cap keeps the Executor brief bounded against inject bloat.
+const INJECT_SKILL_CHARS: usize = 3000;
+
+/// Up to `n` chars of `s`, truncating at a newline boundary when possible.
+fn take(n: usize, s: &str) -> &str {
+    let n = n.min(s.len());
+    let cut = &s[..n];
+    if let Some(back) = cut.rfind('\n') {
+        if back > n / 2 { return &s[..back]; }
+    }
+    &s[..n]
+}
+
 fn progress_marker(c: &TaskContract) -> String {
     let find = c.verified_findings
         .last()
@@ -184,11 +199,13 @@ fn progress_marker(c: &TaskContract) -> String {
         .last()
         .map(|a| format!("{}:{}", a.round_index, a.id))
         .unwrap_or_default();
-    let lead = c.open_leads
-        .last()
-        .map(|l| format!("{}:{}", l.status, l.description))
-        .unwrap_or_default();
-    format!("{}/{}/{}", find, act, lead)
+    // Deliberately do NOT include open_leads.last(): the Manager commonly
+    // re-opens / rewrites open leads every round, so that term churns even when
+    // NO verified progress is made — which quietly suppressed the anti-stagnation
+    // gate (this is why the 8-round re-collection loop never tripped stale_rounds).
+    // Verified findings/actions are the durable "accepted progress" signal that
+    // should gate the human-escalation loop.
+    format!("{}/{}", find, act)
 }
 
 impl ManagedRunner {
@@ -729,11 +746,11 @@ impl ManagedRunner {
                         enriched.push_str("\n\n## Active Skills (pre-matched for this subtask)\n");
                         enriched.push_str(
                             "The following skill(s) matched this subtask. Follow their \
-                             workflows directly — no need to load them via file_read.\n\n"
+                             workflows directly — ONLY follow a skill whose workflow is DIRECTLY relevant to THIS subtask; ignore pre-matched skills that do not apply (do not load them).\n\n"
                         );
                         for (content, score) in &matched {
                             info!("[managed:{}] Injecting matched skill (score {:.3}) into Executor brief", session, score);
-                            enriched.push_str(content);
+                            enriched.push_str(&*take(INJECT_SKILL_CHARS, content));
                             enriched.push('\n');
                         }
                         enriched
@@ -1004,7 +1021,15 @@ impl ManagedRunner {
                         // Forward Executor events to the main stream and capture the
                         // assistant's final text for the TaskContract.
                         use futures::StreamExt;
+                        let mut exec_fwd_n: usize = 0;
+                        let mut exec_last_got = std::time::Instant::now();
+                        let mut exec_last_sent = std::time::Instant::now();
                         while let Some(result) = stream.next().await {
+                            exec_fwd_n += 1;
+                            if exec_last_got.elapsed().as_secs() >= 5 {
+                                info!("[managed:{}] exec round {} [hb] GOT event #{} (pre-forward)", session, round + 1, exec_fwd_n);
+                                exec_last_got = std::time::Instant::now();
+                            }
                             // STOP during an Executor round: abort so the underlying
                             // agent loop sees its consumer close and stops issuing
                             // tools (e.g. browser_cdp) instead of running on.
@@ -1056,7 +1081,12 @@ impl ManagedRunner {
                                 executor_output.push_str(content);
                             }
                             let _ = tx.send(result).await;
+                            if exec_last_sent.elapsed().as_secs() >= 5 {
+                                info!("[managed:{}] exec round {} [hb] FORWARDED event #{} (post-send)", session, round + 1, exec_fwd_n);
+                                exec_last_sent = std::time::Instant::now();
+                            }
                         }
+                        info!("[managed:{}] exec round {} stream CLOSED; forwarded {} event(s)", session, round + 1, exec_fwd_n);
                         info!("[managed:{}] Executor round {} completed", session, round + 1);
                     }
                     Err(e) => {

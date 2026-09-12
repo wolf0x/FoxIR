@@ -1187,7 +1187,27 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
     }
 }
 
+/// RAII lifecycle guard for a per-run Orchestrator owned by a spawned agent task.
+///
+/// Holds the strong `Arc<Orchestrator>` (and thus its clone of the event-stream
+/// `tx`) for the duration of the task, and unregisters it from the global map
+/// when the task ends by ANY path (normal completion, early return, or panic
+/// unwind). Without this, the registry's strong Arc keeps a `tx` clone alive
+/// after the agent loop finishes, so the event channel never closes and any
+/// consumer awaiting stream close (e.g. the ManagedRunner Executor forward
+/// loop) deadlocks forever.
+struct OrchLifecycle {
+    _orch: std::sync::Arc<crate::agent::orchestration::Orchestrator>,
+    key: String,
+}
+
+impl Drop for OrchLifecycle {
+    fn drop(&mut self) {
+        crate::agent::orchestration::unregister_orchestrator(&self.key);
+    }
+}
 #[async_trait]
+
 impl Agent for LlmAgent {
     fn name(&self) -> &str { &self.name }
     fn description(&self) -> &str { &self.description }
@@ -1423,6 +1443,8 @@ impl Agent for LlmAgent {
         let orch_key = ctx.base.invocation_id.clone();
 
         tokio::spawn(async move {
+            // Release the per-run Orchestrator when this task ends (by any path).
+            let _orch_life = orch.map(|o| OrchLifecycle { _orch: o, key: orch_key.clone() });
             // ── Initialize event log for crash recovery ──
             let mut event_log = event_log_path.as_ref().and_then(|p| {
                 match EventLog::open(p) {
@@ -2265,24 +2287,14 @@ impl Agent for LlmAgent {
             for s in &cleanup_sessions { let _ = s.close().await; }
         });
 
-        // Convert mpsc Receiver into a Stream
+        // Convert mpsc Receiver into a Stream.
+        // The per-run Orchestrator (if any) is released by `_orch_life` when the
+        // spawned task ends — by any path — which drops its clone of `tx` so the
+        // event channel closes and this stream terminates for the consumer. We
+        // must NOT gate unregister on stream close: doing so is a self-deadlock
+        // (the stream can only close once the registered Arc, which holds a `tx`
+        // clone, is removed — but removal only runs after the stream closes).
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        // If this run owns an orchestrator, keep it alive for the whole stream and
-        // unregister it once the stream is fully consumed so the process does not
-        // accumulate per-run orchestrator state.
-        if let Some(ref orch) = orch {
-            let key = orch_key.clone();
-            let _keep = orch.clone();
-            let stream = async_stream::stream! {
-                use futures::StreamExt as _;
-                let mut inner = Box::pin(stream);
-                while let Some(item) = inner.next().await {
-                    yield item;
-                }
-                crate::agent::orchestration::unregister_orchestrator(&key);
-            };
-            return Ok(Box::pin(stream));
-        }
         Ok(Box::pin(stream))
     }
 }
