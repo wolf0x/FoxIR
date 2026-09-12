@@ -418,3 +418,11 @@
 - **测试**：新增 `phase0_run_loop_collect_produces_bounded_unique_rounds`（≤max_rounds、只收 Ok、每轮 role 唯一）。全量 `cargo test --bin FoxIR` → **301 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+1 新测）。release 构建通过：`target/release/FoxIR.exe`。
 - **用法**：`FoxIR.exe --orch-self-test parallel 3` / `sequential 3` / `loop 2`（需 `models.json` 配好模型）。
 - **诚实标注**：`run_loop_collect`/CLI 用的真模型输出质量受当前 `models.json` 配置影响；selftest 是确定性驱动 Orchestrator 而非端到端 Manager 排产，后者仍受 Manager plan 是否声明 `Parallel Subtasks` 门控。
+## 2026-09-12 · T6.5：TaskContract ↔ `update_plan` 双向同步（§7.8.1 计划真源）
+
+- **Orchestrator**（`src/agent/orchestration.rs`）：新增 `plan_persist: Option<Arc<dyn Fn(&Value)+Send+Sync>>` 字段 + `set_plan_persist` / `seed_plan`；`update_plan` 现在先更新内存镜像（`plan`）再推入持久化 sink（memory→persist）。`seed_plan` 复用 `update_plan`，故恢复时也会落一次 sink（persist→memory 后保持锁步）。
+- **TaskContract**（`src/managed/task_contract.rs`）：新增 `orchestrator_plan: Option<String>`（serde default None，旧 JSON 向后兼容）+ `set_orchestrator_plan(&Value)` / `orchestrator_plan_value()`；作为与 `pending_plan` 区分的持久计划真源。
+- **ParallelEnv**（`src/managed/parallel.rs`）：新增 `plan_seed: Option<Value>` / `plan_persist: Option<Arc<dyn Fn(&Value)+Send+Sync>>`，在 `orchestrator()` 里 seed + attach；`orchestrator()` 改 `pub(crate)` 以便测试直达。
+- **runner 接线**：并行块在 collect 前若 contract 无 `orchestrator_plan` 则把当前 ManagerPlan（subtask/success_criteria/expected_evidence/route/parallel_subtasks）落种并持久化；collect 的 Orchestrator 从 contract seed，`update_plan` 通过 sink 以 load-modify-save（`get_task_contract`→`from_json`→`set_orchestrator_plan`→`persist_contract`）写回，避免借用冲突。
+- **测试**：`task_contract::tests::orchestrator_plan_roundtrips_and_defaults_none`（缺省 None + 往返）；`phase0_plan_bidirectional_sync_seed_and_persist`（种子→内存、seed 与 update_plan 均入 sink 共 2 次，双向断言）。全量 `cargo test --bin FoxIR` → **303 passed / 1 failed**（唯一 `test_shimcache` 环境基线，非回归；+2 新测）。
+- **诚实标注**：managed 路径的 Manager 是纯规划（无 tool 循环），`update_plan` 工具在当前 managed 主流程不被调用，因此 sink 在并行 collect 上是"已接线、待 tool 触发"；本同步机制由 selftest/workflow/未来 tool 驱动 Expert Executor 路径真实触发。种/取双向语义已由上述测试确定性覆盖。

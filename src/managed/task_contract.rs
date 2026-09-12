@@ -281,6 +281,12 @@ pub struct TaskContract {
     /// same subtask instead of re-planning a divergent one.
     #[serde(default)]
     pub pending_plan: Option<String>,
+    /// Serialized shared Orchestrator plan (update_plan tool / manager plan),
+    /// persisted as the durable plan truth-source (SDD v1.5 7.8.1). Kept
+    /// distinct from `pending_plan` so a published plan survives a respawn and
+    /// can be re-seeded onto a fresh Orchestrator on resume.
+    #[serde(default)]
+    pub orchestrator_plan: Option<String>,
 }
 
 impl TaskContract {
@@ -313,6 +319,7 @@ impl TaskContract {
 
             prior_handoff: None,
             pending_plan: None,
+            orchestrator_plan: None,
         }
     }
 
@@ -575,6 +582,19 @@ impl TaskContract {
         1
     }
 
+    /// Store the shared Orchestrator plan as the durable plan truth-source.
+    pub fn set_orchestrator_plan(&mut self, plan: &serde_json::Value) {
+        self.orchestrator_plan = Some(serde_json::to_string(plan).unwrap_or_else(|_| plan.to_string()));
+        self.updated_at = Utc::now();
+    }
+
+    /// Deserialize the persisted Orchestrator plan back into a JSON value.
+    pub fn orchestrator_plan_value(&self) -> Option<serde_json::Value> {
+        self.orchestrator_plan
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+    }
+
     /// Serialize to JSON for storage.
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(self).map_err(|e| format!("Failed to serialize TaskContract: {}", e))
@@ -599,6 +619,28 @@ mod tests {
         let r: TaskRecord = serde_json::from_str(old).unwrap();
         assert_eq!(r.parent_task_id, None);
         assert!(r.depends_on.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_plan_roundtrips_and_defaults_none() {
+        // A legacy contract blob without the new field deserializes with None.
+        // Pre-change schema: all currently-required fields present, but the new
+        // `orchestrator_plan` (and `pending_plan`) omitted -> must default to None.
+        let old = r#"{"id":"c1","original_task":"t","phase":"collection","scope":"s","hypothesis":"","verified_findings":[],"verified_actions":[],"open_leads":[],"current_round":0,"max_rounds":5,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","manager_notes":[]}"#;
+        let c: TaskContract = TaskContract::from_json(old).unwrap();
+        assert_eq!(c.orchestrator_plan, None, "absent field must default to None");
+
+        // set_orchestrator_plan stores a serialized JSON value; value() restores it.
+        let mut c2 = TaskContract::new("c2".into(), "task".into(), "scope".into(), 5);
+        assert_eq!(c2.orchestrator_plan, None);
+        let plan = serde_json::json!({ "subtask": "recon", "parallel_subtasks": [] });
+        c2.set_orchestrator_plan(&plan);
+        assert!(c2.orchestrator_plan.is_some());
+        assert_eq!(c2.orchestrator_plan_value(), Some(plan.clone()));
+
+        // Full contract round-trip preserves the field.
+        let back = TaskContract::from_json(&c2.to_json().unwrap()).unwrap();
+        assert_eq!(back.orchestrator_plan_value(), Some(plan));
     }
 
     #[test]

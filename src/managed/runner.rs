@@ -791,6 +791,24 @@ impl ManagedRunner {
                 let brief = {
                     let mut b = brief;
                     if !plan.parallel_subtasks.is_empty() {
+                        // T6.5 bidirectional plan sync: ensure a durable plan truth-
+                        // source exists on the contract, seed the collector's
+                        // Orchestrator from it, and mirror `update_plan` publishes
+                        // back onto the contract (crash/respawn safe).
+                        if contract.orchestrator_plan.is_none() {
+                            let seed = serde_json::json!({
+                                "subtask": plan.subtask,
+                                "success_criteria": plan.success_criteria,
+                                "expected_evidence": plan.expected_evidence,
+                                "route": format!("{:?}", plan.route),
+                                "parallel_subtasks": plan.parallel_subtasks.iter().map(|pt| {
+                                    serde_json::json!({ "role": pt.role, "task": pt.task })
+                                }).collect::<Vec<_>>(),
+
+                            });
+                            contract.set_orchestrator_plan(&seed);
+                            persist_contract(&memory_store, &contract_id, &session, &contract);
+                        }
                         let parl = crate::managed::parallel::ParallelEnv {
                             provider: provider.clone(),
                             tools: tools.clone(),
@@ -808,6 +826,20 @@ impl ManagedRunner {
                             permissions: permissions.clone(),
                             permission_pending: permission_pending.clone(),
                             preauth_profile: Some(permission_profile.clone()),
+                            plan_seed: contract.orchestrator_plan_value(),
+                            plan_persist: Some(std::sync::Arc::new({
+                                let mem = memory_store.clone();
+                                let cid = contract_id.clone();
+                                let sess = session.clone();
+                                move |plan: &serde_json::Value| {
+                                    if let Ok(Some(json)) = mem.get_task_contract(&cid) {
+                                        if let Ok(mut c) = crate::managed::task_contract::TaskContract::from_json(&json) {
+                                            c.set_orchestrator_plan(plan);
+                                            persist_contract(&mem, &cid, &sess, &c);
+                                        }
+                                    }
+                                }
+                            })),
                         };
                         let round_task_id = format!("round-{}", round);
                         // ── §7.5 single-writer gate (deterministic + LLM semantic) ──

@@ -1095,6 +1095,8 @@ async fn phase0_template_collect_dispatches_sequential_and_parallel() {
         permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
         permission_pending: PermissionResolver::new().1,
         preauth_profile: None,
+        plan_seed: None,
+        plan_persist: None,
     };
 
     // Sequential: one-at-a-time, order preserved, all Ok.
@@ -1139,6 +1141,8 @@ async fn phase0_run_loop_collect_produces_bounded_unique_rounds() {
         permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
         permission_pending: PermissionResolver::new().1,
         preauth_profile: None,
+        plan_seed: None,
+        plan_persist: None,
     };
 
     let results = run_loop_collect(&make_env(b.mem_store()), "dig",
@@ -1153,4 +1157,62 @@ async fn phase0_run_loop_collect_produces_bounded_unique_rounds() {
         assert_eq!(r.status, SubAgentStatus::Ok);
     }
     eprintln!("PHASE0 run_loop_collect rounds={}", results.len());
+}
+// ---------------------------------------------------------------------------
+// T6.5: TaskContract <-> update_plan bidirectional sync (SDD v1.5 7.8.1).
+// - Direction B (contract -> memory): plan_seed is restored into the collector
+//   Orchestrator's in-memory plan.
+// - Direction A (memory -> persist): every update_plan (incl. the seed itself)
+//   flows through the durable sink.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase0_plan_bidirectional_sync_seed_and_persist() {
+    use crate::managed::parallel::ParallelEnv;
+    use crate::config::OrchestrationLimits;
+
+    let b = Bench::new(2).await;
+    let seed = serde_json::json!({
+        "subtask": "recon",
+        "parallel_subtasks": [ { "role": "a", "task": "b" } ]
+    });
+    let capture: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap = capture.clone();
+    let env = ParallelEnv {
+        provider: b.provider.clone(),
+        tools: b.tools.clone(),
+        working_dir: b.working.to_string_lossy().to_string(),
+        workspace_dir: b.workspace.to_string_lossy().to_string(),
+        model: "mock".into(),
+        max_iterations: 5,
+        context_window: 128000,
+        max_inline_chars: 120000,
+        tool_timeout_secs: 30,
+        max_tool_retries: 0,
+        two_tier_memory: false,
+        limits: OrchestrationLimits::default(),
+        memory_store: Some(b.mem_store()),
+        permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
+        permission_pending: PermissionResolver::new().1,
+        preauth_profile: None,
+        plan_seed: Some(seed.clone()),
+        plan_persist: Some(Arc::new(move |p: &serde_json::Value| {
+            cap.lock().unwrap().push(p.clone());
+        })),
+    };
+
+    // Direction B: the persisted plan restored into the in-memory mirror.
+    let orch = env.orchestrator("root-sync", "s");
+    assert_eq!(orch.plan(), Some(seed.clone()), "seed must restore into memory");
+
+    // Direction A: update_plan (and the seed itself) flow to the durable sink.
+    let v2 = serde_json::json!({ "subtask": "deep-dive" });
+    orch.update_plan(v2.clone());
+    assert_eq!(orch.plan(), Some(v2.clone()), "memory updated by update_plan");
+    let persisted = capture.lock().unwrap();
+    assert_eq!(persisted.len(), 2, "seed + update_plan both persisted");
+    assert_eq!(persisted[0], seed);
+    assert_eq!(persisted[1], v2);
+    drop(persisted);
+    eprintln!("PHASE0 plan bidirectional sync: seed->memory and update_plan->sink OK");
 }

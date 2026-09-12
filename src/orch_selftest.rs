@@ -41,6 +41,8 @@ pub async fn run(
         )),
         permission_pending: crate::permission::PermissionResolver::new().1,
         preauth_profile: None,
+        plan_seed: None,
+        plan_persist: None,
     };
 
     let root_id = format!("selftest-{}", template.as_str());
@@ -81,6 +83,8 @@ pub async fn run_loop(
         )),
         permission_pending: crate::permission::PermissionResolver::new().1,
         preauth_profile: None,
+        plan_seed: None,
+        plan_persist: None,
     };
     let root_id = format!("selftest-loop-{}", role);
     let results = run_loop_collect(&env, role, "continue bounded read-only deep-dive", rounds, &root_id, "selftest").await;

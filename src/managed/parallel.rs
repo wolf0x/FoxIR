@@ -42,10 +42,16 @@ pub struct ParallelEnv {
     pub permissions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, bool>>>,
     pub permission_pending: PendingMap,
     pub preauth_profile: Option<Arc<PermissionProfile>>,
+    /// Optional plan to seed the transient Orchestrator's in-memory plan from
+    /// (contract -> memory; T6.5 bidirectional sync).
+    pub plan_seed: Option<serde_json::Value>,
+    /// Optional durable sink: invoked on every `update_plan` so a published plan
+    /// is written back to the TaskContract (memory -> contract; T6.5).
+    pub plan_persist: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
 }
 
 impl ParallelEnv {
-    fn orchestrator(&self, root_id: &str, root_session: &str) -> Orchestrator {
+    pub(crate) fn orchestrator(&self, root_id: &str, root_session: &str) -> Orchestrator {
         let env = OrchestratorEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),
@@ -72,8 +78,13 @@ impl ParallelEnv {
         };
         // parent_tx = None: this layer's workers are transient collectors, their
         // events are not forwarded to the UI (the caller surfaces a condensed brief).
-        Orchestrator::new(env, root_id.to_string(), root_session.to_string(),
-            Arc::new(AtomicBool::new(false)), DEFAULT_MAX_DEPTH, None)
+        let mut orch = Orchestrator::new(env, root_id.to_string(), root_session.to_string(),
+            Arc::new(AtomicBool::new(false)), DEFAULT_MAX_DEPTH, None);
+        orch.set_plan_persist(self.plan_persist.clone());
+        if let Some(seed) = &self.plan_seed {
+            orch.seed_plan(seed.clone());
+        }
+        orch
     }
 }
 

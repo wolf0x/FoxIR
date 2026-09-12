@@ -180,6 +180,10 @@ pub struct Orchestrator {
     root_ended: Arc<std::sync::atomic::AtomicBool>,
     max_depth: u8,
     pub plan: Arc<RwLock<Option<serde_json::Value>>>,
+    /// Optional durable sink for the shared plan (TaskContract round-trip).
+    /// Set via `set_plan_persist`; invoked on every `update_plan` so the plan
+    /// truth-source survives crash/respawn (SDD v1.5 7.8.1, T6.5).
+    plan_persist: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
     children: Arc<Mutex<HashMap<String, SubAgentHandle>>>,
     /// Registration channel to the EventPump (bounded, cap = max_concurrent*2).
     reg_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::mpsc::Receiver<AgentEvent>>>,
@@ -223,6 +227,7 @@ impl Orchestrator {
             root_ended,
             max_depth,
             plan: Arc::new(RwLock::new(None)),
+            plan_persist: None,
             children: Arc::new(Mutex::new(HashMap::new())),
             reg_tx,
             budgets: Arc::new(Mutex::new(HashMap::new())),
@@ -542,8 +547,24 @@ impl Orchestrator {
         map.get(run_id).map(|h| h.log.read().unwrap().clone()).unwrap_or_default()
     }
 
+    /// Attach a durable sink for the shared plan (TaskContract round-trip).
+    pub fn set_plan_persist(&mut self, cb: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>) {
+        self.plan_persist = cb;
+    }
+
+    /// Seed the in-memory plan from a durable source (e.g. a resumed contract)
+    /// and mirror it to the persist sink so both stay in lockstep.
+    pub fn seed_plan(&self, plan: serde_json::Value) {
+        self.update_plan(plan);
+    }
+
+    /// Publish/update the shared plan: update the in-memory mirror and push it
+    /// through the durable sink so it survives crash/respawn (memory -> sink).
     pub fn update_plan(&self, plan: serde_json::Value) {
-        *self.plan.write().unwrap() = Some(plan);
+        *self.plan.write().unwrap() = Some(plan.clone());
+        if let Some(cb) = &self.plan_persist {
+            cb(&plan);
+        }
     }
 
     pub fn plan(&self) -> Option<serde_json::Value> {
