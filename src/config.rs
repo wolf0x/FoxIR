@@ -232,7 +232,27 @@ impl From<&ExpertModeConfig> for OrchestrationLimits {
     }
 }
 
+impl From<&InstantModeConfig> for OrchestrationLimits {
+    fn from(cfg: &InstantModeConfig) -> Self {
+        Self {
+            max_concurrent_subagents: cfg.max_concurrent_subagents,
+            default_timeout_secs: cfg.default_timeout_secs,
+            max_tokens_per_run: cfg.max_tokens_per_run,
+            max_total_tokens: cfg.max_total_tokens,
+        }
+    }
+}
+
 impl ModesConfig {
+    /// D11: orchestration now belongs to Instant; fall back to the legacy
+    /// `modes.expert.orchestration` key only when instant is unset.
+    pub fn orchestration_enabled(&self) -> bool {
+        match &self.instant.orchestration {
+            Some(v) => v == "on",
+            None => self.expert.orchestration == "on",
+        }
+    }
+
     /// §9 validation: invalid values `warn!` and fall back to defaults.
     pub fn validate_orchestration(&mut self) {
         if self.expert.max_concurrent_subagents < 1 {
@@ -279,8 +299,17 @@ pub struct InstantModeConfig {
     pub skill_strategy: String,
     #[serde(default = "default_zero_u8")]
     pub max_depth: u8,
-    #[serde(default = "default_orchestration_state")]
-    pub orchestration: String,
+    /// Orchestration gate: None = fall back to legacy expert key.
+    #[serde(default)]
+    pub orchestration: Option<String>,
+    #[serde(default = "default_max_concurrent_subagents")]
+    pub max_concurrent_subagents: usize,
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub default_timeout_secs: u64,
+    #[serde(default = "default_max_tokens_per_run")]
+    pub max_tokens_per_run: u64,
+    #[serde(default = "default_max_total_tokens")]
+    pub max_total_tokens: u64,
 }
 
 impl Default for InstantModeConfig {
@@ -288,7 +317,11 @@ impl Default for InstantModeConfig {
         Self {
             skill_strategy: default_mode_skill_strategy(),
             max_depth: default_zero_u8(),
-            orchestration: default_orchestration_state(),
+            orchestration: None,
+            max_concurrent_subagents: default_max_concurrent_subagents(),
+            default_timeout_secs: default_subagent_timeout_secs(),
+            max_tokens_per_run: default_max_tokens_per_run(),
+            max_total_tokens: default_max_total_tokens(),
         }
     }
 }
@@ -963,7 +996,28 @@ mod tests {
         assert_eq!(m.expert.max_depth, 1);
         assert_eq!(m.expert.orchestration, "on");
         assert_eq!(m.instant.skill_strategy, "attached");
+        assert_eq!(m.instant.orchestration, None);
         assert_eq!(m.subagent.max_depth, 1);
         assert!(m.subagent.authorized_tools.is_empty());
+    }
+
+    #[test]
+    fn instant_limits_come_from_instant_config() {
+        let mut instant = InstantModeConfig::default();
+        instant.max_concurrent_subagents = 4;
+        instant.default_timeout_secs = 90;
+        let lim = OrchestrationLimits::from(&instant);
+        assert_eq!(lim.max_concurrent_subagents, 4);
+        assert_eq!(lim.default_timeout_secs, 90);
+    }
+
+    #[test]
+    fn orchestration_enabled_falls_back_to_expert_when_instant_unset() {
+        let mut modes = ModesConfig::default();
+        modes.instant.orchestration = None;            // 未显式设置
+        modes.expert.orchestration = "on".to_string();  // 旧键
+        assert!(modes.orchestration_enabled());
+        modes.instant.orchestration = Some("off".to_string());
+        assert!(!modes.orchestration_enabled());        // 显式 instant 优先
     }
 }

@@ -502,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SDD v1.5: build the main agent as an Expert root when orchestration is
     // enabled so the sub-agent tools actually deliver/spawn at depth 0. When
     // disabled (default legacy path) the agent stays Instant (zero diff).
-    let orchestration_enabled = config.agent.modes.expert.orchestration == "on";
+    let orchestration_enabled = config.agent.modes.orchestration_enabled();
     let agent = LlmAgent::builder()
         .name("FoxIR")
         .description("Local AI agent with Windows system tools")
@@ -723,7 +723,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         expert_tool_timeout_secs: Arc::new(AtomicUsize::new(config.agent.expert_tool_timeout_secs)),
         expert_max_tool_retries: Arc::new(AtomicUsize::new(config.agent.expert_max_tool_retries)),
         expert_max_managed_rounds: Arc::new(AtomicUsize::new(config.agent.expert_max_managed_rounds)),
-        orchestration_limits: Arc::new(crate::config::OrchestrationLimits::from(&config.agent.modes.expert)),
+        orchestration_limits: Arc::new(crate::config::OrchestrationLimits::from(&config.agent.modes.instant)),
         sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         permissions,
         permission_resolver,
