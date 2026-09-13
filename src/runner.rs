@@ -220,6 +220,32 @@ impl Runner {
         RunnerBuilder::new()
     }
 
+    /// Create a clone of this Runner with `can_spawn` forcibly disabled.
+    /// Used by ManagedRunner to ensure Expert Executor rounds cannot spawn
+    /// sub-agents (enforcing the "Expert = pure serial" invariant).
+    pub fn without_spawn(&self) -> Runner {
+        Runner {
+            agent: self.agent.clone(),
+            session_service: self.session_service.clone(),
+            logger: self.logger.clone(),
+            app_name: self.app_name.clone(),
+            checkpointer: self.checkpointer.clone(),
+            trim_redundant_tool_calls: self.trim_redundant_tool_calls.clone(),
+            knowledge_pre_retrieval: self.knowledge_pre_retrieval.clone(),
+            sop_replay: self.sop_replay.clone(),
+            budget_dashboard: self.budget_dashboard.clone(),
+            budget_sink: self.budget_sink.clone(),
+            enable_context_scaling: self.enable_context_scaling.clone(),
+            max_inline_chars: self.max_inline_chars.clone(),
+            skill_listing_strategy: self.skill_listing_strategy.clone(),
+            skill_max_inline_chars: self.skill_max_inline_chars.clone(),
+            skill_catalog_max: self.skill_catalog_max.clone(),
+            skill_hot_top_k: self.skill_hot_top_k.clone(),
+            can_spawn: false,
+            mode: self.mode,
+        }
+    }
+
     /// Run the agent for a given user message and return the event stream.
     /// The runner handles session creation, context building, and event persistence.
     pub async fn run(

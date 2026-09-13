@@ -409,7 +409,8 @@ impl ManagedRunner {
             );
         }
 
-        let inner = self.inner.clone();
+        // Expert Executor MUST NOT spawn sub-agents (enforce serial invariant).
+        let executor_inner = Arc::new(self.inner.without_spawn());
         let session = session_id.to_string();
         let permissions = permissions.clone();
         let permission_pending = permission_pending.clone();
@@ -836,7 +837,7 @@ impl ManagedRunner {
                 // Run the Executor with the brief as the user message
                 // This uses the existing agent loop with fresh context
                 // D-fix: race the Executor start against STOP so a user Stop can
-                // interrupt a round even if `inner.run` gets stuck before emitting
+                // interrupt a round even if `executor_inner.run` gets stuck before emitting
                 // any event (the per-event loop only observes Stop after a yield).
                 let exec_session = format!("{}-exec-{}", session, round);
                 let executor_result = tokio::select! {
@@ -844,7 +845,7 @@ impl ManagedRunner {
                         info!("[managed:{}] STOP during Executor round {} start - aborting", session, round + 1);
                         break;
                     }
-                    res = inner.run(
+                    res = executor_inner.run(
                         &brief,
                         &exec_session,
                         &executor_model,
@@ -1255,6 +1256,16 @@ impl ManagedRunner {
 
                 // ── Persist TaskContract after each round (crash recovery) ──
                 persist_contract(&memory_store, &contract_id, &session, &contract);
+
+                // ── Round transition progress hint ──
+                // Notify the user that the next round is being prepared (Manager
+                // LLM call can take 10-30s with no visible output otherwise).
+                if round + 1 < contract.max_rounds {
+                    let _ = tx.send(Ok(AgentEvent::text(
+                        "\n\n---\n\u{1f4cb} 下一轮工作准备中，请稍候...\n",
+                        &contract_id, "manager"
+                    ))).await;
+                }
 
                 round += 1;
             }

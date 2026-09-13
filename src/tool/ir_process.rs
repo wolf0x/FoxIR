@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use chrono::Local;
 use serde_json::{json, Value};
+use std::fs;
 use tokio::process::Command;
 
 use super::Tool;
@@ -21,7 +23,7 @@ try {
     $path=''; try { $path=[string]$_.Path } catch {}
     $start=''; try { if($_.StartTime){ $start=$_.StartTime.ToString('o') } } catch {}
     $cpu=0; try { if($_.CPU){ $cpu=[double]([math]::Round($_.CPU,2)) } } catch {}
-    $mem=0; try { $mem=[double]([math]::Round($_.WorkingSet64/1MB,1)) } } catch {}
+    $mem=0; try { $mem=[double]([math]::Round($_.WorkingSet64/1MB,1)) } catch {}
     $gpMap[[int]$_.Id]=[PSCustomObject]@{name=$name; path=$path; creationDate=$start; cpu=$cpu; memoryMB=$mem}
   }
 } catch {}
@@ -195,12 +197,40 @@ impl Tool for IrProcessTool {
                 let med_count = classified.iter().filter(|p| p["risk_level"] == "medium").count();
                 let low_count = classified.iter().filter(|p| p["risk_level"] == "low").count();
                 let safe_count = classified.iter().filter(|p| p["risk_level"] == "safe").count();
+                let total_processes = classified.len();
+
+                // --- Smart truncation: write full output to file, inline only non-safe ---
+                let full_json = json!({
+                    "status": "ok",
+                    "total_processes": total_processes,
+                    "summary": { "high": high_count, "medium": med_count, "low": low_count, "safe": safe_count },
+                    "processes": classified.clone(),
+                });
+
+                let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+                let filename = format!("ir_process-{}.json", timestamp);
+                let output_path = format!("output/{}", filename);
+
+                // Ensure output directory exists and write full data
+                let _ = fs::create_dir_all("output");
+                if let Ok(pretty) = serde_json::to_string_pretty(&full_json) {
+                    let _ = fs::write(&output_path, pretty);
+                }
+
+                // Only inline non-safe processes
+                let inline_processes: Vec<Value> = classified.into_iter()
+                    .filter(|p| p["risk_level"].as_str().unwrap_or("safe") != "safe")
+                    .collect();
+                let processes_returned = inline_processes.len();
 
                 Ok(json!({
                     "status": "ok",
-                    "total_processes": classified.len(),
+                    "total_processes": total_processes,
+                    "processes_returned": processes_returned,
                     "summary": { "high": high_count, "medium": med_count, "low": low_count, "safe": safe_count },
-                    "processes": classified,
+                    "processes": inline_processes,
+                    "full_output_path": output_path,
+                    "note": "Full process list written to file. Only non-safe processes shown inline.",
                 }))
             }
             "kill" => {
