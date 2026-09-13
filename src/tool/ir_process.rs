@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use chrono::Local;
 use serde_json::{json, Value};
-use std::fs;
 use tokio::process::Command;
 
 use super::Tool;
@@ -199,38 +197,13 @@ impl Tool for IrProcessTool {
                 let safe_count = classified.iter().filter(|p| p["risk_level"] == "safe").count();
                 let total_processes = classified.len();
 
-                // --- Smart truncation: write full output to file, inline only non-safe ---
-                let full_json = json!({
-                    "status": "ok",
-                    "total_processes": total_processes,
-                    "summary": { "high": high_count, "medium": med_count, "low": low_count, "safe": safe_count },
-                    "processes": classified.clone(),
-                });
-
-                let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-                let filename = format!("ir_process-{}.json", timestamp);
-                let output_path = format!("output/{}", filename);
-
-                // Ensure output directory exists and write full data
-                let _ = fs::create_dir_all("output");
-                if let Ok(pretty) = serde_json::to_string_pretty(&full_json) {
-                    let _ = fs::write(&output_path, pretty);
-                }
-
-                // Only inline non-safe processes
-                let inline_processes: Vec<Value> = classified.into_iter()
-                    .filter(|p| p["risk_level"].as_str().unwrap_or("safe") != "safe")
-                    .collect();
-                let processes_returned = inline_processes.len();
-
+                // Return the full classified list inline, consistent with the
+                // other ir_* tools (ir_scan, ir_artifacts, ...). No file output.
                 Ok(json!({
                     "status": "ok",
                     "total_processes": total_processes,
-                    "processes_returned": processes_returned,
                     "summary": { "high": high_count, "medium": med_count, "low": low_count, "safe": safe_count },
-                    "processes": inline_processes,
-                    "full_output_path": output_path,
-                    "note": "Full process list written to file. Only non-safe processes shown inline.",
+                    "processes": classified,
                 }))
             }
             "kill" => {

@@ -434,6 +434,11 @@ impl Orchestrator {
 
     /// Spawn a worker sub-agent from a spawn request made by the parent.
     /// `ctx_depth` is the parent's current depth; the worker gets depth+1.
+    /// Active-emit of a milestone into the parent stream (P0-A).
+    fn emit(&self, ev: AgentEvent) {
+        emit_typed(&self.event_tx, ev);
+    }
+
     pub async fn spawn(&self, spec: &SubAgentSpec, ctx_depth: u8, parent_id: &str, parent_session: &str, parent_author: &str) -> AgentResult<String> {
         if ctx_depth + 1 > self.max_depth {
             return Err(AgentError::depth_limit());
@@ -443,6 +448,25 @@ impl Orchestrator {
         // instead of re-spawning the worker (Phase 0 kill-9 gate).
         if let Some(existing) = self.try_reuse(&spec.role) {
             return Ok(existing);
+        }
+        // Enforce the per-orchestrator concurrency ceiling (P2): cap how many
+        // workers may run at once so a single round can't spawn unbounded LLM
+        // workers (cost / DoS guard). A reused role consumes no new slot.
+        {
+            let map = self.children.lock().unwrap();
+            let running = map
+                .values()
+                .filter(|h| {
+                    let s = h.status.lock().unwrap();
+                    matches!(*s, SubAgentStatus::Pending | SubAgentStatus::Running)
+                })
+                .count();
+            let max = self.env.max_concurrent_subagents.max(1);
+            if running >= max {
+                return Err(AgentError::agent(format!(
+                    "spawn_subagent: concurrency limit reached ({running} running, max {max}); wait for a worker or reuse a terminal role"
+                )));
+            }
         }
         let run_id = Uuid::new_v4().to_string();
         let session_id = format!("sub-{run_id}");
@@ -478,6 +502,22 @@ impl Orchestrator {
             !SkillManager::skill_tool_names().iter().any(|s| s == n)
                 && !crate::agent::llm_agent::is_orchestration_name(n.as_str())
         });
+        // F8: an explicit allowlist with unknown names would silently produce a
+        // (near-)empty worker (subset() drops them) — fail loudly instead.
+        if !spec.tools_allowlist.is_empty() {
+            let known = self.env.tools.read().await;
+            let unknown: Vec<&String> = spec
+                .tools_allowlist
+                .iter()
+                .filter(|n| known.get(n.as_str()).is_none())
+                .collect();
+            if !unknown.is_empty() {
+                return Err(AgentError::agent(format!(
+                    "spawn_subagent: unknown tool(s) in tools_allowlist: {:?}; pass the exact registered tool names",
+                    unknown
+                )));
+            }
+        }
         let worker_registry = {
             let reg = self.env.tools.read().await;
             reg.subset(&allow)
@@ -525,6 +565,9 @@ impl Orchestrator {
 
         let handle = SubAgentHandle::new(run_id.clone(), spec.clone());
         self.children.lock().unwrap().insert(run_id.clone(), handle.clone());
+        // P0-A: publish the spawn milestone so the frontend opens a sub-agent
+        // card immediately, instead of waiting for raw text fragments.
+        self.emit(AgentEvent::subagent_spawned(&run_id, &role, parent_id, parent_author));
 
         // Dispatch the worker task. Clone borrowed inputs into owned values first
         // so nothing borrowed escapes into the 'static spawned task.
@@ -558,9 +601,11 @@ impl Orchestrator {
         let root_tmo = root_invocation_id.clone();
         let budgets_tmo = budgets.clone();
         let write_gate = self.write_gate.clone();
+        let event_tx_run = self.event_tx.clone();
+        let event_tx_tmo = self.event_tx.clone();
         tokio::spawn(async move {
             let fut = run_worker(worker, &child_ctx, spec_task, handle_task, worker_tx,
-                parent_author_task.as_str(), memory_store, root_invocation_id, budgets, write_gate);
+                parent_author_task.as_str(), memory_store, root_invocation_id, budgets, write_gate, event_tx_run);
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
                 Ok(res) => { let _ = res; }
                 // Deadline exceeded: the worker future is dropped mid-run; finalize
@@ -593,6 +638,11 @@ impl Orchestrator {
                         completion_tokens: 0,
                         total_tokens: 0,
                     });
+                    // P0-A: surface the timeout as a typed failed milestone.
+                    emit_typed(&event_tx_tmo, AgentEvent::budget_update(
+                        &handle_tmo.run_id, &handle_tmo.role, 0, &root_tmo, &parent_author_task));
+                    emit_typed(&event_tx_tmo, AgentEvent::subagent_failed(
+                        &handle_tmo.run_id, &handle_tmo.role, "worker timed out", &root_tmo, &parent_author_task));
                     handle_tmo.done.notify_waiters();
                 }
             }
@@ -705,6 +755,18 @@ impl Drop for Orchestrator {
     }
 }
 
+/// Best-effort push of a typed event into the parent run's stream (P0-A).
+/// `None` in headless contexts -> dropped. Milestones are low-volume, so a
+/// droppable `try_send` is acceptable (the frontend reads them as cards).
+fn emit_typed(
+    tx: &Option<tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>>,
+    ev: AgentEvent,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.try_send(Ok(ev));
+    }
+}
+
 /// Drive one worker to completion: consume its event stream, build a summary,
 /// apply cancellation, and finalize the handle (status + result + notify).
 /// Recursively harvest short string leaves from a tool result JSON. Used to
@@ -737,6 +799,7 @@ async fn run_worker(
     root_invocation_id: String,
     budgets: Arc<Mutex<HashMap<String, BudgetSnapshot>>>,
     write_gate: Arc<tokio::sync::Mutex<()>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>>,
 ) -> AgentResult<SubAgentResult> {
     // Step 2b (SDD v1.5 §7.10 / §7.11 layer 2): write/exec workers are forced to
     // run one-at-a-time. Acquire the gate before running; dropped on return.
@@ -827,7 +890,27 @@ async fn run_worker(
         total_tokens: token_usage,
     });
     handle.done.notify_waiters();
-    let _ = parent_author;
+    // P0-A: emit typed terminal milestones to the parent stream. The frontend
+    // renders these as grouped sub-agent cards (status/summary/token), which is
+    // the structured counterpart to the raw `broadcast_subagent_result` bubble.
+    let run_id = handle.run_id.clone();
+    let role = spec.role.clone();
+    emit_typed(&event_tx, AgentEvent::budget_update(
+        &run_id, &role, token_usage, &root_invocation_id, parent_author));
+    match result.status {
+        SubAgentStatus::Ok => {
+            emit_typed(&event_tx, AgentEvent::subagent_completed(
+                &run_id, &role, "completed",
+                &format!("{:?}", result.confidence),
+                &result.summary, result.evidence_refs.clone(),
+                &root_invocation_id, parent_author));
+        }
+        _ => {
+            emit_typed(&event_tx, AgentEvent::subagent_failed(
+                &run_id, &role, &format!("{:?}", result.status),
+                &root_invocation_id, parent_author));
+        }
+    }
     crate::agent::event_pump::broadcast_subagent_result(&worker_tx, &result);
     Ok(result)
 }

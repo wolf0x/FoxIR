@@ -62,7 +62,7 @@ pub struct SpawnSubagentTool;
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str { "spawn_subagent" }
     fn description(&self) -> &str {
-        "Spawn a read-only worker sub-agent that runs a delegated task in its own session and returns a structured SubAgentResult. Call with {role, prompt, [tools_allowlist], [allow_write], [allow_exec], [model], [max_iterations], [skills]}. Then wait_subagent for the result."
+        "Spawn a read-only worker sub-agent that runs a delegated task in its own session and returns a structured SubAgentResult. Call with {role, prompt, [tools_allowlist], [allow_write], [allow_exec], [model], [max_iterations], [timeout]}. Then wait_subagent for the result."
     }
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {
@@ -72,7 +72,8 @@ impl Tool for SpawnSubagentTool {
             "allow_write": { "type": "boolean" },
             "allow_exec": { "type": "boolean" },
             "model": { "type": "string" },
-            "max_iterations": { "type": "integer" }
+            "max_iterations": { "type": "integer" },
+            "timeout": { "type": "integer", "description": "Per-worker wall-clock timeout in seconds (default 300)" }
         }, "required": ["role", "prompt"] })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
@@ -228,5 +229,23 @@ mod tests {
         let err = tool.execute(json!({"role": "worker", "prompt": "x"}), &ctx).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unavailable") || msg.contains("not available") || msg.contains("mode"), "got {msg}");
+    }
+
+    /// A schema-compliant call with only `role`/`prompt` must deserialize into
+    /// a read-only worker instead of failing with "missing field" (the P0 serde
+    /// blocker). All optional fields now carry safe defaults.
+    #[test]
+    fn subagent_spec_partial_json_uses_safe_defaults() {
+        let spec: SubAgentSpec = serde_json::from_value(json!({
+            "role": "probe",
+            "prompt": "collect"
+        }))
+        .expect("partial spec must deserialize with defaults");
+        assert_eq!(spec.role, "probe");
+        assert_eq!(spec.prompt, "collect");
+        assert!(spec.tools_allowlist.is_empty());
+        assert!(!spec.allow_write);
+        assert!(!spec.allow_exec);
+        assert!(spec.skills.is_empty());
     }
 }

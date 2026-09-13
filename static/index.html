@@ -280,6 +280,15 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .tool-hdr .arrow.open{transform:rotate(180deg)}
 .tool-body{overflow:hidden;transition:max-height .4s ease;padding:0 12px}
 .tool-body.open{max-height:2000px;padding:0 12px 10px;overflow-y:auto}
+.subagent-card{background:#fff;border:1px solid var(--border);border-radius:8px;margin:8px 0;overflow:hidden;border-left:3px solid #5b6bf0}
+.subagent-card .sub-hdr{display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(91,107,240,.07)}
+.subagent-card .sub-role{font-weight:600;font-size:13px;flex:1}
+.subagent-card .sub-tok{font-size:10px;color:#8b95a5}
+.subagent-card .sub-body{padding:4px 12px 10px;font-size:12px;color:#444}
+.subagent-card .sub-sum{white-space:pre-wrap;margin:6px 0}
+.subagent-card .sub-ev{margin-top:4px}
+.subagent-card .sub-ev a{color:#3a4bd6;text-decoration:none;display:block;font-size:11px;padding:2px 0}
+.subagent-card .sub-ev a:hover{text-decoration:underline}
 .tool-body:not(.open){max-height:0;padding:0 12px;overflow:hidden}
 .tool-body pre{background:#1e1e1e;border-radius:4px;padding:8px;font-size:11px;font-family:var(--mono);color:#d4d4d4;overflow-x:auto;white-space:pre-wrap;margin:4px 0}
 .tool-summary{font-size:11px;color:var(--t3);margin-left:8px;font-weight:400;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1577,6 +1586,7 @@ let ws=null,connected=false,msgHist=[],logHist=[];
 let curThinkEl=null,curTextEl=null,textAccum='',curToolMap={},agentRunning=false,msgQueue=[];
 let interjectList=[];
 let lastInvId=null; // Expert mode multi-round: track invocation_id to segment output blocks
+let subAgentRunIds=new Set(),subAgentRoles=new Set(),subAgentCards={},subAgentOrder=[];
 // Persistent session id: survives WebSocket reconnects so Expert-mode TaskContract
 // resume (keyed by session_id on the server) keeps working. Regenerated on "clear chat".
 let SESSION_ID=(function(){try{var s=sessionStorage.getItem('ra_session_id');if(s)return s;var id=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():('sess-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10));sessionStorage.setItem('ra_session_id',id);return id;}catch(e){return 'sess-'+Date.now();}})();
@@ -1708,6 +1718,11 @@ function updateStatus(){
 // 閳光偓閳光偓 Message Handler 閳光偓閳光偓
 function handleMsg(msg){
   if(!msg||!msg.type)return;
+  // P0-B: suppress raw worker fragments (thinking/text/tool/progress) from the
+  // main conversation — the typed sub-agent milestone cards are their structured
+  // representation. Identify them by the worker run_id (its event invocation id)
+  // or by the worker role (author), both registered on `subagent_spawned`.
+  if(isWorkerFragment(msg))return;
   // Expert mode multi-round: when the invocation_id changes (Manager Plan vs
   // Executor round, or between Executor rounds), finalize the current text
   // block so the next segment starts a fresh bubble instead of appending.
@@ -1755,10 +1770,13 @@ function handleMsg(msg){
     case 'usage':
       // Usage events handled by token usage dashboard on load
       break;
-    case 'subagent_spawned':
     case 'budget_update':
     case 'subagent_completed':
     case 'subagent_failed':
+    case 'subagent_spawned':
+      expertHandleMsg(msg);
+      handleSubAgentCard(msg);
+      break;
     case 'plan_updated':
       expertHandleMsg(msg);
       break;
@@ -1787,6 +1805,7 @@ function handleMsg(msg){
       finalizeTextBlock();
       curToolMap={};
       lastInvId=null;
+      subAgentRunIds=new Set();subAgentRoles=new Set();subAgentOrder=[];subAgentCards={};
       setAgentRunning(false);
       // Refresh checkpoint banner (completed checkpoints are deleted server-side)
       checkCheckpoints();
@@ -4108,6 +4127,61 @@ document.addEventListener('click',function(e){
 // Consumes the subagent/budget/plan WS events emitted by the ManagedRunner and
 // renders an Expert drawer: task queue, agent cards, budget, log, evidence links.
 const expertState = { agents: {}, queue: [], plan: null, order: [] };
+
+// ── P0-B: main-conversation sub-agent cards ──────────────────────────────
+// Renders the typed sub-agent milestone events as grouped cards in the main
+// chat (not just the Expert drawer), and suppresses the worker's raw streaming
+// fragments so they don't duplicate those cards or leave empty tool blocks.
+function isWorkerFragment(msg){
+  if(!msg)return false;
+  if(['thinking','text','tool_call','tool_result','progress','error'].indexOf(msg.type)<0)return false;
+  const inv=msg.invocation_id||'';
+  if(inv&&subAgentRunIds.has(inv))return true;
+  if(msg.author&&subAgentRoles.has(msg.author))return true;
+  return false;
+}
+
+function handleSubAgentCard(msg){
+  try{
+    const run_id=msg.run_id||'', role=msg.role||'sub-agent';
+    if(msg.type==='subagent_spawned'){
+      subAgentRunIds.add(run_id);
+      if(role)subAgentRoles.add(role);
+      if(subAgentOrder.indexOf(run_id)<0)subAgentOrder.push(run_id);
+      if(!subAgentCards[run_id]){
+        const card=document.createElement('div');
+        card.className='subagent-card';
+        card.dataset.rid=run_id;
+        card.innerHTML='<div class="sub-hdr"><span class="st st-running">running</span>'+
+          '<span class="sub-role">'+esc(role)+'</span>'+
+          '<span class="sub-tok">0 tok</span></div>'+
+          '<div class="sub-body"><div class="sub-sum">Worker dispatched…</div><div class="sub-ev"></div></div>';
+        appendToConv(card);
+        subAgentCards[run_id]=card;
+      }
+    }else if(msg.type==='budget_update'){
+      const card=subAgentCards[run_id];if(!card)return;
+      const tok=card.querySelector('.sub-tok');if(tok)tok.textContent=(msg.tokens||0)+' tok';
+    }else if(msg.type==='subagent_completed'||msg.type==='subagent_failed'){
+      const done=msg.type==='subagent_completed';
+      const status=done?'completed':(msg.reason||'failed');
+      const card=subAgentCards[run_id];if(!card)return;
+      const badge=card.querySelector('.sub-hdr .st');
+      if(badge){badge.className='st '+statusClass(status);badge.textContent=status;}
+      const sum=card.querySelector('.sub-sum');
+      if(sum)sum.textContent=msg.summary||(done?'Completed':(msg.reason||'Failed'));
+      const ev=card.querySelector('.sub-ev');
+      if(ev){
+        ev.innerHTML=(msg.evidence_refs||[]).map(ref=>{
+          const href=evidenceHref(ref);
+          return href
+            ?'<a href="'+href+'" target="_blank" title="Open evidence">&#128196; '+esc(normalizeEvidenceRef(ref))+'</a>'
+            :'<span style="font-size:11px;color:#8b95a5">&#128196; '+esc(ref)+'</span>';
+        }).join('');
+      }
+    }
+  }catch(err){console.error('handleSubAgentCard',err);}
+}
 
 function normalizeEvidenceRef(ref) {
   if (!ref) return '';

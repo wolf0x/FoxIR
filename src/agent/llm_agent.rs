@@ -1352,10 +1352,22 @@ impl Agent for LlmAgent {
         // `user_message` is still the borrowed &str (it is shadowed to String
         // further down). When false the allowset stays empty and no Orchestrator
         // is built — the zero-overhead promise for non-fan-out runs.
+        let prefilter = orchestration_prefilter(user_message);
         let orch_candidate = ctx.can_spawn
             && ctx.mode == crate::context::AgentMode::Instant
             && ctx.depth == 0
-            && orchestration_prefilter(user_message);
+            && prefilter;
+        // F7: surface the orchestration gate for diagnosis — this is the single
+        // line that decides whether the run can fan out.
+        if ctx.can_spawn
+            && ctx.mode == crate::context::AgentMode::Instant
+            && ctx.depth == 0
+        {
+            tracing::info!(
+                "[session:{}] orchestration gate: prefilter={prefilter} -> orchard={orch_candidate} (+7 orchestration tools if true)",
+                session_id
+            );
+        }
         let (core_tool_defs, load_schema_def) = {
             let reg = self.tools.read().await;
             let periph = reg.peripheral_tools();

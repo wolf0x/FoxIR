@@ -95,13 +95,17 @@ pub struct SubAgentSpec {
     pub role: String,
     pub prompt: String,
     pub system_prompt: Option<String>,
+    #[serde(default)]
     pub tools_allowlist: Vec<String>,
+    #[serde(default)]
     pub allow_write: bool,
+    #[serde(default)]
     pub allow_exec: bool,
     pub model: Option<String>,
     pub timeout: Option<u64>,
     pub max_tokens: Option<usize>,
     pub max_iterations: Option<usize>,
+    #[serde(default)]
     pub skills: Vec<String>,
 }
 

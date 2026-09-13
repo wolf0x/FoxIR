@@ -18,6 +18,12 @@ pub struct ShimCacheEntry {
 
 const WIN10_SIGNATURE: u32 = 0x0000_0080;
 const WIN7_SIGNATURE: u32 = 0xBADC_0FEE;
+/// Per-entry marker (`"10ts"`) that anchors each AppCompatCache v3 entry.
+const V3_ENTRY_MARKER: u32 = 0x7374_3031;
+/// Known AppCompatCache v3 entry-header leads. Recent Windows 10/11 live
+/// blobs omit the 0x00000080 file header and begin directly with the first
+/// v3 entry header, whose first u32 is the entry header size (0x30 / 0x34).
+const V3_HEADERLESS_LEADS: &[u32] = &[0x0000_0030, 0x0000_0034];
 
 /// Parse an AppCompatCache binary blob.
 /// `data` is the raw REG_BINARY value from the registry.
@@ -29,6 +35,9 @@ pub fn parse_shimcache(data: &[u8]) -> Result<Vec<ShimCacheEntry>, String> {
     match sig {
         WIN10_SIGNATURE => parse_win10(data),
         WIN7_SIGNATURE => parse_win7(data),
+        // Windows 10/11 live blobs on recent builds carry no file header and
+        // start directly with a v3 entry header. Dispatch on the known lead.
+        _ if V3_HEADERLESS_LEADS.contains(&sig) => parse_win11_headerless(data),
         other => Err(format!("Unknown ShimCache signature: 0x{:08X}", other)),
     }
 }
@@ -98,6 +107,69 @@ fn parse_win10(data: &[u8]) -> Result<Vec<ShimCacheEntry>, String> {
     Ok(entries)
 }
 
+/// Headerless Windows 10/11 (AppCompatCache v3) blob.
+///
+/// Recent Win10/11 builds do not persist the `0x00000080` file header in the
+/// live registry value; the blob begins directly with the first entry header,
+/// whose first u32 is the entry header size (0x30 / 0x34) and, on this layout,
+/// equals the offset of the first `0x73743031` ("10ts") entry marker.
+///
+/// Each entry (validated against live Windows 11 build 22631) is laid out as:
+///   +0x00  u32 marker 0x73743031 ("10ts")
+///   +0x04  u32 unknown
+///   +0x08  u32 entry span in bytes minus 12
+///   +0x0C  u16 path length in bytes (UTF-16LE, NOT null-terminated)
+///   +0x0E  path
+///   +end   FILETIME (8 bytes): last modified
+///   next marker = pos + (u32 @ +0x08) + 12
+fn parse_win11_headerless(data: &[u8]) -> Result<Vec<ShimCacheEntry>, String> {
+    let mut entries = Vec::new();
+    // The first u32 is the entry header size and the offset of the first marker.
+    let mut pos = read_u32(data, 0).unwrap_or(0) as usize;
+    let mut index = 0;
+
+    while pos + 4 <= data.len() {
+        if read_u32(data, pos) != Some(V3_ENTRY_MARKER) {
+            break; // end of entry list / malformed data
+        }
+        let span = match read_u32(data, pos + 8) {
+            Some(s) => s as usize + 12,
+            None => break,
+        };
+        let plen = match read_u16(data, pos + 12) {
+            Some(p) => p as usize,
+            None => break,
+        };
+        let path_start = pos + 14;
+        let path = if plen == 0 || plen > 0x10000 || path_start + plen + 8 > data.len() {
+            String::new()
+        } else {
+            super::utf16_from_bytes(&data[path_start..path_start + plen])
+                .trim_matches('\0')
+                .to_string()
+        };
+        let last_modified = if path_start + plen + 8 <= data.len() {
+            read_u64(data, path_start + plen).and_then(|ft| filetime_to_iso(ft))
+        } else {
+            None
+        };
+        if !path.is_empty() {
+            entries.push(ShimCacheEntry {
+                index,
+                path,
+                last_modified,
+                data_size: 0,
+            });
+            index += 1;
+        }
+        if span == 0 {
+            break;
+        }
+        pos += span;
+    }
+    Ok(entries)
+}
+
 /// Windows 7 format (simplified):
 ///   Header: 128 bytes
 ///   Entry: path_size(2) + max_path(2) + path_offset(4) + FILETIME(8) + flags(4) + padding(4)
@@ -162,5 +234,38 @@ mod tests {
         data[0..4].copy_from_slice(&WIN10_SIGNATURE.to_le_bytes());
         let entries = parse_shimcache(&data).unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// A headerless Win11 v3 blob (first u32 = 0x34) parses instead of
+    /// returning "Unknown ShimCache signature".
+    #[test]
+    fn test_win11_headerless_parses_entry() {
+        let path = "C:\\Windows\\system32\\cmd.exe";
+        let plen = path.len() * 2; // UTF-16 bytes
+        let header = 0x34usize;
+        let mut d = vec![0u8; header + 14 + plen + 8];
+        d[0..4].copy_from_slice(&0x0000_0034u32.to_le_bytes());
+
+        let marker = header;
+        d[marker..marker + 4].copy_from_slice(&V3_ENTRY_MARKER.to_le_bytes());
+        // span-12 field: choose a span that advances past the end to stop the loop.
+        let span_field = (d.len() as u32 - marker as u32) + 4;
+        d[marker + 8..marker + 12].copy_from_slice(&span_field.to_le_bytes());
+        d[marker + 12..marker + 14].copy_from_slice(&(plen as u16).to_le_bytes());
+
+        let path_start = marker + 14;
+        for (i, b) in path.encode_utf16().flat_map(|u| u.to_le_bytes()).enumerate() {
+            d[path_start + i] = b;
+        }
+        let ft = 0x01DB_4A21_053F_B900u64; // a plausible recent FILETIME
+        let ft_pos = path_start + plen;
+        d[ft_pos..ft_pos + 8].copy_from_slice(&ft.to_le_bytes());
+
+        let entries = parse_shimcache(&d)
+            .expect("headerless v3 blob must parse, not hit the unknown-signature error");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].index, 0);
+        assert!(entries[0].last_modified.is_some());
     }
 }
