@@ -211,20 +211,22 @@ impl Orchestrator {
         max_depth: u8,
         parent_tx: Option<tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>>,
     ) -> Self {
-        // SDD §7.4.2: start a single EventPump that forwards every worker's own
-        // event channel to the parent stream. The registration channel is
-        // *bounded* (cap = max_concurrent*2) so the register hop carries
-        // backpressure too (accepted delta vs the spec's UnboundedReceiver).
-        // Keep a clone of the parent event channel so the spawn-time P4
-        // authorization gate can emit its own `permission_request` event back to
-        // the client (the original `parent_tx` is consumed by the EventPump below).
+        // SDD §7.4.2: start a single EventPump that drains every worker's own
+        // event channel (bounded by WORKER_CHANNEL_CAP) so workers never block.
+        // Worker raw fragments are NOT forwarded to the parent stream (see
+        // event_pump module docs — typed subagent_* events carry the milestones).
+        // The registration channel is *bounded* (cap = max_concurrent*2) so the
+        // register hop carries backpressure too (accepted delta vs the spec's
+        // UnboundedReceiver). Keep a clone of the parent event channel so the
+        // spawn-time P4 authorization gate can emit its own `permission_request`
+        // event back to the client.
         let event_tx = parent_tx.clone();
-        let reg_tx = if let Some(ptx) = parent_tx {
+        let reg_tx = if parent_tx.is_some() {
             let cap = env.max_concurrent_subagents.max(1) * 2;
             let (reg_tx, reg_rx) = tokio::sync::mpsc::channel::<
                 tokio::sync::mpsc::Receiver<AgentEvent>
             >(cap);
-            tokio::spawn(EventPump::new(reg_rx, ptx).run());
+            tokio::spawn(EventPump::new(reg_rx).run());
             Some(reg_tx)
         } else {
             None
@@ -931,6 +933,26 @@ pub fn register_orchestrator(root_invocation_id: String, orch: Arc<Orchestrator>
 
 pub fn get_orchestrator(root_invocation_id: &str) -> Option<Arc<Orchestrator>> {
     registry().lock().unwrap().get(root_invocation_id).cloned()
+}
+
+/// True if the given root invocation has an active Orchestrator with at least
+/// one worker still pending or running.
+///
+/// The agent loop uses this to keep an orchestration run alive when the WebSocket
+/// consumer drops mid-wait: tearing the run down (which sets the shared `ended`
+/// flag and cascades cancellation to every in-flight worker) would lose their
+/// results. When that is the case we let `wait_subagent` collect the remaining
+/// workers instead of aborting immediately. Returns false for every non-spawning
+/// session, so the normal abort-on-disconnect behavior is unchanged.
+pub fn has_inflight_workers(root_invocation_id: &str) -> bool {
+    let Some(orch) = get_orchestrator(root_invocation_id) else {
+        return false;
+    };
+    let map = orch.children.lock().unwrap();
+    map.values().any(|h| {
+        let status = h.status.lock().unwrap();
+        matches!(*status, SubAgentStatus::Pending | SubAgentStatus::Running)
+    })
 }
 
 /// Cancel a sub-agent across every live root orchestrator by its run id.

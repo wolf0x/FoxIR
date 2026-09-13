@@ -323,18 +323,17 @@ async fn phase0_twenty_runs_no_busy_no_deadlock_no_event_loss() {
         }
         join_all(ids.iter().map(|id| orch.wait(id))).await;
 
-        // Event-loss guard: every worker must have broadcast its [sub-agent:…] done.
-        // Events flow through the EventPump task asynchronously, so drain with a
-        // bounded settle window instead of a single non-blocking try_recv pass.
+        // Event-loss guard: every worker must emit its typed completion milestone
+        // (subagent_completed) onto the parent stream. Events flow through the
+        // parent channel asynchronously, so drain with a bounded settle window
+        // instead of a single non-blocking try_recv pass.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut broadcasts = 0usize;
         while broadcasts < m && std::time::Instant::now() < deadline {
             match prx.try_recv() {
                 Ok(ev) => {
-                    if let Ok(AgentEvent::TextDelta { content, .. }) = ev {
-                        if content.contains("[sub-agent:") {
-                            broadcasts += 1;
-                        }
+                    if matches!(ev, Ok(AgentEvent::SubagentCompleted { .. })) {
+                        broadcasts += 1;
                     }
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,

@@ -1711,12 +1711,20 @@ impl Agent for LlmAgent {
 
                 // If the consumer (WebSocket client) dropped the event stream —
                 // e.g. user clicked Stop or the connection closed — abort the
-                // agent loop immediately so we don't keep streaming from the
-                // LLM into a dead channel.
+                // agent loop so we don't keep streaming from the LLM into a dead
+                // channel. Exception: if sub-agents are still running (active
+                // orchestration), do not tear the run down mid-wait — that would
+                // cancel every in-flight worker and lose their results. Let
+                // wait_subagent collect them first; once no worker is left the
+                // next pass aborts normally.
                 if tx.is_closed() {
-                    info!("[session:{}] Consumer channel closed, aborting agent loop", session_id);
-                    ended_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
+                    if !crate::agent::orchestration::has_inflight_workers(&invocation_id) {
+                        info!("[session:{}] Consumer channel closed, aborting agent loop", session_id);
+                        ended_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    info!("[session:{}] Consumer closed but sub-agents in flight; continuing to collect worker results",
+                          session_id);
                 }
 
                 // Drain only EXPLICIT "insert-now" messages and feed them into the
@@ -1814,8 +1822,12 @@ impl Agent for LlmAgent {
                             let _ = tx.send(Ok(AgentEvent::usage(&active_model, prompt_t, completion_t, total_t, &invocation_id, &author))).await;
                         }
                         // If the consumer disappeared mid-stream, don't continue
-                        // executing tools or making further LLM calls.
-                        if tx.is_closed() {
+                        // executing tools or making further LLM calls — unless
+                        // sub-agents are still running (active orchestration), in
+                        // which case keep going so wait_subagent can collect them.
+                        if tx.is_closed()
+                            && !crate::agent::orchestration::has_inflight_workers(&invocation_id)
+                        {
                             info!("[session:{}] Consumer closed during LLM response, stopping", session_id);
                             ended_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             return;
@@ -2839,9 +2851,15 @@ async fn execute_tool_call(
                                     author,
                                 );
                                 if tx.send(Ok(progress)).await.is_err() {
-                                    info!("[session] Consumer disconnected during tool '{}', aborting", tool_name);
-                                    tool_handle.abort();
-                                    break Some(serde_json::json!({ "error": "Cancelled by user (consumer disconnected)" }));
+                                    if !crate::agent::orchestration::has_inflight_workers(invocation_id) {
+                                        info!("[session] Consumer disconnected during tool '{}', aborting", tool_name);
+                                        tool_handle.abort();
+                                        break Some(serde_json::json!({ "error": "Cancelled by user (consumer disconnected)" }));
+                                    }
+                                    // Orchestration resilience: consumer dropped but
+                                    // sub-agents are still running — keep waiting for
+                                    // this tool so wait_subagent can collect them.
+                                    info!("[session] Consumer dropped during '{}' but sub-agents in flight; continuing", tool_name);
                                 }
                             }
 
@@ -2868,17 +2886,23 @@ async fn execute_tool_call(
                                     author,
                                 );
                                 if tx.send(Ok(progress)).await.is_err() {
-                                    info!("[session] Consumer disconnected during tool '{}', aborting", tool_name);
-                                    tool_handle.abort();
-                                    break Some(serde_json::json!({ "error": "Cancelled by user (consumer disconnected)" }));
+                                    if !crate::agent::orchestration::has_inflight_workers(invocation_id) {
+                                        info!("[session] Consumer disconnected during tool '{}', aborting", tool_name);
+                                        tool_handle.abort();
+                                        break Some(serde_json::json!({ "error": "Cancelled by user (consumer disconnected)" }));
+                                    }
+                                    info!("[session] Consumer dropped during '{}' but sub-agents in flight; continuing", tool_name);
                                 }
                             }
 
                             // Consumer disconnected (STOP button)
                             _ = tx.closed() => {
-                                info!("Consumer disconnected during tool '{}', aborting", tool_name);
-                                tool_handle.abort();
-                                break Some(serde_json::json!({ "error": "Cancelled by user" }));
+                                if !crate::agent::orchestration::has_inflight_workers(invocation_id) {
+                                    info!("Consumer disconnected during tool '{}', aborting", tool_name);
+                                    tool_handle.abort();
+                                    break Some(serde_json::json!({ "error": "Cancelled by user" }));
+                                }
+                                info!("[session] Consumer dropped during '{}' but sub-agents in flight; continuing wait", tool_name);
                             }
 
                             // Timeout (pinned — survives across loop iterations)

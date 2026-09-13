@@ -1,15 +1,21 @@
 //! Event pump (SDD v1.5 §7.4.2).
 //!
-//! A single in-Manager task that dynamically aggregates every worker's own
-//! event channel with `FuturesUnordered` and forwards events to the parent
-//! run's event stream with tiered backpressure:
-//!   - `TextDelta`: `try_send` (droppable — the hop most tolerant of loss)
-//!   - everything else: `send().await` (guaranteed, single-hop backpressure)
-//! Workers each write to their own `mpsc::channel(cap = WORKER_CHANNEL_CAP)`
-//! and never block; the EventPump is the only await-backpressure point
-//! (§7.4.2). Registration is a *bounded* channel (cap = max_concurrent*2,
-//! set by the Orchestrator) so the register hop also has backpressure — see
-//! the accepted spec delta (avoids §7.4.2's UnboundedReceiver deadlock).
+//! A single in-Manager task that drains every worker's own event channel with
+//! `FuturesUnordered` so workers never block on a full buffer.
+//!
+//! Since P0-A/P0-B, worker *raw* fragments (text/thinking/tool_call/tool_result/
+//! progress) are no longer broadcast into the parent run's WebSocket stream —
+//! the structured milestones are delivered independently by the typed
+//! `subagent_*`/`budget_update` events (`Orchestrator::emit_typed`). This
+//! collapses the wait-phase WS flood that could stall/drop the connection and
+//! tear down an in-flight orchestration run. The EventPump therefore only
+//! *drains* each worker channel (bounded by `WORKER_CHANNEL_CAP`) and drops the
+//! events; `run_worker` still consumes a worker's own stream to build its
+//! summary/evidence/tokens, so no worker data is lost.
+//!
+//! Registration is a *bounded* channel (cap = max_concurrent*2, set by the
+//! Orchestrator) so the register hop carries backpressure — see the accepted
+//! spec delta (avoids §7.4.2's UnboundedReceiver deadlock).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,7 +24,6 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::agent::event::AgentEvent;
-use crate::error::AgentResult;
 
 /// Per-worker event channel capacity (SDD §7.4.2).
 pub const WORKER_CHANNEL_CAP: usize = 128;
@@ -28,17 +33,16 @@ type WorkerEvent = (Option<AgentEvent>, tokio::sync::mpsc::Receiver<AgentEvent>)
 /// The Manager's single event aggregation task.
 pub struct EventPump {
     reg_rx: tokio::sync::mpsc::Receiver<tokio::sync::mpsc::Receiver<AgentEvent>>,
-    ws_tx: tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>,
 }
 
 impl EventPump {
     /// `reg_rx` receives newly-spawned worker channels (bounded by the
-    /// Orchestrator); `ws_tx` is the parent run's event stream sink.
+    /// Orchestrator). The pump only drains worker channels; it does not forward
+    /// events to the parent stream (see module docs).
     pub fn new(
         reg_rx: tokio::sync::mpsc::Receiver<tokio::sync::mpsc::Receiver<AgentEvent>>,
-        ws_tx: tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>,
     ) -> Self {
-        Self { reg_rx, ws_tx }
+        Self { reg_rx }
     }
 
     fn push(
@@ -83,18 +87,11 @@ impl EventPump {
         }
     }
 
-    /// Tiered backpressure (§7.4.2): `TextDelta` is droppable; all other events
-    /// are awaited (one controlled hop). (`PromptAugmented` does not exist in
-    /// this codebase's `AgentEvent`, so `_` covers every remaining variant.)
+    /// Drain one worker event. The event is intentionally dropped (not sent to
+    /// the parent stream) — see the module docs. Returning immediately keeps the
+    /// drain loop moving so the worker's bounded channel never blocks.
     async fn forward(&self, e: AgentEvent) {
-        match &e {
-            AgentEvent::TextDelta { .. } => {
-                let _ = self.ws_tx.try_send(Ok(e));
-            }
-            _ => {
-                let _ = self.ws_tx.send(Ok(e)).await;
-            }
-        }
+        let _ = e;
     }
 }
 
