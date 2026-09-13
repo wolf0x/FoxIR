@@ -193,6 +193,11 @@ pub struct Orchestrator {
     /// write/exec workers are forced to run one-at-a-time. Read-only workers
     /// never touch this gate (they are concurrency-safe).
     write_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Parent event channel (a clone of the EventPump sink) used to emit
+    /// interactive `permission_request` events for the P4 write/exec spawn
+    /// authorization gate. `None` in headless contexts -> authorization is
+    /// denied by default (no way to reach the user).
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>>,
 }
 
 impl Orchestrator {
@@ -210,6 +215,10 @@ impl Orchestrator {
         // event channel to the parent stream. The registration channel is
         // *bounded* (cap = max_concurrent*2) so the register hop carries
         // backpressure too (accepted delta vs the spec's UnboundedReceiver).
+        // Keep a clone of the parent event channel so the spawn-time P4
+        // authorization gate can emit its own `permission_request` event back to
+        // the client (the original `parent_tx` is consumed by the EventPump below).
+        let event_tx = parent_tx.clone();
         let reg_tx = if let Some(ptx) = parent_tx {
             let cap = env.max_concurrent_subagents.max(1) * 2;
             let (reg_tx, reg_rx) = tokio::sync::mpsc::channel::<
@@ -232,6 +241,7 @@ impl Orchestrator {
             reg_tx,
             budgets: Arc::new(Mutex::new(HashMap::new())),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            event_tx,
         }
     }
 
@@ -316,6 +326,110 @@ impl Orchestrator {
             }
         }
         None
+    }
+
+    /// P4 (§6.4): Authorization gate for spawning a write/exec worker.
+    ///
+    /// Read-only workers (`allow_write=false && allow_exec=false`) never call
+    /// this and are admitted with zero extra latency. A write/exec worker is
+    /// admitted only when either:
+    ///   1. the managed pre-authorization profile bypasses the gate
+    ///      (`allow_all` / matching action class), or
+    ///   2. the user explicitly approves the interactive `permission_request`.
+    ///
+    /// Uses the same PendingMap + oneshot round-trip as
+    /// [`crate::permission::PermissionChecker::request_confirmation`]: a
+    /// `request_id` is generated, the oneshot sender is parked in
+    /// `env.permission_pending`, a `permission_request` event is emitted on the
+    /// parent channel, and we wait up to 30s for the user's reply. Timeout,
+    /// dropped channel, denial, or a missing event channel (headless) all
+    /// resolve to `false` (deny by default).
+    pub async fn request_spawn_authorization(&self, spec: &SubAgentSpec) -> bool {
+        // 1) Pre-authorization profile bypass (managed mode / CRON auto-approve).
+        if let Some(profile) = &self.env.preauth_profile {
+            let preauth_args = serde_json::json!({
+                "role": spec.role,
+                "allow_write": spec.allow_write,
+                "allow_exec": spec.allow_exec,
+            });
+            if crate::managed::permission_profile::check_preauthorization(
+                profile, "spawn_subagent", &preauth_args) {
+                tracing::info!(
+                    "[orch] write/exec worker '{}' pre-authorized by profile; skipping interactive gate",
+                    spec.role);
+                return true;
+            }
+        }
+
+        // 2) Interactive user confirmation. Without an event channel there is no
+        //    way to reach the user (headless) -> deny by default.
+        let Some(tx) = self.event_tx.as_ref() else {
+            tracing::info!(
+                "[orch] no event channel to request spawn authorization; denying write/exec worker '{}'",
+                spec.role);
+            return false;
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let category = if spec.allow_exec { "execute" } else { "write" };
+        tracing::info!(
+            "[orch] spawn authorization required for write/exec worker '{}' (category: {}), request_id: {}",
+            spec.role, category, request_id);
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<bool>();
+        {
+            let mut pending = self.env.permission_pending.lock().await;
+            pending.insert(request_id.clone(), resp_tx);
+        }
+
+        let scope = match (spec.allow_write, spec.allow_exec) {
+            (true, true) => "写入与执行",
+            (_, true) => "执行",
+            (true, _) => "写入",
+            _ => "写入/执行",
+        };
+        let explanation = format!(
+            "请求派生具备【{}】权限的子代理（角色：{}），该子代理可执行写入/命令类操作。",
+            scope, spec.role);
+        let args = serde_json::json!({
+            "role": spec.role,
+            "prompt": spec.prompt,
+            "allow_write": spec.allow_write,
+            "allow_exec": spec.allow_exec,
+        });
+        let event = AgentEvent::permission_request(
+            &request_id,
+            "spawn_subagent",
+            category,
+            args,
+            &explanation,
+            &self.root_invocation_id,
+            "manager",
+        );
+        let _ = tx.send(Ok(event)).await;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(30), resp_rx).await {
+            Ok(Ok(allowed)) => {
+                tracing::info!(
+                    "[orch] spawn authorization {} for write/exec worker '{}' (request_id: {})",
+                    if allowed { "granted" } else { "denied" }, spec.role, request_id);
+                allowed
+            }
+            Ok(Err(_)) => {
+                tracing::info!(
+                    "[orch] spawn authorization channel dropped for worker '{}'; denying by default",
+                    spec.role);
+                false
+            }
+            Err(_) => {
+                tracing::info!(
+                    "[orch] spawn authorization timed out for worker '{}'; denying by default",
+                    spec.role);
+                let mut pending = self.env.permission_pending.lock().await;
+                pending.remove(&request_id);
+                false
+            }
+        }
     }
 
     /// Spawn a worker sub-agent from a spawn request made by the parent.

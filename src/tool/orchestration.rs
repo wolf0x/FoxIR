@@ -80,6 +80,19 @@ impl Tool for SpawnSubagentTool {
         let o = orch(ctx)?;
         let spec: SubAgentSpec = serde_json::from_value(args)
             .map_err(|e| AgentError::agent(format!("spawn_subagent: bad args: {e}")))?;
+        // P4 (§6.4): read-only workers are admitted with no extra gate; write/exec
+        // workers (allow_write || allow_exec) require explicit user authorization
+        // (or a matching pre-authorization profile) before spawning. Denied =>
+        // structured rejection (no panic), suggesting a read-only re-spawn.
+        if spec.allow_write || spec.allow_exec {
+            if !o.request_spawn_authorization(&spec).await {
+                return Ok(json!({
+                    "error": "Write/exec worker authorization denied by user",
+                    "status": "rejected",
+                    "suggestion": "Re-spawn with allow_write=false for read-only access"
+                }));
+            }
+        }
         // Step 2b: allow_write / allow_exec workers are admitted (§7.10 layer 2)
         // and forced serial by the Orchestrator's write_gate.
         let run_id = o.spawn(&spec, ctx.depth, &ctx.base.base.invocation_id, &ctx.base.base.session_id, &ctx.base.base.agent_name).await?;

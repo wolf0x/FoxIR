@@ -169,6 +169,19 @@ fn manager_system_prompt(lang: &str, domain: TaskDomain, tool_defs: &[ToolDefini
     prompt.push_str("19. PARALLEL DISPATCH (optional, T5.5): If the next round contains 2 or more INDEPENDENT, read-only collection/analysis steps that share no data dependency, list them under a \"Parallel Subtasks:\" section as one bullet per worker line, format `- role | one-sentence self-contained task` (e.g. `- port_scan | enumerate open TCP ports on 10.0.0.5`). Each must be complete stand-alone and read-only (no writes, no containment). Keep the main \"Subtask:\" as the round objective that consumes/advances on those parallel results. If nothing is safely parallel, omit the Parallel Subtasks section entirely (single-Executor fallback). Limit to the concurrency bound.
 ");
     prompt.push_str(&format!("\n{}\n", tool_ref));
+
+    prompt.push_str("\n## CAPABILITY ROUTING (Two-Layer Decision)\n\n");
+    prompt.push_str("Layer 1 — Capability Selection:\n");
+    prompt.push_str("1. If a Skill matches the subtask domain, instruct the Executor to use it (hot skills auto-inject; cold via skill_read_file)\n");
+    prompt.push_str("2. Select tools closest to the data source — prefer domain-specific tools over generic shell/browser:\n");
+    prompt.push_str("   - EVTX → ir_eventlog, PCAP → ir_pcap_analyze, Memory → ir_memdump\n");
+    prompt.push_str("   - Registry → ir_registry, Prefetch → ir_prefetch, Timeline → ir_timeline\n");
+    prompt.push_str("3. Match tool to artifact type; do NOT use shell commands when a specialized tool exists\n\n");
+    prompt.push_str("Layer 2 — Execution Dispatch:\n");
+    prompt.push_str("- Expert mode is ALWAYS serial: Manager → Executor → Auditor per round\n");
+    prompt.push_str("- Each subtask is executed sequentially; no parallel fan-out in Expert mode\n");
+    prompt.push_str("- Write/exec actions follow the pre-authorization profile or human gate\n");
+
     prompt.push_str(&format!("\nLANGUAGE: The original task is written in {lang}. Write all free-text fields (Subtask, Success Criteria, Expected Evidence, reason) in {lang}; keep structure and tool names in English.\n"));
     prompt
 }
