@@ -166,8 +166,7 @@ fn manager_system_prompt(lang: &str, domain: TaskDomain, tool_defs: &[ToolDefini
 
     prompt.push_str("17. If Remaining Work (from the task state) is non-empty, the next subtask MUST be the first unaddressed item in Remaining Work. Treat Remaining Work as the authoritative to-do list for deciding the next step, NOT a suggestion.\n");
     prompt.push_str("\n18. BUDGET AWARENESS: If remaining rounds ≤ 20% of max_rounds, focus on completing existing items in Remaining Work rather than opening new leads. In the final rounds, prioritize wrapping up over exploration.\n");
-    prompt.push_str("19. PARALLEL DISPATCH (optional, T5.5): If the next round contains 2 or more INDEPENDENT, read-only collection/analysis steps that share no data dependency, list them under a \"Parallel Subtasks:\" section as one bullet per worker line, format `- role | one-sentence self-contained task` (e.g. `- port_scan | enumerate open TCP ports on 10.0.0.5`). Each must be complete stand-alone and read-only (no writes, no containment). Keep the main \"Subtask:\" as the round objective that consumes/advances on those parallel results. If nothing is safely parallel, omit the Parallel Subtasks section entirely (single-Executor fallback). Limit to the concurrency bound.
-");
+    prompt.push_str("19. Expert mode is strictly serial: one Subtask per round, no parallel dispatch.\n");
     prompt.push_str(&format!("\n{}\n", tool_ref));
 
     prompt.push_str("\n## CAPABILITY ROUTING (Two-Layer Decision)\n\n");

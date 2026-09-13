@@ -1352,7 +1352,8 @@ impl Agent for LlmAgent {
         // `user_message` is still the borrowed &str (it is shadowed to String
         // further down). When false the allowset stays empty and no Orchestrator
         // is built — the zero-overhead promise for non-fan-out runs.
-        let orch_candidate = ctx.mode == crate::context::AgentMode::Instant
+        let orch_candidate = ctx.can_spawn
+            && ctx.mode == crate::context::AgentMode::Instant
             && ctx.depth == 0
             && orchestration_prefilter(user_message);
         let (core_tool_defs, load_schema_def) = {

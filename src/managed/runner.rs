@@ -421,9 +421,7 @@ impl ManagedRunner {
         let tool_timeout_secs = self.tool_timeout_secs;
         let max_tool_retries = self.max_tool_retries;
         let skill_manager = self.skill_manager.clone();
-        let working_dir = self.working_dir.clone();
         let workspace_dir = self.workspace_dir.clone();
-        let orchestration_limits = self.orchestration_limits;
         let computer_use_enabled = self.computer_use_enabled.clone();
         let human_intervention_enabled = self.human_intervention_enabled.clone();
         let provider = self.provider.clone();

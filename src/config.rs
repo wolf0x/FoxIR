@@ -276,6 +276,15 @@ impl ModesConfig {
             tracing::warn!("[config] modes.subagent.skill_strategy invalid; falling back to 'disabled'");
             self.subagent.skill_strategy = "disabled".to_string();
         }
+
+        // Validate instant orchestration limits
+        if self.instant.max_concurrent_subagents == 0 {
+            tracing::warn!("[config] modes.instant.max_concurrent_subagents is 0, will be clamped to 1 at runtime");
+        }
+        if self.instant.max_tokens_per_run > self.instant.max_total_tokens && self.instant.max_total_tokens > 0 {
+            tracing::warn!("[config] modes.instant.max_tokens_per_run ({}) exceeds max_total_tokens ({})",
+                self.instant.max_tokens_per_run, self.instant.max_total_tokens);
+        }
     }
 }
 
