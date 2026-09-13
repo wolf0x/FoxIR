@@ -2396,6 +2396,13 @@ function sendMsg(){
     // Queue as a follow-up on the server NOW so it auto-runs AFTER the current task
     // completes (not injected into the running task, not dropped).
     if(ws&&connected){ws.send(JSON.stringify({type:'interject',content:txt,session:SESSION_ID,insert:false}));}
+    // Render the interjection as a user message in the conversation immediately.
+    // Previously it lived only in the pending bar, which setAgentRunning(false)
+    // clears when the current task ends - so it vanished from the UI even though
+    // the AI had already received and was reasoning on it.
+    showUserMsg(txt,[]);
+    msgHist.push({role:'user',text:txt,time:nowTimeStr()});
+    saveHist();
     inp.value='';inp.style.height='auto';
     updateSendState();
     return;
@@ -2571,7 +2578,6 @@ function injectInterject(i){
   const content=interjectList[i];
   interjectList.splice(i,1);
   if(ws&&connected){ws.send(JSON.stringify({type:'interject',content:content,session:SESSION_ID,insert:true}));}
-  showUserMsg(content,[]);
   renderInterjectBar();updateSendState();
 }
 function dropInterject(i){
