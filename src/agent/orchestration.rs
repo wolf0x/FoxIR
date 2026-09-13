@@ -570,6 +570,19 @@ impl Orchestrator {
     pub fn plan(&self) -> Option<serde_json::Value> {
         self.plan.read().unwrap().clone()
     }
+
+    /// Gracefully shut down all workers: set root_ended and cancel all children.
+    /// Called by OrchLifecycle::drop when the parent agent task ends.
+    pub fn shutdown(&self) {
+        // 1. Set root_ended — all child_ctx.is_ended() will see true
+        self.root_ended.store(true, Ordering::SeqCst);
+        // 2. Cancel each child explicitly (belt-and-suspenders)
+        if let Ok(map) = self.children.lock() {
+            for h in map.values() {
+                h.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 impl Drop for Orchestrator {

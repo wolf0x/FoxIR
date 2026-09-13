@@ -1235,6 +1235,8 @@ struct OrchLifecycle {
 
 impl Drop for OrchLifecycle {
     fn drop(&mut self) {
+        // P7: Propagate cancellation to all workers BEFORE unregistering
+        self._orch.shutdown();
         crate::agent::orchestration::unregister_orchestrator(&self.key);
     }
 }
@@ -1482,6 +1484,7 @@ impl Agent for LlmAgent {
             None
         };
         let orch_key = ctx.base.invocation_id.clone();
+        let ended_flag = ctx.ended_flag();
 
         tokio::spawn(async move {
             // Release the per-run Orchestrator when this task ends (by any path).
@@ -1683,6 +1686,7 @@ impl Agent for LlmAgent {
                 // LLM into a dead channel.
                 if tx.is_closed() {
                     info!("[session:{}] Consumer channel closed, aborting agent loop", session_id);
+                    ended_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
 
@@ -1784,6 +1788,7 @@ impl Agent for LlmAgent {
                         // executing tools or making further LLM calls.
                         if tx.is_closed() {
                             info!("[session:{}] Consumer closed during LLM response, stopping", session_id);
+                            ended_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             return;
                         }
                         // If the model didn't emit native tool_calls, try to
