@@ -11,6 +11,32 @@ use std::sync::Mutex;
 use crate::error::{AgentError, AgentResult};
 use crate::model::ChatMessage;
 
+/// Per-session metadata kept in the lightweight session index (title, timestamps,
+/// soft-delete flag). This is the "session registry" layer used by the multi-session
+/// navigation UI; it is decoupled from the heavy per-session conversation history
+/// which lives in `AppState.sessions` and `memory.db` (keyed by session_id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl SessionMeta {
+    pub fn new(title: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            title,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        }
+    }
+}
+
 /// A single session representing a conversation.
 /// Modeled after ADK-RUST's Session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,4 +162,115 @@ impl SessionService for InMemorySessionService {
         session.append_message(message);
         Ok(())
     }
+}
+
+/// Lightweight per-process session registry backing the multi-session navigation
+/// UI. Tracks title/timestamps/soft-delete for each session id and persists to a
+/// single JSON file so the list survives process restarts. It deliberately does
+/// NOT own conversation history — that remains in `AppState.sessions` (memory)
+/// and `memory.db` (SQLite, keyed by session_id), which already give per-session
+/// isolation. This layer only surfaces which sessions exist and how to label them.
+pub struct SessionIndex {
+    path: std::path::PathBuf,
+    metas: Mutex<HashMap<String, SessionMeta>>,
+}
+
+impl SessionIndex {
+    /// Load the index from `path` (creating an empty one if missing/corrupt).
+    pub fn load(path: std::path::PathBuf) -> Self {
+        let metas = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<HashMap<String, SessionMeta>>(&raw).ok())
+            .unwrap_or_default();
+        Self { path, metas: Mutex::new(metas) }
+    }
+
+    /// Persist current index to disk (best-effort; failures are logged by caller).
+    pub fn save(&self) -> Result<(), String> {
+        let metas = self.metas.lock().map_err(|e| format!("SessionIndex lock: {e}"))?;
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let raw = serde_json::to_string_pretty(&*metas).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, raw).map_err(|e| e.to_string())
+    }
+
+    /// Register the session if unknown, bump `updated_at`, and optionally set a
+    /// title on first sight. Cheap and safe to call on every active-session adopt.
+    pub fn touch(&self, session_id: &str, title: Option<String>) -> Result<(), String> {
+        let mut metas = self.metas.lock().map_err(|e| format!("SessionIndex lock: {e}"))?;
+        let now = Utc::now();
+        match metas.get_mut(session_id) {
+            Some(m) => {
+                m.updated_at = now;
+                if title.is_some() && m.title.is_none() {
+                    m.title = title;
+                }
+            }
+            None => {
+                let mut meta = SessionMeta::new(title);
+                meta.updated_at = now;
+                metas.insert(session_id.to_string(), meta);
+            }
+        }
+        drop(metas);
+        self.save()
+    }
+
+    /// Rename a session (returns Err if absent).
+    pub fn rename(&self, session_id: &str, title: &str) -> Result<(), String> {
+        let mut metas = self.metas.lock().map_err(|e| format!("SessionIndex lock: {e}"))?;
+        let meta = metas.get_mut(session_id).ok_or_else(|| format!("Session not found: {session_id}"))?;
+        meta.title = Some(title.trim().to_string());
+        meta.updated_at = Utc::now();
+        drop(metas);
+        self.save()
+    }
+
+    /// Soft-delete a session so it disappears from the list (history retained in
+    /// memory/SQLite for potential recovery).
+    pub fn soft_delete(&self, session_id: &str) -> Result<(), String> {
+        let mut metas = self.metas.lock().map_err(|e| format!("SessionIndex lock: {e}"))?;
+        if let Some(meta) = metas.get_mut(session_id) {
+            meta.deleted = true;
+            meta.updated_at = Utc::now();
+        }
+        drop(metas);
+        self.save()
+    }
+
+    /// All non-deleted sessions, newest-first by `updated_at`.
+    pub fn list(&self) -> Vec<(String, SessionMeta)> {
+        let metas = self.metas.lock().map(|g| g.clone()).unwrap_or_default();
+        let mut v: Vec<(String, SessionMeta)> = metas
+            .into_iter()
+            .filter(|(_, m)| !m.deleted)
+            .collect();
+        v.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        v
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<SessionMeta> {
+        self.metas.lock().ok().and_then(|g| g.get(session_id).cloned())
+    }
+}
+
+#[test]
+fn session_index_touch_rename_delete_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("foxir_sess_test_{}", uuid::Uuid::new_v4()));
+    let path = dir.join("session_index.json");
+    let idx = SessionIndex::load(path.clone());
+    idx.touch("sess-1", Some("First".into())).unwrap();
+    idx.touch("sess-2", None).unwrap();
+    assert_eq!(idx.list().len(), 2);
+    idx.rename("sess-1", "Renamed").unwrap();
+    assert_eq!(idx.list()[0].1.title.as_deref(), Some("Renamed"));
+    idx.soft_delete("sess-2").unwrap();
+    assert_eq!(idx.list().len(), 1);
+
+    // Persistence survives a reload.
+    let idx2 = SessionIndex::load(path.clone());
+    assert_eq!(idx2.list().len(), 1);
+    assert_eq!(idx2.list()[0].1.title.as_deref(), Some("Renamed"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

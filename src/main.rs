@@ -34,7 +34,6 @@ mod policy;
 mod runner;
 mod scheduler;
 mod server;
-#[allow(dead_code)]
 mod session;
 mod skill;
 mod sop;
@@ -717,6 +716,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         expert_max_managed_rounds: Arc::new(AtomicUsize::new(config.agent.expert_max_managed_rounds)),
         orchestration_limits: Arc::new(crate::config::OrchestrationLimits::from(&config.agent.modes.instant)),
         sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        session_index: Arc::new({
+            let idx_path = std::path::Path::new(&workspace_dir).join("session_index.json");
+            crate::session::SessionIndex::load(idx_path)
+        }),
         permissions,
         permission_resolver,
         permission_pending,

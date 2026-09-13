@@ -4,7 +4,7 @@ use axum::{
         Path, Query, State,
     },
     response::{IntoResponse, Response},
-    routing::{get, post, put, delete},
+    routing::{get, post, put, delete, patch},
     Json, Router,
 };
 use futures::StreamExt;
@@ -183,6 +183,9 @@ pub struct AppState {
     pub orchestration_limits: Arc<crate::config::OrchestrationLimits>,
     /// Per-session conversation history for multi-turn context
     pub sessions: Arc<Mutex<std::collections::HashMap<String, Vec<ChatMessage>>>>,
+    /// Lightweight session registry for the multi-session navigation UI
+    /// (titles/timestamps/soft-delete), persisted to session_index.json.
+    pub session_index: Arc<crate::session::SessionIndex>,
     /// Permission settings (category -> allowed), shared across connections
     pub permissions: Arc<Mutex<std::collections::HashMap<String, bool>>>,
     /// Resolver for pending permission requests
@@ -266,9 +269,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 .route("/api/memory/deep", get(deep_memory_list_handler))
 .route("/api/memory/deep", post(deep_memory_create_handler))
 .route("/api/memory/deep/{id}", put(deep_memory_update_handler))
-.route("/api/memory/deep/{id}", delete(deep_memory_delete_handler))
+        .route("/api/memory/deep/{id}", delete(deep_memory_delete_handler))
         .route("/api/memory/deep/import", post(deep_memory_import_handler))
         .route("/api/history", get(history_handler))
+        .route("/api/sessions", get(sessions_list_handler))
+        .route("/api/sessions", post(sessions_create_handler))
+        .route("/api/sessions/{id}", patch(sessions_rename_handler))
+        .route("/api/sessions/{id}", delete(sessions_delete_handler))
         .route("/api/usage", get(usage_handler))
         .route("/api/usage/today", get(usage_today_handler))
         .route("/api/budget", get(budget_handler))
@@ -1468,6 +1475,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                     session_id = client_sess.to_string();
                                 }
                             }
+                            // Surface the active session in the navigation index so it
+                            // appears (and is labelled) in the sidebar. Idempotent.
+                            let _ = state.session_index.touch(&session_id, None);
 
                             // Reset cancellation for new chat (new explicit task
                             // re-enables follow-up auto-dispatch).
@@ -2602,6 +2612,9 @@ struct HistoryQuery {
     limit: usize,
     #[serde(default = "default_tz_offset")]
     tz_offset: i32,
+    /// Optional session_id filter. When present, only entries for that session
+    /// are returned; when absent, behaviour is unchanged (all recent entries).
+    session: Option<String>,
 }
 
 // ── Engram Curator（后台自动蒸馏，temm1e 形态）───────────────
@@ -2781,6 +2794,10 @@ async fn history_handler(
             // Filter to user/assistant roles and take the last N entries
             let filtered: Vec<_> = entries.into_iter()
                 .filter(|e| e.role == "user" || e.role == "assistant")
+                .filter(|e| match &query.session {
+                    Some(sid) if !sid.is_empty() => e.session_id == *sid,
+                    _ => true,
+                })
                 .collect();
             let chat: Vec<Value> = filtered.into_iter()
                 .rev()
@@ -2798,6 +2815,73 @@ async fn history_handler(
             Json(json!({ "messages": chat, "count": chat.len() }))
         }
         Err(e) => Json(json!({ "messages": [], "count": 0, "error": e })),
+    }
+}
+
+// ── Multi-session (navigation UI) API ────────────────────────
+// These endpoints drive the sidebar session list + new/rename/delete lifecycle.
+// Conversation isolation is already provided by AppState.sessions + memory.db
+// (keyed by session_id); this layer only exposes which sessions exist and their
+// labels. Adding these is strictly additive — no existing behaviour changes.
+
+async fn sessions_list_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let list = state.session_index.list();
+    let sessions: Vec<Value> = list
+        .into_iter()
+        .map(|(id, meta)| json!({
+            "id": id,
+            "title": meta.title.unwrap_or_else(|| "New session".to_string()),
+            "created_at": meta.created_at.to_rfc3339(),
+            "updated_at": meta.updated_at.to_rfc3339(),
+        }))
+        .collect();
+    Json(json!({ "sessions": sessions, "count": sessions.len() }))
+}
+
+#[derive(Deserialize)]
+struct SessionCreateBody {
+    title: Option<String>,
+}
+
+async fn sessions_create_handler(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<SessionCreateBody>>,
+) -> Json<Value> {
+    let title = body.as_ref().and_then(|b| b.title.clone());
+    let id = uuid::Uuid::new_v4().to_string();
+    let _ = state.session_index.touch(&id, title);
+    let meta = state.session_index.get(&id);
+    Json(json!({
+        "id": id,
+        "title": meta.as_ref().and_then(|m| m.title.clone()).unwrap_or_else(|| "New session".to_string()),
+        "created_at": meta.as_ref().map(|m| m.created_at.to_rfc3339()),
+        "updated_at": meta.as_ref().map(|m| m.updated_at.to_rfc3339()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SessionRenameBody {
+    title: String,
+}
+
+async fn sessions_rename_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Json<SessionRenameBody>,
+) -> Json<Value> {
+    match state.session_index.rename(&id, &body.title) {
+        Ok(()) => Json(json!({ "success": true, "id": id, "title": body.title })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+async fn sessions_delete_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match state.session_index.soft_delete(&id) {
+        Ok(()) => Json(json!({ "success": true, "id": id })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
     }
 }
 
