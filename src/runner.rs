@@ -46,7 +46,7 @@ pub struct Runner {
     skill_hot_top_k: Arc<AtomicUsize>,
     /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
     can_spawn: bool,
-    /// Operational mode for this run (Expert unlocks orchestration at depth 0).
+    /// Operational mode for this run (Instant unlocks orchestration at depth 0).
     mode: crate::context::AgentMode,
 }
 
@@ -70,7 +70,7 @@ pub struct RunnerBuilder {
     skill_hot_top_k: Arc<AtomicUsize>,
     /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
     can_spawn: bool,
-    /// Operational mode for this run (Expert unlocks orchestration at depth 0).
+    /// Operational mode for this run (Instant unlocks orchestration at depth 0).
     mode: crate::context::AgentMode,
 }
 

@@ -424,7 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Register orchestration shell tools (SDD v1.5 \u00a77.3 / Step 1). The delivery
-    // gate hides them from every model until Step 2a opens `Expert && depth == 0`.
+    // gate hides them from every model until the delivery gate opens `Instant && depth == 0`.
     crate::tool::orchestration::register_orchestration_tools(&mut registry);
 
     // Build LLM provider (implements Llm trait)

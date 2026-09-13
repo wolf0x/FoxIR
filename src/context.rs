@@ -16,7 +16,7 @@ use crate::model::ChatMessage;
 use crate::permission::PendingMap;
 use crate::checkpoint::ATaskCheckpointer;
 
-/// Agent operational mode. Orchestration is only available in Expert mode.
+/// Agent operational mode. Orchestration is only available in Instant mode (depth 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentMode {
     #[default]

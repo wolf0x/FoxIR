@@ -181,7 +181,8 @@ pub struct ExpertModeConfig {
     /// Max sub-agent nesting depth (Phase 0 = 1: root spawns depth-1 workers only).
     #[serde(default = "default_expert_max_depth")]
     pub max_depth: u8,
-    /// Orchestration gate: "on" (Step 2a opens `Expert && depth == 0`) or "off".
+    /// Legacy orchestration gate: kept only as fallback when `modes.instant.orchestration`
+    /// is unset. The runtime gate is now `Instant && depth == 0`.
     #[serde(default = "default_expert_orchestration_state")]
     pub orchestration: String,
     /// Upper bound on concurrently running sub-agents (SDD v1.5 §9, >= 1).
