@@ -1415,6 +1415,7 @@ impl Agent for LlmAgent {
         let workspace_dir = self.workspace_dir.clone();
         let mode = ctx.mode;
         let depth = ctx.depth;
+        let can_spawn = ctx.can_spawn;
         let output_dir_override = match &ctx.tool_output_dir {
             Some(d) if !d.is_empty() => d.clone(),
             _ => String::new(),
@@ -2118,7 +2119,7 @@ impl Agent for LlmAgent {
                                         &invocation_id, &author
                                     ))).await;
                                     let msgs = execute_tools_concurrent(
-                                        &tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id,
+                                        &tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, can_spawn, &invocation_id,
                                     ).await;
                                     history.extend(msgs);
                                 } else {
@@ -2126,7 +2127,7 @@ impl Agent for LlmAgent {
                                     for tc in &tool_calls {
                                         inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
-                                            &tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id, event_log.as_mut(),
+                                            &tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, can_spawn, &invocation_id, event_log.as_mut(),
                                         ).await;
                                         history.push(msg);
                                     }
@@ -2149,14 +2150,14 @@ impl Agent for LlmAgent {
                                 if all_read_only && tool_calls.len() > 1 {
                                     info!("[session:{}] Executing {} tool call(s) concurrently", session_id, tool_calls.len());
                                     let msgs = execute_tools_concurrent(
-                                        &*tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id,
+                                        &*tools, &tool_calls, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, can_spawn, &invocation_id,
                                     ).await;
                                     history.extend(msgs);
                                 } else {
                                     for tc in &tool_calls {
                                         inject_user_interjections(&mut history, &session_id);
                                         let msg = execute_tool_call(
-                                            &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, false, &invocation_id, event_log.as_mut(),
+                                            &*tools, tc, &working_dir, &workspace_dir, &output_dir_override, &invocation_id, &author, &session_id, &tx, &checker, tool_timeout_secs, max_tool_retries, context_window, inline_scaling_enabled, max_inline_chars, mode, depth, can_spawn, &invocation_id, event_log.as_mut(),
                                         ).await;
                                         history.push(msg);
                                     }
