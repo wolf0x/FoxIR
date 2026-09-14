@@ -33,7 +33,11 @@ impl Tool for KnowledgeIngestTool {
         "Add knowledge to the local knowledge base (workspace/knowledge). Pass raw 'text' \
          (for remote content, fetch it first with web_fetch) or a local 'source_path'. \
          Provide an optional 'title', comma-separated 'tags', and 'category'. The content \
-         is saved as markdown and indexed, so it becomes findable via knowledge_search."
+         is saved as markdown and indexed, so it becomes findable via knowledge_search. \
+         The knowledge base is for DURABLE METHODOLOGY — reusable playbooks, procedures, \
+         learnings, and reference material. Do NOT ingest one-off conversation conclusions \
+         or per-investigation findings here (those belong in deep memory via the curator); \
+         only consolidate a conversation into knowledge when the user explicitly asks."
     }
 
     fn is_builtin(&self) -> bool {

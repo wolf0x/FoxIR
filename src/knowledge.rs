@@ -45,7 +45,7 @@ fn preferred_file(workspace_dir: &str) -> PathBuf {
 
 /// Load the set of knowledge files the user has pinned for priority retrieval.
 /// Returns an empty vec when unset or unreadable. Stored as relative paths
-/// (e.g. ["threat-intel/apt.md", "lessons.md"]).
+/// (e.g. ["ops/playbook.md", "lessons.md"]).
 pub fn load_preferred(workspace_dir: &str) -> Vec<String> {
     let pf = preferred_file(workspace_dir);
     let Ok(raw) = std::fs::read_to_string(&pf) else {
@@ -306,8 +306,8 @@ pub fn upload_file(workspace_dir: &str, rel: &str, body: &str) -> Result<String,
     let _ = build_index(workspace_dir);
     Ok(norm)
 }
-/// Delete a knowledge document by its relative path (e.g. "lessons.md" or
-/// "threat-intel/apt.md"). Path traversal is rejected.
+/// Delete a knowledge document by its relative path (e.g. "ops/playbook.md" or
+/// "lessons.md"). Path traversal is rejected.
 pub fn delete_file(workspace_dir: &str, rel: &str) -> Result<(), String> {
     let norm = rel.trim().replace('\\', "/").trim_start_matches('/').to_string();
     let p = Path::new(&norm);
