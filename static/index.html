@@ -1607,7 +1607,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 <script>
 // 閳光偓閳光偓 State 閳光偓閳光偓
 let ws=null,connected=false,msgHist=[],logHist=[];
-let curThinkEl=null,curTextEl=null,textAccum='',curToolMap={},agentRunning=false,msgQueue=[];
+let curThinkEl=null,curTextEl=null,textAccum='',curToolMap={},agentRunning=false,msgQueue=[],_doneSid=null;
 let interjectList=[];
 let lastInvId=null; // Expert mode multi-round: track invocation_id to segment output blocks
 let subAgentRunIds=new Set(),subAgentRoles=new Set(),subAgentCards={},subAgentOrder=[];
@@ -1678,6 +1678,8 @@ function switchSession(id){
   try{sessionStorage.setItem('ra_session_id',id);}catch(e){}
   clearCurrentSessionUI();
   restoreCurrentSession();
+  // Sync the running/STOP pulse to the newly active session (per-session isolation).
+  setAgentRunning(runningSessions.has(id));
   // If this session is streaming a task in the background, surface whatever
   // output has accumulated so the view is not blank while it keeps running.
   const buf=bgBuffer[id];
@@ -1942,6 +1944,7 @@ function handleMsg(msg){
   }
   if(msg.type==='done'||msg.type==='error'){
     var _fin=taskSessionId||SESSION_ID;
+    _doneSid=_fin;
     taskSessionId=null;
     if(_fin!==SESSION_ID){
       var _snap=sessionSnapshots[_fin]||(sessionSnapshots[_fin]={msgHist:[],logHist:logHist.slice(),html:''});
@@ -2063,7 +2066,7 @@ function handleMsg(msg){
       curToolMap={};
       lastInvId=null;
       subAgentRunIds=new Set();subAgentRoles=new Set();subAgentOrder=[];subAgentCards={};
-      setAgentRunning(false);
+      if(_doneSid===null||_doneSid===SESSION_ID)setAgentRunning(false);
       // Refresh checkpoint banner (completed checkpoints are deleted server-side)
       checkCheckpoints();
       // Refresh output artifacts panel
@@ -2499,7 +2502,7 @@ function sendMsg(){
   let sendTxt=txt;
 
 
-  if(agentRunning&&txt&&pendingImages.length===0&&pendingFiles.length===0){
+  if(runningSessions.has(SESSION_ID)&&txt&&pendingImages.length===0&&pendingFiles.length===0){
     interjectList.push(txt);
     renderInterjectBar();
     // Queue as a follow-up on the server NOW so it auto-runs AFTER the current task
@@ -2521,7 +2524,7 @@ function sendMsg(){
   var atts=[];
   if(pendingFiles.length) atts=pendingFiles.map(function(f){return {name:f.name,data:f.data};});
   pendingImages=[];pendingFiles=[];renderImagePreviews();renderFilePreviews();updateAttachDot();
-  if(agentRunning){
+  if(runningSessions.has(SESSION_ID)){
     msgQueue.push({txt:sendTxt,imgs,atts:atts});
     addLog('Message queued ('+msgQueue.length+' pending)','info');
     return;
@@ -2632,12 +2635,12 @@ function sendExpertChoice(choice,btn){
 }
 
 function onSendClick(){
-  if(agentRunning){stopAgent();}
+  if(runningSessions.has(SESSION_ID)){stopAgent();}
   else{sendMsg();}
 }
 function stopAgent(){
-  if(ws&&connected&&agentRunning){
-    ws.send(JSON.stringify({type:'stop'}));
+  if(ws&&connected&&runningSessions.has(SESSION_ID)){
+    ws.send(JSON.stringify({type:'stop',session:SESSION_ID}));
     addLog('Stop signal sent','warn');
   }
 }

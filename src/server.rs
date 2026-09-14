@@ -1965,20 +1965,35 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                             let mt = p["type"].as_str().unwrap_or("");
                                                             match mt {
                                                                 "stop" => {
-                                                                    info!("Stop signal received");
-                                                                    cancelled.store(true, Ordering::SeqCst);
-                                                                    if let Some(c) = session_cancel.as_ref() {
-                                                                        c.store(true, Ordering::SeqCst);
-                                                                    }
-                                                                    // Also stop the Expert-mode spawned task via its
-                                                                    // per-task flag (the connection flag is reset by
-                                                                    // the next message and must not be its signal).
-                                                                    if managed {
-                                                                        let tasks = state.expert_tasks.lock().unwrap();
-                                                                        if let Some(flag) = tasks.get(&session_id) {
-                                                                            flag.store(true, Ordering::SeqCst);
-                                                                        }
-                                                                    }
+                                                                				// Session-scoped stop: only cancel the session the
+                                                                				// message names. A stop for a DIFFERENT session must
+                                                                				// not cancel the currently-draining session (that was
+                                                                				// the pre-isolation "global stop" behavior).
+                                                                				let stop_sid = p["session"].as_str().unwrap_or(&session_id).to_string();
+                                                                				if stop_sid != session_id {
+                                                                								let found = state.session_request_cancel(&stop_sid);
+                                                                								info!(
+                                                                												"[session:{}] Stop routed to other session {} (running={})",
+                                                                												&session_id[..8.min(session_id.len())],
+                                                                												&stop_sid[..8.min(stop_sid.len())],
+                                                                												found
+                                                                								);
+                                                                				} else {
+                                                                								info!("[session:{}] Stop signal received", session_id);
+                                                                								cancelled.store(true, Ordering::SeqCst);
+                                                                								if let Some(c) = session_cancel.as_ref() {
+                                                                												c.store(true, Ordering::SeqCst);
+                                                                								}
+                                                                								// Also stop the Expert-mode spawned task via its
+                                                                								// per-task flag (the connection flag is reset by
+                                                                								// the next message and must not be its signal).
+                                                                								if managed {
+                                                                												let tasks = state.expert_tasks.lock().unwrap();
+                                                                												if let Some(flag) = tasks.get(&session_id) {
+                                                                																flag.store(true, Ordering::SeqCst);
+                                                                												}
+                                                                								}
+                                                                				}
                                                                 }
                                                                 "permission_response" => {
                                                                     let req_id = p["request_id"].as_str().unwrap_or("");
@@ -2326,6 +2341,23 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             let req_id = parsed["request_id"].as_str().unwrap_or("");
                             let allowed = parsed["allowed"].as_bool().unwrap_or(false);
                             state.permission_resolver.resolve(req_id, allowed).await;
+                        }
+                        "stop" => {
+                        	// Session-scoped stop received while the main loop is idle
+                        	// (no session currently draining). Route it to the named session
+                        	// registry entry so a background run can still be cancelled;
+                        	// no-op (returns false) when nothing is running.
+                        	let stop_sid = parsed["session"].as_str().unwrap_or("").to_string();
+                        	if stop_sid.is_empty() {
+                        		info!("Outer stop ignored (no session supplied)");
+                        	} else {
+                        		let found = state.session_request_cancel(&stop_sid);
+                        		info!(
+                        			"[session:{}] Outer stop routed (running={})",
+                        			&stop_sid[..8.min(stop_sid.len())],
+                        			found
+                        		);
+                        	}
                         }
                         _ => {}
                     }
