@@ -86,7 +86,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .container{max-width:1560px;margin:0 auto;height:calc(100vh - 40px);background:white;border-radius:var(--radius);box-shadow:0 20px 60px rgba(0,0,0,.3);display:flex;overflow:hidden}
 
 /* Sidebar */
-.sidebar{width:220px;background:#2c3e50;color:white;display:flex;flex-direction:column;border-right:1px solid #34495e;flex-shrink:0}
+.sidebar{width:220px;background:#2c3e50;color:white;display:flex;flex-direction:column;border-right:1px solid #34495e;flex-shrink:0;overflow:hidden}
 .sidebar-hdr{padding:20px;border-bottom:1px solid #34495e}
 .sidebar-hdr h2{font-size:15px;font-weight:700;display:flex;align-items:center;gap:6px;color:white}
 .sidebar-hdr p{font-size:11px;color:#95a5a6;margin-top:4px}
@@ -98,12 +98,14 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 @keyframes logoRipple{0%{transform:scale(1);opacity:0.6}100%{transform:scale(1.8);opacity:0}}
 .sidebar-hdr-row{display:flex;align-items:center;gap:12px}
 .sidebar-logo .logo-img{width:100%;height:100%;border-radius:50%;object-fit:cover}
-.nav-tabs{display:flex;flex-direction:column;gap:2px;padding:8px}
+.nav-tabs{display:flex;flex-direction:column;gap:2px;padding:8px;flex:1;min-height:0;overflow-y:auto;scrollbar-width:none}
+.nav-tabs::-webkit-scrollbar{display:none}
 .sessions-panel{border-bottom:1px solid #34495e;padding:0 8px 8px}
 .sessions-hdr{display:flex;align-items:center;justify-content:space-between}
 .sessions-new{background:transparent;border:1px solid #3b5470;color:#9fb0d0;width:22px;height:22px;border-radius:6px;cursor:pointer;font-size:15px;line-height:1;font-weight:600}
 .sessions-new:hover{background:rgba(56,189,248,.18);color:#fff;border-color:#38bdf8}
-.sessions-list{display:flex;flex-direction:column;gap:1px;max-height:180px;overflow-y:auto}
+.sessions-list{display:flex;flex-direction:column;gap:1px;max-height:180px;overflow-y:auto;scrollbar-width:none}
+.sessions-list::-webkit-scrollbar{display:none}
 .sessions-item{display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:8px;cursor:pointer;color:#9fb0d0;font-size:12.5px;transition:.15s}
 .sessions-item:hover{background:rgba(255,255,255,.05);color:#fff}
 .sessions-item.active{background:rgba(56,189,248,.16);color:#fff;font-weight:600}
@@ -114,7 +116,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .sessions-item .si-actions button:hover{background:rgba(255,255,255,.12);color:#fff}
 .sessions-item .si-edit{width:100%;box-sizing:border-box;background:#0f1e2e;border:1px solid #38bdf8;border-radius:6px;color:#fff;font-size:12.5px;padding:2px 6px;outline:none}
 .sessions-item.running .si-title{display:flex;align-items:center;gap:6px;color:#7dd3fc}
-.sessions-item.running .si-title:before{content:"\u25B6";font-size:8px;color:#7dd3fc;animation:pulseP 1.2s infinite}
+.sessions-item.running .si-title:before{content:"\25B6";font-size:8px;color:#7dd3fc;animation:pulseP 1.2s infinite}
 @media(max-width:700px){.sessions-panel .nav-group{display:none}}
 .nav-group{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:#7f93c0;font-weight:600;padding:14px 12px 4px}
 .nav-tab{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:11px 12px;background:transparent;border:0;color:#9fb0d0;text-align:left;cursor:pointer;border-radius:10px;font-size:14px;font-weight:500;transition:.2s}
@@ -411,7 +413,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 .grok-bar textarea{
   flex:1; border:none; outline:0; resize:none; background:transparent; font-family:inherit;
   color:var(--t1); font-size:15px; line-height:1.5; max-height:200px;
-  height:40px; min-height:40px; overflow-y:hidden; padding:9px 4px 8px;
+  height:40px; min-height:40px; overflow-y:auto; padding:9px 4px 8px;
 }
 .grok-bar textarea::placeholder{color:#8b98a5}
 /* 附件按钮 */
@@ -1665,7 +1667,7 @@ async function loadSessions(){
         +'<span class="si-title" title="'+title+'">'+title+'</span>'
         +'<span class="si-actions">'
         +'<button title="Rename" onclick="event.stopPropagation();startRenameSession(this)">\u270e</button>'
-        +'<button title="Delete" onclick="event.stopPropagation();deleteSession(\''+s.id+'\')">\u2715</button>'
+        +'<button title="Delete" data-del="'+s.id+'" onclick="event.stopPropagation();deleteSession(this)">\u2715</button>'
         +'</span></div>';
     }).join('');
   }catch(err){}
@@ -1795,8 +1797,17 @@ async function doRenameSession(id,title){
   loadSessions();
 }
 
-async function deleteSession(id){
-  if(!confirm('Delete this session? Its history is soft-deleted (recoverable).'))return;
+async function deleteSession(btn){
+  const id=btn.getAttribute('data-del');
+  // Two-step inline confirm (no browser dialog): first click arms, second deletes.
+  if(btn.getAttribute('data-armed')!=='1'){
+    btn.setAttribute('data-armed','1');
+    btn.textContent='确认?';
+    btn.style.color='#f87171';
+    if(btn._armTimer)clearTimeout(btn._armTimer);
+    btn._armTimer=setTimeout(()=>{btn.removeAttribute('data-armed');btn.textContent='\u2715';btn.style.color='';},2500);
+    return;
+  }
   try{
     const r=await fetch('/api/sessions/'+encodeURIComponent(id),{method:'DELETE'});
     await r.json();
@@ -2769,7 +2780,7 @@ function showUserMsg(txt,imgsOrTime,time){
     imgs.forEach(src=>{imgHtml+='<img src="'+src+'" style="max-width:200px;max-height:200px;border-radius:6px;border:1px solid #bdc3c7;object-fit:cover">';});
     imgHtml+='</div>';
   }
-  d.innerHTML='<div class="msg-avatar">&#128100;</div><div class="msg-body"><div class="msg-role">You</div><div class="msg-content">'+esc(txt)+(imgs?imgHtml:'')+'</div><div class="msg-time">'+(time||nowTimeStr())+'</div></div>';
+  d.innerHTML='<div class="msg-avatar">&#128100;</div><div class="msg-body"><div class="msg-role">You</div><div class="msg-content md-content">'+(renderMd(txt)||'')+(imgs?imgHtml:'')+'</div><div class="msg-time">'+(time||nowTimeStr())+'</div></div>';
   document.getElementById('convArea').appendChild(d);scrollBottom();
 }
 function appendToConv(el){document.getElementById('convArea').appendChild(el);scrollBottom()}

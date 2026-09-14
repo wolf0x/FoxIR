@@ -1684,6 +1684,26 @@ pub fn write_memory_projection(&self, workspace_dir: &str) -> Result<(), String>
         md.push('\n');
     }
 
+    // ── Recent Conversation Highlights ──
+    // Distilled from the per-day extractive summaries (user topics + assistant
+    // replies), so the projection reflects what was actually discussed instead
+    // of only the sparse permanent facts.
+    self.ensure_recent_summaries(7);
+    if let Ok(summaries) = self.get_recent_summaries(7) {
+        let highlights: Vec<_> = summaries
+            .into_iter()
+            .filter(|s| !s.summary.trim().is_empty())
+            .collect();
+        if !highlights.is_empty() {
+            md.push_str("\n\n## Recent Conversation Highlights (distilled)\n");
+            md.push_str("_Extractive daily summaries of user topics and assistant replies._\n\n");
+            for s in highlights.iter().take(7) {
+                let body: String = s.summary.chars().take(1600).collect();
+                md.push_str(&format!("### {}\n{}\n\n", s.date, body));
+            }
+        }
+    }
+
     let out_path = std::path::Path::new(workspace_dir).join("MEMORY.md");
     std::fs::write(&out_path, md).map_err(|e| format!("write_memory_projection write: {e}"))?;
     tracing::info!("Memory projection written to {}", out_path.to_string_lossy());

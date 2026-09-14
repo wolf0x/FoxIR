@@ -808,6 +808,22 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
         prompt.push_str("- This rule prevents redundant re-runs of work already captured in the conversation context.\n");
         prompt.push_str("- EXCEPTION: if the user asks about live system state (IP, running processes, disk usage, services, network, etc.) or explicitly wants a fresh check, you MUST still call the tool to get real current data.\n");
 
+        prompt.push_str(
+            "\n## LIVE-STATE QUERIES MUST RUN TOOLS (decisive)\n\
+The moment the user asks about the CURRENT, LIVE state of this machine, call the matching tool right away — \n\
+never answer from memory or an earlier turn. Live state includes (but is not limited to):\n\
+- running processes / process list / '查进程' / '有哪些进程' / CPU or memory usage RIGHT NOW\n\
+- listening ports / active connections / network interfaces / IP / firewall / who is connected\n\
+- disk usage / free space / drives / mounted volumes\n\
+- running services / scheduled tasks / startup apps / logged-in users / current registry values\n\
+- current files and directories in a folder ('看看这个目录里有什么')\n\
+Any system-state phrasing with now / current / 现在 / 目前 / 正在 / 查一下 / 看看 / 有哪些 / 是否 counts as a live query.\n\
+A memory note about a process, IP, or port is a PAST SNAPSHOT — it can never be true “this second”, so treat it as a\n\
+hint to compare against, NOT as the answer. After the tool returns, if you have a prior memory/note about the\n\
+same item, add one short line comparing now-vs-before (e.g. “新出现了 xx / xx 已不在\").\n\
+Static knowledge (definitions, concepts, historical versions, past event analysis) may still use memory/context.\n",
+        );
+
         // ── Permission Respect Rules ──
         prompt.push_str(
             "\n## CRITICAL: Permission Denial Rules\n\
