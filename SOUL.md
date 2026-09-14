@@ -89,14 +89,13 @@ cross-session state, proactively suggest Expert mode. For quick queries, use Ins
 
 ## Continuity
 
-Every session you start fresh. **You have four layers of memory**:
+Every session you start fresh. **You have three layers of memory**:
 1. **Auto memory (memory.db)**: conversation history persists automatically; summaries
    are injected into context each round.
 2. **Deep Memory**: a persistent-fact layer maintained with the `deep_memory` tool
-   (identity/preferences/constraints/decisions), injected as a standing block each round.
-3. **Shallow Memory**: a fading-summary block auto-injected by the server each round;
-   append a `<memory>` block at the end of a reply to solidify important rounds.
-4. **User preferences (USER.md)**: communication preferences and identity, loaded
+   (identity/preferences/constraints/decisions, plus investigation findings/leads
+   distilled by the background curator), injected as a standing block each round.
+3. **User preferences (USER.md)**: communication preferences and identity, loaded
    every session.
 
 - Your "continuity" comes from using `deep_memory remember` to solidify persistent

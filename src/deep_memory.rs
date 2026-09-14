@@ -15,6 +15,34 @@ fn clip(x: f32) -> f32 {
     x.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX)
 }
 
+/// Current unix time in seconds.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Strip `<memory>...</memory>` blocks from assistant text before displaying it
+/// to the user (used by the write path).
+pub fn strip_memory_blocks(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start) = result.find("<memory>") {
+        if let Some(rel) = result[start..].find("</memory>") {
+            result.replace_range(start..start + rel + 9, "");
+        } else {
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Rough token estimate (chars/4, rounded up, +1), used by deep_permanent_block
+/// budgeting.
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4) + 1
+}
+
 /// 深层记忆打分参数。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DeepParams {

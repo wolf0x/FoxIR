@@ -13,8 +13,6 @@ mod context;
 #[allow(dead_code)]
 mod error;
 mod deep_memory;
-mod memory_migrate;
-mod shallow_memory;
 mod context_arbiter;
 mod turn_decision;
 mod event_log;
@@ -42,8 +40,6 @@ mod security;
 mod tool;
 mod value;
 
-#[cfg(test)]
-mod tests_recall;
 mod web;
 #[cfg(test)]
 mod phase0_acceptance;
@@ -529,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trim_redundant_tool_calls = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.trim_redundant_tool_calls));
     // Per-turn knowledge pre-retrieval pointer injection (Settings toggle).
     let knowledge_pre_retrieval = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.knowledge_pre_retrieval));
-    // 双层记忆（深层 + 浅层）注入开关（Settings，默认开）。
+    // 深层记忆注入开关（Settings，默认开）。
     // 统一上下文预算仪表盘（有限脑）开关（Settings，默认开）。
     let budget_dashboard = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.budget_dashboard));
     // Finite Brain 实测预算快照：agent 每次建上下文时写入，`/api/budget` 读取。
@@ -659,13 +655,6 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
     info!("Registered cron_manage + memory_md + todo_update + browser_cdp tools");
     if let Err(e) = crate::knowledge::build_index(&workspace_dir) {
         tracing::warn!("Failed to build knowledge index: {}", e);
-    }
-
-    // B+ 记忆落地：MEMORY.md 退役为只读投影，deep_facts 为单一事实后端。
-    // 启动时做一次性迁移（幂等）+ 生成式导出，供人查看 / git 审阅。
-    match crate::memory_migrate::import_memory_md_to_shallow(&workspace_dir, &memory_store) {
-        Ok(n) => { if n > 0 { info!("MEMORY.md archived: migrated {} chunk(s) into shallow memory", n); } }
-        Err(e) => tracing::warn!("MEMORY.md shallow migration failed: {}", e),
     }
 
     // Conditionally register Computer Use tools based on config

@@ -2,7 +2,7 @@
 
 # FoxIR
 
-面向本地 IT 系统工程师的 AI 辅助平台——专注于系统分析、日志调查、事件响应与远程运维。**FoxIR 是原 RustAgent 项目的继任者**，完全本地运行、单二进制部署，具备 WebSocket 网关、多模型支持、双层记忆、动态 SOP、有限脑上下文预算、40+ 内置工具、权限管控、任务调度与远程通道（WinRM / Linux SSH）。面向 Windows 环境，开箱即用。
+面向本地 IT 系统工程师的 AI 辅助平台——专注于系统分析、日志调查、事件响应与远程运维。**FoxIR 是原 RustAgent 项目的继任者**，完全本地运行、单二进制部署，具备 WebSocket 网关、多模型支持、深层记忆、动态 SOP、有限脑上下文预算、40+ 内置工具、权限管控、任务调度与远程通道（WinRM / Linux SSH）。面向 Windows 环境，开箱即用。
 
 ## 项目定位
 
@@ -50,7 +50,7 @@ FoxIR 专为本地 IT 系统工程师设计，解决日常运维中最耗时的�
 │    └── External Tools（workspace/tools/）         │
 ├──────────────────────────────────────────────────┤
 │  Memory & Learning                               │
-│    ├── 双层记忆：深层（deep_facts） + 浅层          │
+│    ├── 深层记忆：deep_facts（单一事实后端）          │
 │    ├── 自动记忆 memory.db（SQLite + FTS5 + BM25）  │
 │    ├── Knowledge（routing.json + experience.md）  │
 │    ├── SOP（动态多步流程，自动蒸馏与回放）           │
@@ -81,17 +81,15 @@ FoxIR 实现分类门控（Category-based Gates）+ 意图策略（Intent Policy
 - **回收站安全删除**：`file_delete` 及简单字面路径的 `Remove-Item` / `del` 等 shell 删除默认走系统回收站，而非硬删除数据
 - **权限拒绝强反馈**：拒绝时向 LLM 返回强措辞错误消息，禁止使用替代工具绕过
 
-### 记忆系统（双层记忆）
+### 记忆系统
 
-FoxIR 采用**双层记忆 + 自动记忆 + 知识库**的统一记忆架构：
+FoxIR 采用**深层记忆 + 自动记忆 + 知识库**的统一记忆架构：
 
 **深层记忆（Deep Memory）**：SQLite 持久持久层，用 `deep_memory` 工具管理（remember / recall / list / forget / update）。用户陈述的事实被钉住（永不自动遗忘），其余按统一价值函数 V(a,t)=Q×R×U 排序并随时间退火，按上下文预算打包注入。
 
-**浅层记忆（Shallow Memory）**：服务端每轮自动注入有界摘录块（fading summary），可在回复末尾附 `<memory>` 块捕获重要轮次，支持 FTS 相关召回。
-
 **自动记忆（memory.db）**：每轮对话自动持久化，近期摘要以 [Memory Context] / [Memory Recall] 注入，CJK bigram 分词 + BM25 全文搜索，每日自动摘要。
 
-**MEMORY.md**：curated 长期记忆，在双层记忆开启时作为只读投影（dumped from deep_facts），不再作为主记忆来源注入。
+**MEMORY.md**：深层记忆的只读投影（从 `deep_facts` 自动生成，供快速查看）；不直接编辑，用 `deep_memory` 工具管理。
 
 **Knowledge 知识库**：`knowledge/routing.json` 将请求路由到对应文档；`experience.md` 汇聚所有蒸馏的经验（facts / lessons / decision / tips 等不再分文件）；同时可挂接多份方法论 / playbook / 过程文档（如钓鱼分析方法论），供每轮预检索与优先引用。
 
@@ -117,7 +115,7 @@ FoxIR 采用**双层记忆 + 自动记忆 + 知识库**的统一记忆架构：
 
 **远程 Linux IR**：认证/后门/暴力破解/挖矿/持久化/文件/木马/横向/Web 等分主题排查工具
 
-**记忆与知识**：deep_memory（双层记忆）、memory_md（MEMORY.md 投影/回退）、knowledge_search / knowledge_ingest（知识库）
+**记忆与知识**：deep_memory（深层记忆）、memory_md（MEMORY.md 投影/回退）、knowledge_search / knowledge_ingest（知识库）
 
 **其余**：browser_cdp（浏览器自动化）、MCP 客户端（stdio+SSE）、cron_manage、todo_update（任务台账）、evidence（证据台账）、外部工具（workspace/tools/）
 
@@ -171,7 +169,7 @@ workspace/
 ├── cron_tasks.json      # 定时任务定义
 ├── .password            # Dashboard 访问密码
 ├── memory/
-│   └── memory.db        # SQLite 自动记忆数据库（+ deep_facts 双层记忆）
+│   └── memory.db        # SQLite 自动记忆数据库（+ deep_facts 深层记忆）
 ├── knowledge/           # routing.json + experience.md + 方法论文档
 ├── skills/              # 技能目录
 ├── tools/               # 外部工具目录
@@ -206,9 +204,7 @@ src/
 ├── runner.rs            # 会话管理、Agent 调度
 ├── context_arbiter.rs   # 有限脑 Context Budget 仲裁器（价值排序装配）
 ├── deep_memory.rs       # 深层记忆（SQLite deep_facts）
-├── shallow_memory.rs    # 浅层记忆（有界摘录 + FTS 召回）
 ├── memory.rs            # MemoryStore（memory.db + FTS5 + BM25）
-├── memory_migrate.rs    # 记忆库迁移
 ├── sop.rs               # 动态 SOP（蒸馏 / 匹配 / 回放 / 统计）
 ├── knowledge.rs         # Knowledge（routing.json 路由 + experience 蒸馏）
 ├── value.rs             # 统一工件价值 V=Q×R×U
@@ -226,7 +222,6 @@ src/
 ├── checkpoint.rs        # 对话检查点（崩溃恢复）
 ├── crypto.rs            # AES-256-GCM 加密
 ├── event_log/ forensics/ security/ web/   # 事件日志 / 取证 / 安全 / 静态服务
-└── tests_recall.rs      # 记忆召回测试
 ```
 
 ## License

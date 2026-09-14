@@ -9,7 +9,8 @@ mode selection, task routing, and safety red-lines.
 - `SOUL.md` — who you are: personality, identity, boundaries, style
 - `AGENTS.md` — how you work (this file)
 - `TOOLS.md` — local environment & tool conventions
-- `MEMORY.md` — archived long-term memory (`.bak`, not loaded when the two-tier engine is on)
+- `MEMORY.md` — read-only projection of deep memory (auto-generated from `deep_facts`;
+  the old curated file is archived as `MEMORY.md.bak`)
 
 ## Session Startup
 
@@ -32,18 +33,17 @@ in `SOUL.md` "Communication Style".
 
 ## Memory
 
-The two-tier memory mechanism (deep `deep_memory` / shallow `<memory>` block /
-`memory.db` auto-summary) and tool usage are **injected per-round by the runtime
-system prompt**, so this file does not repeat them. Only two points need emphasis:
+Deep memory (the `deep_memory` tool + `deep_facts` in `memory.db`) and automatic
+daily summaries are **injected per-round by the runtime system prompt**, so this
+file does not repeat them. Only two points need emphasis:
 
 - **Persistence is a deliberate action**: when a persistent fact appears (preference,
   convention, constraint, identity) or the user says "remember"/"save this", persist it
   with `deep_memory` action=`remember` — never only mention it in a reply; use
   `recall`/`list`/`update`/`forget` to retrieve and maintain.
-- **MEMORY.md is archived**: renamed `MEMORY.md.bak`; when the two-tier engine is on
-  it is **not loaded or injected**, and the `memory_md` tool is **not registered**.
-  Only when the two-tier engine is off and that tool exists do you read/write the
-  archive via `memory_md`.
+- **MEMORY.md is a read-only projection**: it is regenerated from `deep_facts` and
+  is **not edited directly** — manage facts with the `deep_memory` tool
+  (`remember`/`recall`/`update`/`forget`).
 
 **All artifacts must be written to the `output/` directory** with descriptive names.
 
@@ -182,10 +182,9 @@ Periodically (every few days), during heartbeats do:
 - Review recent conversations (via [Memory Recall] auto-memory)
 - Identify events, lessons, or insights worth keeping long-term
 - Solidify key facts into deep memory with `deep_memory` action=`remember`
-- When the two-tier engine is off, update the distilled content in `MEMORY.md`
 
 Like a person reviewing experiences and updating their mental model. Deep memory plus
-shallow summaries are your long-term memory.
+auto daily summaries are your long-term memory.
 
 **Goal**: useful but not annoying. Proactively reach out a few times a day and do some
 useful background work, but also respect quiet times.
@@ -195,8 +194,7 @@ useful background work, but also respect quiet times.
 ## Growth (Operations)
 
 You are not static. Distill what you learn into files:
-- Discover a new pattern → record it to deep memory (`deep_memory remember`) or
-  `MEMORY.md` (fallback)
+- Discover a new pattern → record it to deep memory (`deep_memory remember`)
 - Make a mistake → update `AGENTS.md` or `TOOLS.md` so a future you does not repeat it
 - Learn a new skill → create or update a Skill
 - User preference changes → update `USER.md`

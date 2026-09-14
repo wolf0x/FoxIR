@@ -161,7 +161,7 @@ pub struct AppState {
     pub context_budget: Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>,
     /// 发生过 task-matched SKILL 驱动的会话集合（SOP 蒸馏门控）。
     pub skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// 双层记忆（深层 + 浅层）注入开关（默认开）。
+    /// 深层记忆注入开关（默认开）。
     pub two_tier_memory: Arc<AtomicBool>,
     pub enable_context_scaling: Arc<AtomicBool>,
     pub max_inline_chars: Arc<AtomicUsize>,
@@ -270,10 +270,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/memory", get(memory_entries_handler))
         .route("/api/memory/summarize", post(memory_summarize_handler))
 .route("/api/memory/deep", get(deep_memory_list_handler))
-.route("/api/memory/deep", post(deep_memory_create_handler))
-.route("/api/memory/deep/{id}", put(deep_memory_update_handler))
+        .route("/api/memory/deep", post(deep_memory_create_handler))
+        .route("/api/memory/deep/{id}", put(deep_memory_update_handler))
         .route("/api/memory/deep/{id}", delete(deep_memory_delete_handler))
-        .route("/api/memory/deep/import", post(deep_memory_import_handler))
         .route("/api/history", get(history_handler))
         .route("/api/sessions", get(sessions_list_handler))
         .route("/api/sessions", post(sessions_create_handler))
@@ -1508,7 +1507,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             let ctx_refresh_needed = {
                                 let ts = state.memory_ctx_at.lock().unwrap();
                                 match ts.get(&session_id) {
-                                    Some(t) => crate::shallow_memory::now_secs().saturating_sub(*t) > MEMORY_CTX_TTL_SECS,
+                                    Some(t) => crate::deep_memory::now_secs().saturating_sub(*t) > MEMORY_CTX_TTL_SECS,
                                     None => true,
                                 }
                             };
@@ -1522,7 +1521,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                     });
                                     info!("Injecting/refreshing memory context ({} chars)", mem_ctx.len());
                                     history.push(ChatMessage::system(&mem_ctx));
-                                    state.memory_ctx_at.lock().unwrap().insert(session_id.to_string(), crate::shallow_memory::now_secs());
+                                    state.memory_ctx_at.lock().unwrap().insert(session_id.to_string(), crate::deep_memory::now_secs());
                                 }
                             }
 
@@ -1565,7 +1564,7 @@ history.insert(0, ChatMessage::system(hint));
                             // Run via Runner (managed mode dispatches to ManagedRunner)
 
 // O2: 收敛记忆注入 —— 只注入深层永久块（自动 MEMORY.md/Blackboard），
-// 停用浅层 λ 衰减层（其能力被 conversations 尾部+每日摘要+deep_facts 覆盖）。
+// 记忆注入：只注入深层永久块（对话事实由后台 curator 蒸馏进 deep_facts）。
 if state.two_tier_memory.load(Ordering::SeqCst) {
     let (eg_block, _eg_tok, eg_ids) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
     if !eg_block.trim().is_empty() {
@@ -2593,15 +2592,6 @@ async fn deep_memory_delete_handler(
     }
 }
 
-async fn deep_memory_import_handler(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    match crate::memory_migrate::import_memory_md_to_shallow(&state.workspace_dir, &state.memory_store) {
-        Ok(n) => Json(json!({ "success": true, "imported": n })),
-        Err(e) => Json(json!({ "success": false, "error": e })),
-    }
-}
-
 // ── History API ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -3618,17 +3608,17 @@ async fn budget_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 
 
-/// 双层记忆写入路径：从 assistant 文本提取可选的 <memory> 块，持久化进浅层记忆，
-/// 并从展示/存储的文本里剥离该块。仅当双层记忆开关开启时生效（默认开）。
+/// 写入路径：从 assistant 文本剥离模型可能吐出的 <memory> 块（记忆持久化由后台
+/// curator 负责）。仅当记忆开关开启时生效（默认开）。
 fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &str, user_text: &str) {
     if !state.two_tier_memory.load(Ordering::SeqCst) {
         return;
     }
     // O2: 记忆持久化统一交给后台 deep curator（findings 蒸馏）。本函数只负责从
-    // 展示文本剥离模型可能吐出的 `<memory>` 块，不再写入浅层记忆。
+    // 展示文本剥离模型可能吐出的 <memory> 块。
     let _ = session_id;
     let _ = user_text;
-    *assistant_text = crate::shallow_memory::strip_memory_blocks(assistant_text);
+    *assistant_text = crate::deep_memory::strip_memory_blocks(assistant_text);
 }
 
 

@@ -50,7 +50,7 @@ A single Rust artifact (`FoxIR.exe`, ~30MB+) bundles the AI dialog engine, tool-
 │    └── External Tools (workspace/tools/)         │
 ├──────────────────────────────────────────────────┤
 │  Memory & Learning                               │
-│    ├── Two-tier memory: Deep (deep_facts)+Shallow│
+│    ├── Deep memory: deep_facts (single source)   │
 │    ├── Auto memory memory.db (SQLite+FTS5+BM25)  │
 │    ├── Knowledge (routing.json + experience.md)  │
 │    ├── SOP (dynamic multi-step flows)            │
@@ -85,11 +85,9 @@ FoxIR implements a two-layer security model of **category-based gates** + **inte
 
 **Deep Memory**: persistent SQLite layer managed by the `deep_memory` tool (remember / recall / list / forget / update). User-stated facts are pinned (never auto-forgotten); the rest is ranked by the unified value function V(a,t)=Q×R×U, annealed over time, and packed into the context budget.
 
-**Shallow Memory**: the server injects a bounded summary block each turn (fading summary); important turns can be captured via a trailing `<memory>` block; supports FTS relevance recall.
-
 **Auto memory (memory.db)**: every turn is persisted automatically; recent summaries are injected as [Memory Context] / [Memory Recall]; CJK bigram tokenization + BM25 full-text search; daily auto-summaries.
 
-**MEMORY.md**: the curated long-term memory — a read-only projection dumped from deep_facts when two-tier memory is enabled (not auto-injected as a primary source).
+**MEMORY.md**: a read-only projection of deep memory auto-generated from `deep_facts`; not edited directly — manage facts with the `deep_memory` tool.
 
 **Knowledge base**: `knowledge/routing.json` routes a request to the right document; `experience.md` accumulates all distilled experience (facts / lessons / decisions / tips — no longer split into many files); additional methodology / playbook / process documents can be attached and pre-retrieved per-turn.
 
@@ -115,7 +113,7 @@ FoxIR implements a two-layer security model of **category-based gates** + **inte
 
 **Remote Linux IR**: themed tools for auth, backdoors, brute-force, miners, persistence, files, rootkits, lateral movement, web, etc.
 
-**Memory & knowledge**: deep_memory (two-tier), memory_md (MEMORY.md projection/fallback), knowledge_search / knowledge_ingest
+**Memory & knowledge**: deep_memory, memory_md (MEMORY.md projection/fallback), knowledge_search / knowledge_ingest
 
 **Others**: browser_cdp (browser automation), MCP client (stdio+SSE), cron_manage, todo_update (task ledger), evidence (evidence ledger), external tools (workspace/tools/)
 
@@ -169,7 +167,7 @@ workspace/
 ├── cron_tasks.json      # scheduled task definitions
 ├── .password            # Dashboard access password
 ├── memory/
-│   └── memory.db        # SQLite auto memory (+ deep_facts two-tier memory)
+│   └── memory.db        # SQLite auto memory (+ deep_facts deep memory)
 ├── knowledge/           # routing.json + experience.md + methodology docs
 ├── skills/              # skills directory
 ├── tools/               # external tools directory
@@ -204,9 +202,7 @@ src/
 ├── runner.rs            # session management, agent scheduling
 ├── context_arbiter.rs   # bounded Context Budget arbiter (value-ranked)
 ├── deep_memory.rs       # deep memory (SQLite deep_facts)
-├── shallow_memory.rs    # shallow memory (bounded summary + FTS recall)
 ├── memory.rs            # MemoryStore (memory.db + FTS5 + BM25)
-├── memory_migrate.rs    # memory migration
 ├── sop.rs               # dynamic SOP (distill / match / replay / stats)
 ├── knowledge.rs         # Knowledge (routing.json routing + experience)
 ├── value.rs             # unified artifact value V=Q×R×U
@@ -224,7 +220,6 @@ src/
 ├── checkpoint.rs        # conversation checkpoints (crash recovery)
 ├── crypto.rs            # AES-256-GCM crypto
 ├── event_log/ forensics/ security/ web/   # event logs / forensics / security / static serving
-└── tests_recall.rs      # memory recall tests
 ```
 
 ## License

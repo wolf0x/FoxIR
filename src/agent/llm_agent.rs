@@ -339,7 +339,7 @@ pub struct LlmAgent {
     parallel_ir_tools: bool,
     /// User's given name (auto-detected from Windows at startup).
     user_given_name: String,
-    /// Whether two-tier memory is enabled. When on, MEMORY.md replaced by 深层/浅层 memory injection (server).
+    /// Whether deep-memory injection is enabled (server injects the permanent block).
     two_tier_memory: bool,
     /// Sessions in which a task-matched SKILL drove a turn (used to skip SOP
     /// authoring for skill-driven sessions). Shared with AppState.
@@ -769,7 +769,7 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
 - **STRICTLY PROHIBITED**: Do NOT narrate your tool-calling intentions. If you need to call a tool, just call it \
   (output the JSON block). Never write \"let me check X\" as text AND also call the tool in the same response.\n\
 - **Talk like a person, not like a system.** The memory blocks injected above are PRIVATE BACKGROUND material. \
-  NEVER reference the mechanism in your reply to the user: no \"deep/shallow memory\", \"injection block\", \"recall\", \
+  NEVER reference the mechanism in your reply to the user: no \"deep memory\", \"injection block\", \"recall\", \
   \"returned 0 matching\", \"SQLite\", \"MEMORY.md\", \"[Memory Context]/[Memory Recall]\", or \"memory block\".\n\
 - Instead, speak as if you simply remember: e.g. \"我记得那事发生在 8月4日\". State a specific date ONLY when the \
   block explicitly shows one; otherwise say \"具体日期我不太确定\" instead of inventing one.\n\
@@ -920,35 +920,25 @@ The following files are loaded from your workspace. They define your behavior, p
 
             // ── Memory System Documentation ──
             let memory_system_note = if self.two_tier_memory {
-                // 双层记忆：深层(Deep)为持久永久层，浅层(Shallow)为弹性衰减层。
-                // 服务端每轮以 SYSTEM 消息注入深层永久块与浅层衰减块。
-                "\n# 记忆系统（双层）\n\
-你由两层记忆自动管理：\n\n\
+                // 记忆系统：deep 单层。调查结论/线索由后台 curator 蒸馏进 deep_facts，
+                // 服务端每轮以 SYSTEM 消息注入深层永久块。
+                "\n# 记忆系统\n\
+由深层记忆自动管理：\n\n\
 ## 深层记忆（持久永久层 Deep Memory）\n\
 - 持久化长期事实每轮以常驻块注入上下文\n\
 - 用户说 'remember' / 'forget that' / 'save this'，或出现持久性事实\n\
   （偏好、项目约定、约束、身份）时，用 `deep_memory` 工具 action 'remember' 持久化，\n\
   **绝不要**只写在回复里。\n\
 - 需要不在当前上下文里的事实，用 `deep_memory` action 'recall'。\n\
-- 用户陈述的事实被钉住（永不自动遗忘）；用 `deep_memory` 更新/删除。\n\n\
-## 浅层记忆（弹性衰减层 Shallow Memory）\n\
-- Fading conversational memory; the server injects a bounded summary block each turn.\n\
-- You may optionally emit a `<memory>` block at the END of a reply to capture a\n\
-  notable turn. Format:\n\
-  <memory>\n\
-  summary: (one sentence)\n\
-  essence: (5 words max)\n\
-  importance: (1-5, 3=decision, 5=critical)\n\
-  tags: (up to 5, comma-separated)\n\
-  </memory>\n\
-  It is extracted and stored automatically; do not show it to the user.\n\n\
+- 用户陈述的事实被钉住（永不自动遗忘）；用 `deep_memory` 更新/删除。\n\
+- 调查中确认的发现/线索（受影响版本、C2/IP/域名/hash、证据路径、结论）会由后台\n\
+  curator 自动蒸馏进深层记忆，跨会话可召回。\n\n\
 ## Automatic Memory (memory.db — SQLite)\n\
 - Every conversation is automatically persisted; recent summaries are injected as\n\
   [Memory Context] / [Memory Recall]. You do NOT need to do anything for this.\n\n\
-## Manual Reference: MEMORY.md (fallback)\n\
-- MEMORY.md is only used as a fallback curated file when the two-tier engine is off.\n\
-- When it appears in your context, treat it as authoritative facts. You may update it\n\
-  via the `memory_md` tool if present.\n"
+## Memory projection (read-only)\n\
+- Deep durable facts are projected to MEMORY.md; view it to see what is currently\n\
+  preserved. Edit facts with `deep_memory`, not by editing that file.\n"
             } else {
                 // Two-tier disabled → legacy MEMORY.md behavior (status quo).
                 "\n# Memory System\n\
@@ -1570,13 +1560,13 @@ impl Agent for LlmAgent {
                 }
                 true
             });
-            // ── 混合价值池（hybrid）：system/tools/deep/shallow/最近对话保底不进场；
+            // ── 混合价值池（hybrid）：system/tools/deep/最近对话保底不进场；
             //    auto-memory(SQLite) + knowledge + SOP 在单一池内按价值排序、共享预算、降级不丢。
             let mut pool_arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
             if !memory_blocks.is_empty() {
                 let mem_text = memory_blocks.join("\n");
                 pool_arts.push(crate::context_arbiter::artifact_from_block(
-                    crate::context_arbiter::ArtifactKind::ShallowMemory, "auto-memory",
+                    crate::context_arbiter::ArtifactKind::DeepFact, "auto-memory",
                     70.0, 0.8, false, mem_text,
                 ));
             }
@@ -1634,7 +1624,7 @@ impl Agent for LlmAgent {
                 let history_toks: usize = history.iter()
                     .map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("")))
                     .sum();
-                // 预留 = 输出预留（skull/10）+ 安全守卫（skull/50），沿用 temm1e lambda_budget 约定。
+                // 预留 = 输出预留（skull/10）+ 安全守卫（skull/50）。
                 let output_reserve = context_window / 10 + context_window / 50;
                 let report = crate::context_arbiter::budget_report(
                     context_window,

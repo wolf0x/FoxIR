@@ -107,7 +107,7 @@ pub fn learning_value(successes: u32, executed: u32, last_used: Option<u64>, now
 // 存取
 // ---------------------------------------------------------------------------
 
-/// 打开 SOP 持久化的 SQLite（与浅层/深层同库：`<workspace>/memory/memory.db`）并确保 `sops` 表存在。
+/// 打开 SOP 持久化的 SQLite（与深层同库：`<workspace>/memory/memory.db`）并确保 `sops` 表存在。
 /// 同时做一次 `sops.json` → 新表的遗留数据迁移（仅当表为空且 json 存在）。
 fn open_sop_conn(workspace_dir: &str) -> Result<Connection, String> {
     let dir = Path::new(workspace_dir).join("memory");

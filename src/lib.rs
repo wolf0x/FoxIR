@@ -15,8 +15,6 @@ pub mod forensics;
 pub mod context;
 pub mod error;
 pub mod deep_memory;
-pub mod memory_migrate;
-pub mod shallow_memory;
 pub mod context_arbiter;
 pub mod turn_decision;
 pub mod event_log;

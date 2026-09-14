@@ -40,7 +40,7 @@ pub struct AgentConfig {
     /// 独立 SOP 回放开关（默认开）。关闭 knowledge_pre_retrieval 不会连带关闭 SOP。
     #[serde(default = "default_sop_replay")]
     pub sop_replay: bool,
-    /// 双层记忆（深层 + 浅层）注入开关。默认开。
+    /// 深层记忆注入开关。默认开。
     #[serde(default = "default_two_tier_memory")]
     pub two_tier_memory: bool,
     /// 统一上下文预算仪表盘（有限脑）开关：系统提示注入 CONTEXT BUDGET，

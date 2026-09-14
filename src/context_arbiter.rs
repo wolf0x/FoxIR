@@ -1,10 +1,10 @@
 //! 统一上下文仲裁器（Finite Brain 核心）— 有限工作记忆的价值导向装填。
 //!
-//! 纯确定性核：**无 I/O、无 LLM**，沿用 `deep_memory`/`shallow_memory` 的纯核 + 全测模式。
+//! 纯确定性核：**无 I/O、无 LLM**，沿用 `deep_memory` 的纯核 + 全测模式。
 //! 设计见 `output/SDD-Memory-SOP-Hardening.md` §12。
 //!
 //! 核心思想：上下文是有硬上限的工作记忆，每个 token 都是被征用的神经元。所有可注入
-//! 产物（深层事实 / 浅层记忆 / SOP / knowledge / skill / 历史轮次）统一按
+//! 产物（深层事实 / SOP / knowledge / skill / 历史轮次）统一按
 //! `rank_key = value × (0.5 + relevance)` 排序，贪心装填到共享预算，超限时逐级优雅降级
 //! （全文 → 提纲/指针 → 目录 → 丢弃），**绝不静默截断不可再生的证据**。
 //!
@@ -18,7 +18,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
     DeepFact,
-    ShallowMemory,
     Sop,
     Knowledge,
     Skill,
@@ -200,7 +199,7 @@ pub fn budget_report(window: usize, reserve: usize, usage: &[(&str, usize)]) -> 
     BudgetReport { window, reserve, used, free, lines }
 }
 
-/// 内部 token 预估（chars/4 上取整 +1），与 `shallow_memory::estimate_tokens` 一致的粗估。
+/// 内部 token 预估（chars/4 上取整 +1）。
 #[allow(dead_code)]
 fn crate_cost(text: &str) -> usize {
     (text.chars().count() / 4) + 1
@@ -250,7 +249,7 @@ mod tests {
     #[test]
     fn assemble_prefers_higher_rank_into_full() {
         let mut arts = vec![
-            art(ArtifactKind::ShallowMemory, "low", 1.0, 0.0, false),
+            art(ArtifactKind::HistoryTurn, "low", 1.0, 0.0, false),
             art(ArtifactKind::DeepFact, "high", 5.0, 1.0, false),
         ];
         let res = assemble(&mut arts, 1000, 0);
