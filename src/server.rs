@@ -1785,6 +1785,10 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             // Managed mode is activated PER-TASK via the 'managed' field —
                             // NOT a global setting. When true, the task runs through the
                             // Manager-Executor-Auditor loop for long-horizon IR tasks.
+                        if state.session_is_running(&session_id) {
+                            crate::interject::push_pending(&session_id, content.clone());
+                            let _ = ws_send_bounded(&ws_sink, json!({"type":"queued_run","content":content.clone(),"session":session_id}).to_string()).await;
+                        } else {
                             let managed = parsed["managed"].as_bool().unwrap_or(false);
                             let managed_scope = parsed["managed_scope"].as_str().unwrap_or("").to_string();
 
@@ -2026,229 +2030,45 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                 ).await
                             };
                             match run_result {
-                                Ok(mut event_stream) => {
-                                    let mut assistant_text = String::new();
-                                    let mut srv_events: u64 = 0;
-                                    let mut srv_last = std::time::Instant::now();
-                                    loop {
-                                        tokio::select! {
-                                            // Agent event
-                                            result = event_stream.next() => {
-                                                match result {
-                                                    Some(Ok(event)) => {
-                                                        srv_events += 1;
-                                                        if srv_last.elapsed().as_secs() >= 5 {
-                                                            info!("[managed:{}] server event loop alive: {} events", session_id, srv_events);
-                                                            srv_last = std::time::Instant::now();
-                                                        }
-                                                        if let AgentEvent::TextDelta { content: c, .. } = &event {
-                                                            assistant_text.push_str(c);
-                                                        }
-                                                        // Persist token usage to database
-                                                        if let AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
-                                                            {
-                                                        // record_usage is a synchronous SQLite write guarded by a
-                                                        // std::sync::Mutex inside the async event loop. Called inline it
-                                                        // can block a runtime thread and, under DB contention, freeze the
-                                                        // whole Manager->Executor pipeline (server stops draining).
-                                                        // Move it off the hot path so the loop always keeps consuming.
-                                                        let ms = state.memory_store.clone();
-                                                        let mdl = model.clone();
-                                                        let pt = *prompt_tokens;
-                                                        let ct = *completion_tokens;
-                                                        let tt = *total_tokens;
-                                                        let sid = session_id.clone();
-                                                        tokio::task::spawn_blocking(move || {
-                                                            let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
-                                                        });
-                                                    }
-                                                        }
-                                                        let msg_str = event.to_ws_message();
-                                                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
-                                                            break;
-                                                        }
-                                                        if event.is_done() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Some(Err(e)) => {
-                                                        let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
-                                                        let msg_str = err_event.to_ws_message();
-                                                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
-                                                        break;
-                                                    }
-                                                    None => break,
-                                                }
-                                            }
-                                            // Incoming WS message during agent execution (stop/permissions)
-                                            ws_msg = ws_rx.recv() => {
-                                                match ws_msg {
-                                                    Some(Message::Text(t)) => {
-                                                        let s: String = t.to_string();
-                                                        if let Ok(p) = serde_json::from_str::<Value>(&s) {
-                                                            let mt = p["type"].as_str().unwrap_or("");
-                                                            match mt {
-                                                                "stop" => {
-                                                                				// Session-scoped stop: only cancel the session the
-                                                                				// message names. A stop for a DIFFERENT session must
-                                                                				// not cancel the currently-draining session (that was
-                                                                				// the pre-isolation "global stop" behavior).
-                                                                				let stop_sid = p["session"].as_str().unwrap_or(&session_id).to_string();
-                                                                				if stop_sid != session_id {
-                                                                								let found = state.session_request_cancel(&stop_sid);
-                                                                								info!(
-                                                                												"[session:{}] Stop routed to other session {} (running={})",
-                                                                												&session_id[..8.min(session_id.len())],
-                                                                												&stop_sid[..8.min(stop_sid.len())],
-                                                                												found
-                                                                								);
-                                                                				} else {
-                                                                								info!("[session:{}] Stop signal received", session_id);
-                                                                								cancelled.store(true, Ordering::SeqCst);
-                                                                								if let Some(c) = session_cancel.as_ref() {
-                                                                												c.store(true, Ordering::SeqCst);
-                                                                								}
-                                                                								// Also stop the Expert-mode spawned task via its
-                                                                								// per-task flag (the connection flag is reset by
-                                                                								// the next message and must not be its signal).
-                                                                								if managed {
-                                                                												let tasks = state.expert_tasks.lock().unwrap();
-                                                                												if let Some(flag) = tasks.get(&session_id) {
-                                                                																flag.store(true, Ordering::SeqCst);
-                                                                												}
-                                                                								}
-                                                                				}
-                                                                }
-                                                                "permission_response" => {
-                                                                    let req_id = p["request_id"].as_str().unwrap_or("");
-                                                                    let allowed = p["allowed"].as_bool().unwrap_or(false);
-                                                                    state.permission_resolver.resolve(req_id, allowed).await;
-                                                                }
-                                                                "permissions" => {
-                                                                    // Update permission settings
-                                                                    let mut perms = state.permissions.lock().await;
-                                                                    for cat in &["read", "write", "delete", "modify", "execute"] {
-                                                                        if let Some(v) = p[cat].as_bool() {
-                                                                            perms.insert(cat.to_string(), v);
-                                                                        }
-                                                                    }
-                                                                    info!("Permissions updated: {:?}", *perms);
-                                                                }
-                                                                "interject" => {
-                                                                    let content = p["content"].as_str().unwrap_or("").to_string();
-                                                                    let insert = p["insert"].as_bool().unwrap_or(false);
-                                                                    if !content.is_empty() && insert {
-                                                                        // Explicit "insert now": inject into the CURRENT running task as
-                                                                        // supplementary context. The agent loop picks it up via drain_insert
-                                                                        // and also append to session history so it is visible/consumed.
-                                                                        info!("[session:{}] Inserting interjection into running task", session_id);
-                                                                        crate::interject::push_insert(&session_id, content.clone());
-                                                                        {
-                                                                            let mut sessions = state.sessions.lock().await;
-                                                                            sessions.entry(session_id.clone()).or_default().push(ChatMessage::user(&content));
-                                                                        }
-                                                                    } else if !content.is_empty() {
-                                                                        // Default: hold as a follow-up task. It will be dispatched as the
-                                                                        // next sequential task after the current one completes. NOT merged
-                                                                        // into the running task's context or history yet.
-                                                                        info!("[session:{}] Queued follow-up task (will run after current task)", session_id);
-                                                                        crate::interject::push_pending(&session_id, content.clone());
-                                                                    }
-                                                                }
-                                                                "chat" => {
-                                                                    // A plain chat message arriving while a task is running is treated as
-                                                                    // a queued follow-up (executed after the current task), never silently
-                                                                    // dropped. This keeps the auto-drain robust even if the UI briefly
-                                                                    // believes the session is idle.
-                                                                    let c = p["content"].as_str().unwrap_or("").to_string();
-                                                                    if !c.is_empty() {
-                                                                        crate::interject::push_pending(&session_id, c);
-                                                                    }
-                                                                }
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                    Some(Message::Close(_)) | None => {
-                                                        cancelled.store(true, Ordering::SeqCst);
-                                                        if managed {
-                                                            let tasks = state.expert_tasks.lock().unwrap();
-                                                            if let Some(flag) = tasks.get(&session_id) {
-                                                                flag.store(true, Ordering::SeqCst);
-                                                            }
-                                                        }
-                                                        break;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                        // Check if user sent stop (per-session for Instant runs)
-                                        let stop_requested = match session_cancel.as_ref() {
-                                            Some(c) => c.load(Ordering::SeqCst),
-                                            None => cancelled.load(Ordering::SeqCst),
-                                        };
-                                        if stop_requested {
-                                            info!("Agent execution stopped by user");
-                                            // For Expert mode: mark the contract as user-stopped so the
-                                            // resume query can find it. The spawned task will NOT persist
-                                            // (to avoid overwriting this marker).
-                                            if managed {
-                                                state.memory_store.set_contract_stopped(&session_id);
-                                                info!("[managed:{}] Set USER_STOPPED marker on TaskContract", session_id);
-                                            }
-                                            let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
-                                            let msg_str = stop_event.to_ws_message();
-                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
-                                            let done_event = AgentEvent::done(&session_id, "system");
-                                            let msg_str = done_event.to_ws_message();
-                                            let _ = ws_send_bounded(&ws_sink, msg_str).await;
-                                            // Distill any durable facts from the interrupted turn so that
-                                            // information provided right before Stop (e.g. target/credentials)
-                                            // still lands in deep memory and survives a process restart.
-                                            spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
-                                            // Brief yield to let the spawned task detect cancellation
-                                            // and exit cleanly before the user can send a new message.
-                                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                            break;
-                                        }
+                                Ok(event_stream) => {
+                                    if !managed {
+                                        // 片②: spawn a dedicated drain task so the main loop keeps demuxing
+                                        // other sessions (true parallelism across Instant sessions). Expert
+                                        // (managed) runs stay inline and are awaited directly.
+                                        let st = state.clone();
+                                        let w = ws_sink.clone();
+                                        let s2 = session_id.clone();
+                                        let m2 = model.clone();
+                                        let c2 = content.clone();
+                                        let can2 = cancelled.clone();
+                                        let sc2 = session_cancel.clone();
+                                        tokio::spawn(drain_session_stream(
+                                            st, w, m2, s2, c2, false, can2, sc2, event_stream,
+                                        ));
+                                    } else {
+                                        drain_session_stream(
+                                            state.clone(),
+                                            ws_sink.clone(),
+                                            model.clone(),
+                                            session_id.clone(),
+                                            content.clone(),
+                                            true,
+                                            cancelled.clone(),
+                                            None,
+                                            event_stream,
+                                        ).await;
                                     }
-
-                                    two_tier_write(&state, &mut assistant_text, &session_id, content.as_str());
-                                    spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
-                                    // Update session history
-                                    if !assistant_text.is_empty() {
-                                        let mut sessions = state.sessions.lock().await;
-                                        let hist = sessions.entry(session_id.clone()).or_insert_with(Vec::new);
-                                        // User message is already persisted on receipt; append reply only.
-                                        hist.push(ChatMessage::assistant(&assistant_text));
-                                        if hist.len() > 50 {
-                                            let drain = hist.len() - 50;
-                                            hist.drain(..drain);
-                                        }
-
-                                        // Store in memory (SQLite)
-                                        let _ = state.memory_store.store_entry(&session_id, "assistant", &assistant_text, None);
-
-                                        // Refresh today's auto-summary so future
-                                        // sessions (and mid-session recall
-                                        // queries) can reference this exchange.
-                                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                                        let _ = state.memory_store.auto_summarize_date(&today);
-
                                 }
-                            }
                                 Err(e) => {
                                     let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                     let msg_str = err_event.to_ws_message();
                                     let _ = ws_send_bounded(&ws_sink, msg_str).await;
+                                    if session_cancel.is_some() {
+                                        state.session_slot_release(&session_id);
+                                    }
                                 }
                             }
-                            // Release the per-session parallel-execution slot acquired above
-                            // (Instant runs only; managed never acquired one).
-                            if session_cancel.is_some() {
-                                state.session_slot_release(&session_id);
-                            }
+                        }
                         }
                         "clear" => {
                             state.sessions.lock().await.remove(&session_id);
