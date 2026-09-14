@@ -734,60 +734,95 @@ impl MemoryStore {
     /// Build a recall context for a user query by searching SQLite and
     /// summarizing the matching entries. Used when the user asks about past
     /// conversations mid-session.
-    pub fn build_recall_context(&self, query: &str, days: usize) -> Option<String> {
+    pub fn build_recall_context(&self, query: &str, days: usize, budget_chars: usize) -> Option<String> {
         // Ensure daily summaries exist for an overview.
         self.ensure_recent_summaries(days);
 
         let mut parts: Vec<String> = Vec::new();
+        let mut used = 0usize;
 
-        // 1. Keyword-matched entries from the last N days.
+        // 1. Keyword-matched entries (most relevant first), within budget.
         if let Ok(hits) = self.search_entries(query, days) {
-            if !hits.is_empty() {
-                parts.push(format!("## Relevant past messages matching \"{}\" ({} hits)", query, hits.len()));
-                for e in hits.iter().take(20) {
-                    let role_label = match e.role.as_str() {
-                        "user" => "User",
-                        "assistant" => "Assistant",
-                        _ => "System",
-                    };
-                    let preview: String = e.content.chars().take(300).collect();
-                    let suffix = if e.content.chars().count() > 300 { "..." } else { "" };
-                    let when = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
-                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|_| e.date.clone());
-                    parts.push(format!("[{}] {}: {}{}", when, role_label, preview, suffix));
+            let mut shown = 0usize;
+            let mut items: Vec<String> = Vec::new();
+            for e in &hits {
+                if e.role != "user" && e.role != "assistant" {
+                    continue;
+                }
+                if used >= budget_chars {
+                    break;
+                }
+                let role_label = if e.role == "user" { "User" } else { "Assistant" };
+                let when = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|_| e.date.clone());
+                let preview: String = e.content.chars().take(200).collect();
+                let flat = preview.replace('\n', " ");
+                let line = format!("[{}] {}: {}\n", when, role_label, flat);
+                if used + line.len() > budget_chars {
+                    break;
+                }
+                used += line.len();
+                items.push(line);
+                shown += 1;
+            }
+            if shown > 0 {
+                let hdr = format!("## Past messages matching \"{}\" ({} shown):", query, shown);
+                parts.push(hdr.clone());
+                used += hdr.len();
+                parts.extend(items);
+            }
+        }
+
+        // 2. A brief recent-summaries tail ONLY if budget remains. Daily summaries are
+        //    already surfaced by the startup memory context (Fix D); here we add just
+        //    the last 2 days, each truncated, to avoid duplicating the full dump.
+        if used < budget_chars {
+            if let Ok(summaries) = self.get_recent_summaries(2) {
+                let mut added_header = false;
+                for s in &summaries {
+                    if used >= budget_chars {
+                        break;
+                    }
+                    let head: String = s.summary.chars().take(700).collect();
+                    let block = format!("\n### {} daily summary\n{}", s.date, head);
+                    if used + block.len() > budget_chars {
+                        continue;
+                    }
+                    if !added_header {
+                        let hdr = "\n## Recent daily summaries".to_string();
+                        parts.push(hdr.clone());
+                        used += hdr.len();
+                        added_header = true;
+                    }
+                    let block_len = block.len();
+                    parts.push(block);
+                    used += block_len;
                 }
             }
         }
 
-        // 2. Daily summaries for broader context.
-        let mut added_summary_section = false;
-        if let Ok(summaries) = self.get_recent_summaries(days) {
-            if !summaries.is_empty() {
-                added_summary_section = true;
-                parts.push("\n## Daily conversation summaries".to_string());
-                for s in &summaries {
-                    parts.push(format!("\n### {}", s.date));
-                    parts.push(s.summary.clone());
-                }
-            }
-        }
-        if !added_summary_section {
-            if let Ok(dates) = self.available_dates() {
-                let mut generated = Vec::new();
-                for date in dates.into_iter().take(days) {
-                    if let Ok(entries) = self.get_entries_by_date(&date) {
-                        if let Ok(summary) = compose_summary_from_entries(&entries) {
-                            generated.push((date, summary));
-                        }
+        // 3. Confirmed durable facts (deep memory) — findings/leads distilled by
+        // the curator. Makes recall_memory reach facts that were never restated in
+        // a stored conversation turn (O2: fixes the "C2/lead not in conversation" gap).
+        if used < budget_chars {
+            let facts = self.deep_search_keyword(query, 8);
+            if !facts.is_empty() {
+                let mut rows: Vec<String> = Vec::new();
+                for f in &facts {
+                    let key = f.subject_key.as_deref().unwrap_or("-");
+                    let line = format!("- [deep] {} (key: {})", f.content, key);
+                    if used + line.len() > budget_chars {
+                        break;
                     }
+                    used += line.len();
+                    rows.push(line);
                 }
-                if !generated.is_empty() {
-                    parts.push("\n## Daily conversation summaries".to_string());
-                    for (date, summary) in generated {
-                        parts.push(format!("\n### {}", date));
-                        parts.push(summary);
-                    }
+                if !rows.is_empty() {
+                    let hdr = "\n## Confirmed durable facts (deep memory)".to_string();
+                    parts.push(hdr.clone());
+                    used += hdr.len();
+                    parts.extend(rows);
                 }
             }
         }
@@ -796,10 +831,9 @@ impl MemoryStore {
             None
         } else {
             Some(format!(
-                "[Memory Recall — the user is asking about earlier conversations. \
-                 Below are relevant past messages and daily summaries retrieved from \
-                 the local memory store. Use them to answer; do NOT claim you have no \
-                 memory of past conversations when this block is present.]\n\n{}",
+                "[Memory Recall — past conversations retrieved from the local memory store. \
+                 Answer directly from these when they address the question. Do NOT re-run tools \
+                 or re-read source archives just to restate what is already given here.]\n\n{}",
                 parts.join("\n")
             ))
         }
@@ -1801,8 +1835,84 @@ impl MemoryStore {
         Ok(out)
     }
 
-    /// 按 id 取单条。
-    pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>, String> {
+/// Keyword search over deep durable facts (global scope). The table is small, so
+/// a linear keyword filter is cheap and sufficient. Used by recall_memory so
+/// findings/leads distilled by the curator are reachable (O2).
+pub fn deep_search_keyword(&self, query: &str, limit: usize) -> Vec<crate::deep_memory::DeepFact> {
+    let kws = extract_search_keywords(query);
+    if kws.is_empty() {
+        return Vec::new();
+    }
+    let Ok(facts) = self.deep_list("global") else {
+        return Vec::new();
+    };
+    let mut out: Vec<crate::deep_memory::DeepFact> = facts
+        .into_iter()
+        .filter(|f| {
+            let hay = f.content.to_lowercase();
+            kws.iter().any(|k| hay.contains(k))
+        })
+        .collect();
+    out.truncate(limit);
+    out
+}
+
+/// Read-only projection: render the durable deep facts (global scope) as a
+/// human-readable `output/memory.md`. This is a projection only — it never
+/// modifies DB rows. It gives the user a quick overview of what the background
+/// curator currently preserves (O2).
+pub fn write_memory_projection(&self, workspace_dir: &str) -> Result<(), String> {
+    let facts = self.deep_list("global")?;
+    let output_dir = std::path::Path::new(workspace_dir).join("output");
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("write_memory_projection mkdir: {e}"))?;
+
+    let mut md = String::new();
+    md.push_str("# FoxIR Long-Term Memory (read-only projection)\n\n");
+    md.push_str(&format!(
+        "_Generated from `deep_facts` · {} durable fact(s)_.  \n",
+        facts.len()
+    ));
+    md.push_str("_Edit facts with the `deep_memory` tool, not by editing this file._\n\n");
+    if facts.is_empty() {
+        md.push_str("_(no durable facts yet — the background curator distills them from conversations)_\n");
+    }
+
+    let mut sorted = facts;
+    sorted.sort_by(|a, b| {
+        let pa = matches!(a.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+        let pb = matches!(b.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+        pb.cmp(&pa)
+            .then(b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    for (i, f) in sorted.iter().enumerate() {
+        let pinned = match f.pinned_by {
+            crate::deep_memory::PinnedBy::User => "user",
+            crate::deep_memory::PinnedBy::Agent => "agent",
+            crate::deep_memory::PinnedBy::None => "none",
+        };
+        md.push_str(&format!(
+            "{}. **`{}`** — importance {} · pinned `{}`\n",
+            i + 1,
+            f.fact_type.as_str(),
+            f.importance,
+            pinned
+        ));
+        md.push_str(&format!("   {}\n", f.content));
+        if let Some(k) = &f.subject_key {
+            md.push_str(&format!("   key: `{}`\n", k));
+        }
+        md.push('\n');
+    }
+
+    let out_path = output_dir.join("memory.md");
+    std::fs::write(&out_path, md).map_err(|e| format!("write_memory_projection write: {e}"))?;
+    tracing::info!("Memory projection written to {}", out_path.to_string_lossy());
+    Ok(())
+}
+
+/// 按 id 取单条。
+pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT * FROM deep_facts WHERE id = ?1")

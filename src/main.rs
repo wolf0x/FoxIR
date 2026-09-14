@@ -647,8 +647,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !two_tier_memory.load(std::sync::atomic::Ordering::SeqCst) {
             reg.register(Arc::new(crate::tool::memory_md::MemoryMdTool::new(workspace_dir.clone())));
         }
-        reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
-        reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
+reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
+reg.register(Arc::new(crate::tool::recall_memory::RecallMemoryTool::new(memory_store.clone())));
+reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::evidence::EvidenceTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_ingest::KnowledgeIngestTool::new(workspace_dir.clone())));

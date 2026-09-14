@@ -14,6 +14,7 @@ pub mod cron_manage;
 pub mod memory_md;
 pub mod deep_memory;
 pub mod knowledge_search;
+pub mod recall_memory;
 pub mod knowledge_ingest;
 pub mod todo_update;
 pub mod browser_cdp;

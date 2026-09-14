@@ -1549,62 +1549,33 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 info!("Injecting auto-recall block ({} chars)", ar.len());
                                 history.insert(0, ChatMessage::system(&ar));
                             }
-                            // Deeper keyword recall — broad FMTS search plus daily summaries —
-                            // still layered on top for explicit recall/continuation queries.
-                            if is_recall_query(&content) || is_continuation_task(&content) {
-                                if let Some(recall) = state.memory_store.build_recall_context(&content, 14) {
-                                    info!("Injecting recall context ({} chars) for query/continuation", recall.len());
-                                    history.insert(0, ChatMessage::system(&recall));
-                                }
-                            }
+// P2: no auto-inject of a deep recall blob (that large dump made flash
+// re-research instead of recalling). On explicit recall/continuation queries we
+// only hint that the on-demand recall_memory tool exists; the agent pulls a
+// distilled block ONLY when it actually needs specific past detail.
+if is_recall_query(&content) || is_continuation_task(&content) {
+let hint = "[memory] If you need specific past-conversation detail not already obvious from
+the session tail above (e.g. exact version numbers / earlier conclusions), call the read-only
+recall_memory tool with a query and answer directly from its result. Do not re-read source
+archives to restate what recall_memory already returns.";
+info!("Injecting recall hint ({} chars)", hint.len());
+history.insert(0, ChatMessage::system(hint));
+}
 
                             // Run via Runner (managed mode dispatches to ManagedRunner)
 
-                            // 双层记忆（深层 + 浅层）：开启时注入常驻深层永久块与弹性浅层块。
-                            // 两者均为纯读取；默认开启。
-                            if state.two_tier_memory.load(Ordering::SeqCst) {
-                                // 有限脑仲裁（Phase B）：把深层永久块与弹性浅层块收敛为一次
-                                // `context_arbiter::assemble` —— 统一按价值排序、共享预算、降级不丢。
-                                // 预算取「当前两块实际占用 + 安全余量」（下限 2048 token），大窗口下
-                                // 通常不触发降级（行为近等价），小窗口下按价值优雅降级而不静默消失。
-                                let (eg_block, eg_tok, eg_ids) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
-                                let (lam_block, lam_tok, lam_hashes) = state.memory_store.build_shallow_context(&content, 800, 2000, 0.01);
-                                let mut arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
-                                if !eg_block.trim().is_empty() {
-                                    info!("Injected deep permanent block ({} chars)", eg_block.len());
-                                    arts.push(crate::context_arbiter::artifact_from_block(
-                                        crate::context_arbiter::ArtifactKind::DeepFact,
-                                        "global", 60.0, 0.6, true, eg_block,
-                                    ));
-                                }
-                                if !lam_block.trim().is_empty() {
-                                    info!("Injected shallow memory block ({} chars)", lam_block.len());
-                                    arts.push(crate::context_arbiter::artifact_from_block(
-                                        crate::context_arbiter::ArtifactKind::ShallowMemory,
-                                        "shallow", 50.0, 1.0, false, lam_block,
-                                    ));
-                                }
-                                let mem_budget = (eg_tok + lam_tok + 512).max(2048);
-                                let res = crate::context_arbiter::assemble(&mut arts, mem_budget, 0);
-                                for block in &res.blocks {
-                                    if !block.trim().is_empty() {
-                                        history.insert(0, ChatMessage::system(block));
-                                    }
-                                }
-                                info!("Finite-brain arbitration: packed memory artifacts into {} blocks / {} tokens (budget {})", res.blocks.len(), res.used, mem_budget);
-                                // 召回触达（A2）：对本次实际注入的浅层记忆写回 last_accessed/
-                                // access_count/recall_boost，让 R/U 随真实使用学习；一次批量 UPDATE。
-                                if !lam_hashes.is_empty() {
-                                    if let Ok(touched) = state.memory_store.shallow_touch_batch(&lam_hashes) {
-                                        info!("Shallow memory recall touched {} entries", touched);
-                                    }
-                                    // H4：深层注入即 touch（对称 shallow_touch_batch）。
-                                    // 本次实际注入的深层事实刷新 last_accessed，使 R 随真实使用学习。
-                                    if let Ok(touched) = state.memory_store.deep_touch_batch(&eg_ids) {
-                                        info!("Deep memory recall touched {} entries", touched);
-                                    }
-                                }
-                            }
+// O2: 收敛记忆注入 —— 只注入深层永久块（自动 MEMORY.md/Blackboard），
+// 停用浅层 λ 衰减层（其能力被 conversations 尾部+每日摘要+deep_facts 覆盖）。
+if state.two_tier_memory.load(Ordering::SeqCst) {
+    let (eg_block, _eg_tok, eg_ids) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+    if !eg_block.trim().is_empty() {
+        info!("Injected deep permanent block ({} chars)", eg_block.len());
+        history.insert(0, ChatMessage::system(&eg_block));
+        if let Ok(touched) = state.memory_store.deep_touch_batch(&eg_ids) {
+            info!("Deep memory recall touched {} entries", touched);
+        }
+    }
+}
 
                             // Managed mode is activated PER-TASK via the 'managed' field —
                             // NOT a global setting. When true, the task runs through the
@@ -2727,7 +2698,11 @@ fn spawn_deep_curator(
         } else {
             format!("User: {}\nTem: {}", user_part, assistant_part)
         };
-        let sys = "You are a precise long-term-memory curator. From the conversation below extract DURABLE facts about the user or project worth remembering permanently across future sessions: standing preferences, identity details, hard constraints, stable project facts. Ignore one-off or transient details. Pay special attention to stable connection/endpoint details such as target hosts, IPs, credentials, accounts, and project infrastructure references — these are durable facts to keep across sessions. Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
+        let sys = "You are a precise long-term-memory curator. From the conversation below extract DURABLE facts worth remembering across sessions:
+1) user or project facts — standing preferences, identity details, hard constraints, stable project facts;
+2) stable connection/endpoint details — target hosts, IPs, credentials, accounts, infrastructure references;
+3) IR investigation findings/leads established or confirmed in the assistant reply — affected components/versions, C2/IP/domain/hash indicators, evidence or report file paths, and conclusions.
+Ignore one-off or transient details, and do not re-state the same point more than once (dedupe by subject_key). Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
         let messages = vec![ChatMessage::system(sys), ChatMessage::user(&digest)];
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -2802,6 +2777,14 @@ fn spawn_deep_curator(
                 continue;
             }
             tracing::info!("[deep-curator] captured durable fact: {}", fcontent);
+        }
+        // O2: refresh the read-only projection after a curator run so the on-disk
+        // overview stays in sync with deep memory (small table, cheap rewrite).
+        if let Err(e) = state
+            .memory_store
+            .write_memory_projection(&state.workspace_dir)
+        {
+            tracing::warn!("[deep-curator] memory projection failed: {e}");
         }
     });
 }
@@ -3641,60 +3624,10 @@ fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &st
     if !state.two_tier_memory.load(Ordering::SeqCst) {
         return;
     }
-    if let Some(pb) = crate::shallow_memory::parse_memory_block(assistant_text) {
-        let now = crate::shallow_memory::now_secs();
-        let assist_clean = crate::shallow_memory::strip_memory_blocks(assistant_text);
-        let trunc = |s: &str| s.chars().take(500).collect::<String>();
-        // Faithful to temm1e runtime.rs: full_text = truncated User/Assistant pair.
-        let full_text = format!("User: {}\nAssistant: {}", trunc(user_text), trunc(&assist_clean));
-        let hash = crate::shallow_memory::make_hash(session_id, &full_text);
-        let is_explicit = user_text.to_lowercase().contains("remember");
-        let entry = crate::shallow_memory::ShallowEntry::new(
-            hash,
-            full_text,
-            pb.summary,
-            pb.essence,
-            pb.tags,
-            pb.importance,
-            is_explicit,
-            session_id.to_string(),
-            now,
-        );
-        if let Err(e) = state.memory_store.shallow_store(&entry) {
-            tracing::warn!("Two-tier shallow memory storage failed: {e}");
-        }
-    } else if crate::shallow_memory::worth_remembering(user_text, true)
-        || (user_text.trim().chars().count() >= 24
-            && assistant_text.trim().chars().count() >= 80
-            && (user_text.trim().chars().count() + assistant_text.trim().chars().count()) >= 160)
-    {
-        // Fix C: persist a meaningful exchange even when the model did not emit a
-        // <memory> block. Gate on the existing worth_remembering heuristic OR a
-        // substantive Q&A pair so ordinary chatter does not flood shallow memory.
-        // Reads are budget-filtered / decayed downstream, so a few extra rows are fine.
-        let now = crate::shallow_memory::now_secs();
-        let assist_clean = crate::shallow_memory::strip_memory_blocks(assistant_text);
-        let trunc = |s: &str| s.chars().take(500).collect::<String>();
-        let full_text = format!("User: {}\nAssistant: {}", trunc(user_text), trunc(&assist_clean));
-        let hash = crate::shallow_memory::make_hash(session_id, &full_text);
-        let (summary, essence, tags) = crate::shallow_memory::make_auto_summary(user_text, &assist_clean);
-        let is_explicit = user_text.to_lowercase().contains("remember");
-        let importance = if is_explicit { 3.0 } else { 2.0 };
-        let entry = crate::shallow_memory::ShallowEntry::new(
-            hash,
-            full_text,
-            summary,
-            essence,
-            tags,
-            importance,
-            is_explicit,
-            session_id.to_string(),
-            now,
-        );
-        if let Err(e) = state.memory_store.shallow_store(&entry) {
-            tracing::warn!("Two-tier auto shallow memory storage failed: {e}");
-        }
-    }
+    // O2: 记忆持久化统一交给后台 deep curator（findings 蒸馏）。本函数只负责从
+    // 展示文本剥离模型可能吐出的 `<memory>` 块，不再写入浅层记忆。
+    let _ = session_id;
+    let _ = user_text;
     *assistant_text = crate::shallow_memory::strip_memory_blocks(assistant_text);
 }
 
