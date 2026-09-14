@@ -17,6 +17,21 @@ use super::Tool;
 use crate::context::ToolContext;
 use crate::error::AgentResult;
 
+/// Compute the session-scoped TODO file path. Empty session id => shared
+/// `todos.json` (legacy/main); any non-empty id => `todos-<safe>.json` so
+/// parallel sessions never share TASKS/TODO.
+pub fn todos_file_path(workspace_dir: &str, session_id: &str) -> PathBuf {
+    if session_id.trim().is_empty() {
+        PathBuf::from(workspace_dir).join("todos.json")
+    } else {
+        let safe: String = session_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        PathBuf::from(workspace_dir).join(format!("todos-{}.json", safe))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub description: String,
@@ -44,20 +59,11 @@ impl TodoUpdateTool {
 
     /// Session-scoped TODO file path. The main session (and any session with
     /// an empty id, e.g. tools invoked outside a runner) writes to
-    /// `todos.json`; cron sessions write to `todos-<session>.json`
-    /// so they never clobber the main task contract (session-isolation fuse).
+    /// `todos.json`; every other session writes to a per-session
+    /// `todos-<session>.json` so parallel sessions never share TASKS/TODO
+    /// (session-isolation fuse).
     fn todos_path(&self, session_id: &str) -> PathBuf {
-        let main = session_id.trim().is_empty()
-            || !session_id.starts_with("cron-");
-        if main {
-            PathBuf::from(&self.workspace_dir).join("todos.json")
-        } else {
-            let safe: String = session_id
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                .collect();
-            PathBuf::from(&self.workspace_dir).join(format!("todos-{}.json", safe))
-        }
+        todos_file_path(&self.workspace_dir, session_id)
     }
 
     fn load_todos(&self, session_id: &str) -> TodoList {

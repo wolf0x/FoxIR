@@ -770,8 +770,17 @@ async fn output_open_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
 }
 
 /// GET /api/todos — return current TODO list from workspace/todos.json
-async fn todos_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let todos_path = std::path::Path::new(&state.workspace_dir).join("todos.json");
+#[derive(Deserialize)]
+struct TodosQuery {
+    session: Option<String>,
+}
+
+async fn todos_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TodosQuery>,
+) -> Json<Value> {
+    let session_id = query.session.unwrap_or_default();
+    let todos_path = crate::tool::todo_update::todos_file_path(&state.workspace_dir, &session_id);
     if !todos_path.exists() {
         return Json(json!({ "items": [], "count": 0 }));
     }
@@ -1329,6 +1338,23 @@ async fn ws_send_bounded(
     }
 }
 
+/// Inject the owning session_id into a forwarded WS message (parallel
+/// multi-session). All sessions share one sink; without this marker the
+/// frontend cannot attribute an event to the correct session.
+fn ws_msg_for_session(msg: String, session_id: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(&msg) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "session".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            v.to_string()
+        }
+        Err(_) => msg,
+    }
+}
 
 /// Drain a single session agent event stream and persist its outcome.
 
@@ -1377,7 +1403,7 @@ async fn drain_session_stream(
                                 let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
                             });
                         }
-                        let msg_str = event.to_ws_message();
+                        let msg_str = ws_msg_for_session(event.to_ws_message(), &session_id);
                         if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
                             break;
                         }
@@ -1387,7 +1413,7 @@ async fn drain_session_stream(
                     }
                     Some(Err(e)) => {
                         let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
-                        let msg_str = err_event.to_ws_message();
+                        let msg_str = ws_msg_for_session(err_event.to_ws_message(), &session_id);
                         let _ = ws_send_bounded(&ws_sink, msg_str).await;
                         break;
                     }
@@ -1412,10 +1438,10 @@ async fn drain_session_stream(
                 info!("[managed:{}] Set USER_STOPPED marker on TaskContract", session_id);
             }
             let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
-            let msg_str = stop_event.to_ws_message();
+            let msg_str = ws_msg_for_session(stop_event.to_ws_message(), &session_id);
             let _ = ws_send_bounded(&ws_sink, msg_str).await;
             let done_event = AgentEvent::done(&session_id, "system");
-            let msg_str = done_event.to_ws_message();
+            let msg_str = ws_msg_for_session(done_event.to_ws_message(), &session_id);
             let _ = ws_send_bounded(&ws_sink, msg_str).await;
             spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

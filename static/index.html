@@ -1717,6 +1717,7 @@ function switchSession(id){
     if(!hasLocal)loadHistForSession(id);
   }
   loadSessions();
+  loadTodos(SESSION_ID);
   if(document.getElementById('chat')){document.getElementById('chat').classList.add('active');}
   setTimeout(()=>scrollBottom(false),50);
 }
@@ -1749,6 +1750,7 @@ async function newSession(){
     sessionSnapshots[d.id]={msgHist:[],logHist:[],html:''};
     if(ws&&connected){ws.send(JSON.stringify({type:'clear'}));}
     loadSessions();
+    loadTodos(SESSION_ID);
     scrollBottom(false);
   }catch(err){}
 }
@@ -1949,10 +1951,14 @@ function handleMsg(msg){
   // #3 cross-session: a task running for a DIFFERENT session than the one being
   // viewed must not render into the visible conversation (which would pollute the
   // wrong session's view). Buffer its assistant text and show a running indicator
-  // instead; on terminate fold the buffer into that session's snapshot.
+  // instead; on terminate fold the buffer into that session's snapshot. The
+  // owning session is now read from the message itself (`msg.session`, injected
+  // server-side by drain_session_stream) so A/B running in parallel each route
+  // to their own buffer instead of clobbering a single global taskSessionId.
   var _streamTypes=['thinking','text','tool_call','tool_result','progress'];
-  var _bgSess=(taskSessionId&&taskSessionId!==SESSION_ID)?taskSessionId:null;
-  if(_bgSess&&_streamTypes.indexOf(msg.type)>=0){
+  var _evtSid=msg.session||taskSessionId||SESSION_ID;
+  var _bgSess=(_streamTypes.indexOf(msg.type)>=0&&_evtSid!==SESSION_ID)?_evtSid:null;
+  if(_bgSess){
     if(!bgBuffer[_bgSess]){
       bgBuffer[_bgSess]={text:'',events:[]};
       addLog('Session running in background: '+_bgSess.slice(0,8)+'…','info');
@@ -1964,9 +1970,9 @@ function handleMsg(msg){
     return;
   }
   if(msg.type==='done'||msg.type==='error'){
-    var _fin=taskSessionId||SESSION_ID;
+    var _fin=msg.session||taskSessionId||SESSION_ID;
     _doneSid=_fin;
-    taskSessionId=null;
+    if(taskSessionId===_fin)taskSessionId=null;
     if(_fin!==SESSION_ID){
       var _snap=sessionSnapshots[_fin]||(sessionSnapshots[_fin]={msgHist:[],logHist:logHist.slice(),html:''});
       _snap.msgHist=_snap.msgHist||[];
@@ -2086,12 +2092,17 @@ function handleMsg(msg){
       break;
     case 'done':
       hideTyping();finalizeThink();
-      if(textAccum){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}
-      finalizeTextBlock();
-      curToolMap={};
-      lastInvId=null;
-      subAgentRunIds=new Set();subAgentRoles=new Set();subAgentOrder=[];subAgentCards={};
-      if(_doneSid===null||_doneSid===SESSION_ID)setAgentRunning(false);
+      // Only tear down the ACTIVE view when the session that finished is the
+      // active one. When a background session finishes while another is still
+      // streaming, do not clobber the active session's live tool cards/text.
+      if(_doneSid===null||_doneSid===SESSION_ID){
+        if(textAccum){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}
+        finalizeTextBlock();
+        curToolMap={};
+        lastInvId=null;
+        subAgentRunIds=new Set();subAgentRoles=new Set();subAgentOrder=[];subAgentCards={};
+        setAgentRunning(false);
+      }
       // Refresh checkpoint banner (completed checkpoints are deleted server-side)
       checkCheckpoints();
       // Refresh output artifacts panel
@@ -3985,9 +3996,10 @@ async function openOutputFolder(){
   }catch(e){addLog('Open folder failed','error')}
 }
 
-async function loadTodos(){
+async function loadTodos(sid){
+  const s=sid||SESSION_ID||'';
   try{
-    const r=await fetch('/api/todos');const d=await r.json();
+    const r=await fetch('/api/todos?session='+encodeURIComponent(s));const d=await r.json();
     const el=document.getElementById('todoList');if(!el)return;
     const items=d.items||[];
     if(!items.length){el.innerHTML='<div class="todo-empty">No active tasks</div>';return}
@@ -4001,7 +4013,7 @@ async function loadTodos(){
     }).join('');
   }catch(e){}
 }
-setInterval(loadTodos,5000);
+setInterval(()=>loadTodos(),5000);
 
 async function resumeCheckpoint(cpId){
   if(!ws||ws.readyState!==WebSocket.OPEN){addLog('Not connected','error');return}
