@@ -1857,17 +1857,18 @@ pub fn deep_search_keyword(&self, query: &str, limit: usize) -> Vec<crate::deep_
     out
 }
 
-/// Read-only projection: render the durable deep facts (global scope) as a
-/// human-readable `output/memory.md`. This is a projection only — it never
-/// modifies DB rows. It gives the user a quick overview of what the background
-/// curator currently preserves (O2).
+/// Read-only projection: render the durable deep facts (global scope) into the
+/// workspace `MEMORY.md` so the user can view it from the original memory window.
+/// This is a projection only — it never modifies DB rows. It refreshes on every
+/// curator run to reflect what deep memory currently preserves (O2).
 pub fn write_memory_projection(&self, workspace_dir: &str) -> Result<(), String> {
     let facts = self.deep_list("global")?;
-    let output_dir = std::path::Path::new(workspace_dir).join("output");
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("write_memory_projection mkdir: {e}"))?;
 
     let mut md = String::new();
+    // The archived-mark header mirrors memory_migrate's guard so the startup
+    // shallow-migration step (idempotent, now obsolete under O2) skips this file
+    // instead of re-ingesting projection content into shallow memory.
+    md.push_str("<!-- rustagent: archived-to-shallow-memory -->\n\n");
     md.push_str("# FoxIR Long-Term Memory (read-only projection)\n\n");
     md.push_str(&format!(
         "_Generated from `deep_facts` · {} durable fact(s)_.  \n",
@@ -1905,7 +1906,7 @@ pub fn write_memory_projection(&self, workspace_dir: &str) -> Result<(), String>
         md.push('\n');
     }
 
-    let out_path = output_dir.join("memory.md");
+    let out_path = std::path::Path::new(workspace_dir).join("MEMORY.md");
     std::fs::write(&out_path, md).map_err(|e| format!("write_memory_projection write: {e}"))?;
     tracing::info!("Memory projection written to {}", out_path.to_string_lossy());
     Ok(())
