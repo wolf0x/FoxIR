@@ -112,6 +112,9 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .sessions-item:hover .si-actions{display:inline-flex}
 .sessions-item .si-actions button{background:transparent;border:0;color:#9fb0d0;cursor:pointer;font-size:11px;padding:1px 3px;border-radius:4px}
 .sessions-item .si-actions button:hover{background:rgba(255,255,255,.12);color:#fff}
+.sessions-item .si-edit{width:100%;box-sizing:border-box;background:#0f1e2e;border:1px solid #38bdf8;border-radius:6px;color:#fff;font-size:12.5px;padding:2px 6px;outline:none}
+.sessions-item.running .si-title{display:flex;align-items:center;gap:6px;color:#7dd3fc}
+.sessions-item.running .si-title:before{content:"\u25B6";font-size:8px;color:#7dd3fc;animation:pulseP 1.2s infinite}
 @media(max-width:700px){.sessions-panel .nav-group{display:none}}
 .nav-group{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:#7f93c0;font-weight:600;padding:14px 12px 4px}
 .nav-tab{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:11px 12px;background:transparent;border:0;color:#9fb0d0;text-align:left;cursor:pointer;border-radius:10px;font-size:14px;font-weight:500;transition:.2s}
@@ -1618,7 +1621,16 @@ function rotateSessionId(){try{SESSION_ID=(window.crypto&&crypto.randomUUID)?cry
 // conversation (msgHist/logHist + rendered DOM) on switch so no events need
 // cross-session routing. Category names come from the /api/sessions index.
 const sessionSnapshots={};   // sessionId -> {msgHist, logHist, html}
+const runningSessions=new Set(); // session ids currently executing a task
+let bgBuffer={};             // sessionId -> {text} buffered while that session is not the active view
+let taskSessionId=null;      // session id that started the currently running task
 function currentSessionTitle(){return 'Session';}
+
+function markSessionRunning(sid,running){
+  if(running){runningSessions.add(sid);}else{runningSessions.delete(sid);}
+  const item=document.querySelector('.sessions-item[data-sid="'+sid+'"]');
+  if(item)item.classList.toggle('running',runningSessions.has(sid));
+}
 
 function snapshotCurrentSession(){
   if(!SESSION_ID)return;
@@ -1652,7 +1664,7 @@ async function loadSessions(){
       return '<div class="sessions-item'+active+'" data-sid="'+s.id+'" onclick="switchSession(\''+s.id+'\')">'
         +'<span class="si-title" title="'+title+'">'+title+'</span>'
         +'<span class="si-actions">'
-        +'<button title="Rename" onclick="event.stopPropagation();renameSession(\''+s.id+'\')">\u270e</button>'
+        +'<button title="Rename" onclick="event.stopPropagation();startRenameSession(this)">\u270e</button>'
         +'<button title="Delete" onclick="event.stopPropagation();deleteSession(\''+s.id+'\')">\u2715</button>'
         +'</span></div>';
     }).join('');
@@ -1662,14 +1674,27 @@ async function loadSessions(){
 function switchSession(id){
   if(id===SESSION_ID)return;
   snapshotCurrentSession();
-  const prevHistoryWasLoaded = msgHist.length>0;
   SESSION_ID=id;
   try{sessionStorage.setItem('ra_session_id',id);}catch(e){}
   clearCurrentSessionUI();
   restoreCurrentSession();
+  // If this session is streaming a task in the background, surface whatever
+  // output has accumulated so the view is not blank while it keeps running.
+  const buf=bgBuffer[id];
+  if(buf&&buf.text&&buf.text.trim()){
+    const conv=document.getElementById('convArea');
+    if(conv){
+      const d=document.createElement('div');d.className='msg assistant';
+      d.innerHTML='<div class="msg-avatar"></div><div class="msg-body"><div class="msg-role">Agent <span style="color:var(--t3);font-weight:400">(streaming)</span></div><div class="msg-content md-content">'+renderMd(buf.text)+'</div></div>';
+      conv.appendChild(d);
+    }
+    msgHist.push({role:'assistant',text:buf.text.trim(),time:nowTimeStr()});
+  }
   // Always refresh the current session's transcript from the server (source of
   // truth) so a hard-switch reflects persisted history even for new tabs.
-  loadHistForSession(id);
+  // Skip the refresh for a session whose task is still running, so we don't
+  // clobber the live streaming view with stale server history.
+  if(!runningSessions.has(id))loadHistForSession(id);
   loadSessions();
   if(document.getElementById('chat')){document.getElementById('chat').classList.add('active');}
   setTimeout(()=>scrollBottom(false),50);
@@ -1707,15 +1732,44 @@ async function newSession(){
   }catch(err){}
 }
 
-async function renameSession(id){
-  const item=(sessionSnapshots[id]&&sessionSnapshots[id].__title)||'Session';
-  const title=prompt('Rename session:',item);
-  if(title===null)return;
+function startRenameSession(btn){
+  const item=btn.closest('.sessions-item');
+  if(!item)return;
+  const id=item.getAttribute('data-sid');
+  const titleEl=item.querySelector('.si-title');
+  if(!titleEl)return;
+  const old=titleEl.textContent;
+  let done=false;
+  const inp=document.createElement('input');
+  inp.className='si-edit';
+  inp.value=old;
+  inp.maxLength=60;
+  titleEl.innerHTML='';
+  titleEl.appendChild(inp);
+  inp.focus();
+  inp.select();
+  const finish=function(save){
+    if(done)return;
+    done=true;
+    const v=inp.value.trim();
+    if(save&&v&&v!==old){
+      doRenameSession(id,v);
+    }else{
+      loadSessions();
+    }
+  };
+  inp.addEventListener('keydown',function(e){
+    if(e.key==='Enter'){e.preventDefault();finish(true);}
+    else if(e.key==='Escape'){e.preventDefault();finish(false);}
+  });
+  inp.addEventListener('blur',function(){finish(true);});
+}
+async function doRenameSession(id,title){
   try{
     const r=await fetch('/api/sessions/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title})});
     await r.json();
-    loadSessions();
-  }catch(err){}
+  }catch(e){}
+  loadSessions();
 }
 
 async function deleteSession(id){
@@ -1871,6 +1925,34 @@ function handleMsg(msg){
   // representation. Identify them by the worker run_id (its event invocation id)
   // or by the worker role (author), both registered on `subagent_spawned`.
   if(isWorkerFragment(msg))return;
+  // #3 cross-session: a task running for a DIFFERENT session than the one being
+  // viewed must not render into the visible conversation (which would pollute the
+  // wrong session's view). Buffer its assistant text and show a running indicator
+  // instead; on terminate fold the buffer into that session's snapshot.
+  var _streamTypes=['thinking','text','tool_call','tool_result','progress'];
+  var _bgSess=(taskSessionId&&taskSessionId!==SESSION_ID)?taskSessionId:null;
+  if(_bgSess&&_streamTypes.indexOf(msg.type)>=0){
+    if(!bgBuffer[_bgSess]){
+      bgBuffer[_bgSess]={text:''};
+      addLog('Session running in background: '+_bgSess.slice(0,8)+'…','info');
+    }
+    if(msg.type==='text'&&msg.content){bgBuffer[_bgSess].text+=msg.content;}
+    markSessionRunning(_bgSess,true);
+    return;
+  }
+  if(msg.type==='done'||msg.type==='error'){
+    var _fin=taskSessionId||SESSION_ID;
+    taskSessionId=null;
+    if(_fin!==SESSION_ID){
+      var _snap=sessionSnapshots[_fin]||(sessionSnapshots[_fin]={msgHist:[],logHist:logHist.slice(),html:''});
+      _snap.msgHist=_snap.msgHist||[];
+      var _b=bgBuffer[_fin];
+      if(_b&&_b.text&&_b.text.trim()){_snap.msgHist.push({role:'assistant',text:_b.text.trim(),time:nowTimeStr()});}
+      delete bgBuffer[_fin];
+    }
+    markSessionRunning(_fin,false);
+    // fall through to the normal done/error handling below
+  }
   // Expert mode multi-round: when the invocation_id changes (Manager Plan vs
   // Executor round, or between Executor rounds), finalize the current text
   // block so the next segment starts a fresh bubble instead of appending.
@@ -1947,6 +2029,22 @@ function handleMsg(msg){
     case 'skills_changed':
       loadSkills();
       break;
+    case 'queued_run':
+      // A queued interjection (insert:false) has entered the execution queue and
+      // is now running. Render it as a user-side bubble so it does not vanish,
+      // but only for the session the user is currently viewing.
+      if(msg.session && msg.session!==SESSION_ID)break;
+      if(msg.content){
+        showUserMsg(msg.content,[]);
+        msgHist.push({role:'user',text:msg.content,time:nowTimeStr()});
+        saveHist();
+      }
+      // It is no longer pending in the inject bar.
+      if(msg.content){
+        var qi=interjectList.indexOf(msg.content);
+        if(qi>=0){interjectList.splice(qi,1);renderInterjectBar();updateSendState();}
+      }
+      scrollBottom();break;
     case 'done':
       hideTyping();finalizeThink();
       if(textAccum){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}
@@ -2396,13 +2494,6 @@ function sendMsg(){
     // Queue as a follow-up on the server NOW so it auto-runs AFTER the current task
     // completes (not injected into the running task, not dropped).
     if(ws&&connected){ws.send(JSON.stringify({type:'interject',content:txt,session:SESSION_ID,insert:false}));}
-    // Render the interjection as a user message in the conversation immediately.
-    // Previously it lived only in the pending bar, which setAgentRunning(false)
-    // clears when the current task ends - so it vanished from the UI even though
-    // the AI had already received and was reasoning on it.
-    showUserMsg(txt,[]);
-    msgHist.push({role:'user',text:txt,time:nowTimeStr()});
-    saveHist();
     inp.value='';inp.style.height='auto';
     updateSendState();
     return;
@@ -2441,6 +2532,8 @@ function doSend(txt,imgs,atts){
   ws.send(JSON.stringify(msg));
   showTyping();
   setAgentRunning(true);
+  taskSessionId=SESSION_ID;          // this task belongs to the session that started it
+  markSessionRunning(SESSION_ID,true);
 }
 var lastUserLang='';
 var expertOpenCard=null;
@@ -2578,6 +2671,11 @@ function injectInterject(i){
   const content=interjectList[i];
   interjectList.splice(i,1);
   if(ws&&connected){ws.send(JSON.stringify({type:'interject',content:content,session:SESSION_ID,insert:true}));}
+  // The user explicitly chose to inject now: it is entering execution, so it
+  // is rendered as a user-side bubble immediately (unlike a plain queued one).
+  showUserMsg(content,[]);
+  msgHist.push({role:'user',text:content,time:nowTimeStr()});
+  saveHist();
   renderInterjectBar();updateSendState();
 }
 function dropInterject(i){

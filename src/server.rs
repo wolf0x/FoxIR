@@ -1341,6 +1341,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
         let user_msg = match crate::interject::pop_pending(&session_id) {
             Some(next_content) => {
                 info!("[session:{}] Dispatching queued follow-up task", session_id);
+                // Tell the client this queued interjection is now entering the
+                // execution queue so it can render a user-side bubble. It must
+                // NOT be shown earlier (only once it actually starts running).
+                let run_content = next_content.clone();
+                let _ = ws_send_bounded(&ws_sink, json!(
+                    {"type":"queued_run","content":run_content,"session":session_id}).to_string()).await;
                 let msg_json = json!({ "type": "chat", "content": next_content });
                 Some(Message::Text(msg_json.to_string().into()))
             }
