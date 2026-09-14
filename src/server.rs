@@ -1568,6 +1568,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 let sessions = state.sessions.lock().await;
                                 sessions.get(&session_id).cloned().unwrap_or_default()
                             };
+                            // Persist the user message to in-memory session history IMMEDIATELY so
+                            // it survives an early Stop (previously it was only written together
+                            // with the assistant reply at run end, so stopping with no output
+                            // dropped the user's message). The assistant reply is appended by the
+                            // drain; we only add the user side here to avoid duplication.
+                            {
+                                let mut sessions = state.sessions.lock().await;
+                                sessions.entry(session_id.clone()).or_default().push(ChatMessage::user(&content));
+                                let _ = state.memory_store.store_entry(&session_id, "user", &content, None);
+                            }
 
                             // Inject / refresh the daily-summary memory context (Fix D).
                             // - New session (empty in-memory history): inject a fresh 7-day
@@ -2071,7 +2081,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                     if !assistant_text.is_empty() {
                                         let mut sessions = state.sessions.lock().await;
                                         let hist = sessions.entry(session_id.clone()).or_insert_with(Vec::new);
-                                        hist.push(ChatMessage::user(&content));
+                                        // User message is already persisted on receipt; append reply only.
                                         hist.push(ChatMessage::assistant(&assistant_text));
                                         if hist.len() > 50 {
                                             let drain = hist.len() - 50;
@@ -2079,7 +2089,6 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         }
 
                                         // Store in memory (SQLite)
-                                        let _ = state.memory_store.store_entry(&session_id, "user", &content, None);
                                         let _ = state.memory_store.store_entry(&session_id, "assistant", &assistant_text, None);
 
                                         // Refresh today's auto-summary so future
