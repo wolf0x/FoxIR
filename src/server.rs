@@ -135,6 +135,16 @@ fn compress_handoff_summary(handoff: &str) -> String {
 /// Type alias for the broadcast channel used to push notifications to all WS clients.
 pub type NotifyTx = tokio::sync::broadcast::Sender<String>;
 
+/// Per-session running state for parallel multi-session execution (形态 B).
+/// Each active session gets its own cancel flag so stopping/starting one session
+/// never touches another. Registered while a session's task is in flight and
+/// removed when it completes.
+#[derive(Default)]
+pub struct SessionRunState {
+    pub cancel: Arc<AtomicBool>,
+    pub running: bool,
+}
+
 pub struct AppState {
     pub runner: Arc<Runner>,
     pub skill_manager: Arc<SkillManager>,
@@ -200,6 +210,11 @@ pub struct AppState {
     /// resets the connection-level `cancelled`) cannot un-cancel a task that is
     /// still winding down — preventing two managed loops on the same contract.
     pub expert_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    /// Parallel multi-session concurrency cap (default 5). Hot-reloadable from
+    /// the Settings panel via `agent_settings_save_handler`.
+    pub session_max: Arc<AtomicUsize>,
+    /// Per-session running-state registry for parallel execution.
+    pub session_runs: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionRunState>>>,
     /// CRON task scheduler
     pub scheduler: Arc<Mutex<Scheduler>>,
     /// Broadcast channel for push notifications (sys_remind, etc.)
@@ -223,6 +238,63 @@ pub struct AppState {
     pub expert_role_models: Arc<std::sync::RwLock<crate::config::RoleModelsConfig>>,
     /// Timezone offset in hours (from config.toml) — RwLock for hot-reload from UI
     pub timezone_offset: Arc<std::sync::RwLock<i8>>,
+}
+
+impl AppState {
+    /// Try to reserve a parallel-execution slot for `session_id`, respecting the
+    /// `session_max` cap. Also installs a fresh per-session cancel flag.
+    /// Returns `None` when the cap is reached (caller should reject the run) or
+    /// `Some(cancel)` when the slot was acquired.
+    pub fn session_slot_acquire(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
+        let max = self.session_max.load(Ordering::SeqCst);
+        {
+            // Existing run: reuse its cancel flag (mark running if it had settled).
+            let mut runs = self.session_runs.lock().unwrap();
+            if let Some(st) = runs.get_mut(session_id) {
+                if !st.running {
+                    st.running = true;
+                    st.cancel.store(false, Ordering::SeqCst);
+                }
+                return Some(st.cancel.clone());
+            }
+        }
+        // New session: enforce the concurrency cap before inserting.
+        let mut runs = self.session_runs.lock().unwrap();
+        let active: usize = runs.values().filter(|s| s.running).count();
+        if active >= max {
+            return None;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        runs.insert(session_id.to_string(), SessionRunState { cancel: cancel.clone(), running: true });
+        Some(cancel)
+    }
+
+    /// Mark a session run as finished and remove it from the registry.
+    pub fn session_slot_release(&self, session_id: &str) {
+        if let Ok(mut runs) = self.session_runs.lock() {
+            runs.remove(session_id);
+        }
+    }
+
+    /// Request cancellation of a specific session's in-flight run.
+    /// Returns whether a running task was found for this session.
+    pub fn session_request_cancel(&self, session_id: &str) -> bool {
+        if let Ok(runs) = self.session_runs.lock() {
+            if let Some(st) = runs.get(session_id) {
+                st.cancel.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of currently active (running) sessions.
+    pub fn session_active_count(&self) -> usize {
+        self.session_runs
+            .lock()
+            .map(|r| r.values().filter(|s| s.running).count())
+            .unwrap_or(0)
+    }
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -3117,6 +3189,10 @@ async fn agent_settings_save_handler(
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(state.skill_hot_top_k.load(Ordering::SeqCst));
+    let session_max = body.get("session_max")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(state.session_max.load(Ordering::SeqCst));
 
     // Save to config.toml
     let workspace_dir = &state.workspace_dir;
@@ -3156,6 +3232,7 @@ async fn agent_settings_save_handler(
             state.skill_max_inline_chars.store(skill_max_inline_chars, Ordering::SeqCst);
             state.skill_catalog_max.store(skill_catalog_max, Ordering::SeqCst);
             state.skill_hot_top_k.store(skill_hot_top_k, Ordering::SeqCst);
+            state.session_max.store(session_max, Ordering::SeqCst);
 
             info!("Agent settings saved and hot-reloaded: max_iterations={}, rabbit_hole={}, ctx_threshold={}, tool_timeout={}, max_retries={}",
                 max_iterations, rabbit_hole_threshold, context_window_threshold, tool_timeout_secs, max_tool_retries);
