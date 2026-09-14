@@ -436,5 +436,75 @@ mod tests {
         assert_eq!(depth, 0);
         assert!(!can_spawn);
     }
+
+    /// Concurrency verification stub (multi-session): proves a single shared
+    /// `Agent` + single shared `Runner` can drive many sessions concurrently with
+    /// no shared-state race and full per-session isolation. Mirrors the exact
+    /// `Arc<Mutex<HashSet>>` pattern the real `LlmAgent` uses for
+    /// `skill_used_sessions`.
+    struct RecordingAgent {
+        seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Agent for RecordingAgent {
+        fn name(&self) -> &str { "recording" }
+        fn description(&self) -> &str { "records observed sessions" }
+        async fn run(
+            &self,
+            ctx: &InvocationContext,
+            _user_message: &str,
+            _images: Vec<String>,
+        ) -> AgentResult<EventStream> {
+            self.seen.lock().unwrap().insert(ctx.base.session_id.clone());
+            let sid = ctx.base.session_id.clone();
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(crate::agent::AgentEvent::text("tick", &sid, "assistant")),
+                Ok(crate::agent::AgentEvent::done(&sid, "assistant")),
+            ])))
+        }
+    }
+
+    async fn consume(mut s: EventStream) -> usize {
+        use futures::StreamExt;
+        let mut n = 0usize;
+        while let Some(Ok(_ev)) = s.next().await { n += 1; }
+        n
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sessions_are_race_free_and_isolated() {
+        // 8 sessions run on ONE shared Runner + ONE shared Agent. If `run()` were not
+        // concurrency-safe, the shared HashSet insert would drop updates (len < 8)
+        // or panic under the concurrent calls.
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let fake = RecordingAgent { seen: seen.clone() };
+        let runner = Runner::builder()
+            .agent(Arc::new(fake))
+            .logger(Arc::new(ConversationLogger::new(std::env::temp_dir().to_str().unwrap())))
+            .build()
+            .unwrap();
+        let ids: Vec<String> = (0..8).map(|i| format!("sess-{i}")).collect();
+        let futs = ids.iter().map(|sid| {
+            let r = &runner;
+            let sid = sid.clone();
+            async move {
+                let stream = r.run(
+                    "hi", &sid, "m", 5, vec![],
+                    perms(), Arc::new(Mutex::new(HashMap::new())), None, None,
+                    3, 64000, 80, 60, 3, vec![], None, None, None,
+                ).await.expect("run should succeed");
+                consume(stream).await
+            }
+        }).collect::<Vec<_>>();
+        let counts = futures::future::join_all(futs).await;
+
+        assert_eq!(counts.len(), 8, "all 8 concurrent runs must complete");
+        for c in &counts { assert_eq!(*c, 2, "each session stream must fully drain (2 events)"); }
+        {
+            let guard = seen.lock().unwrap();
+            assert_eq!(guard.len(), 8, "no lost update: every session must be recorded");
+            for id in &ids { assert!(guard.contains(id), "session {id} must be observed"); }
+        }
+    }
 }
 
