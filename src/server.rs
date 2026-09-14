@@ -186,6 +186,9 @@ pub struct AppState {
     /// Lightweight session registry for the multi-session navigation UI
     /// (titles/timestamps/soft-delete), persisted to session_index.json.
     pub session_index: Arc<crate::session::SessionIndex>,
+    /// Per-session last memory-context (daily summary) injection epoch, so a
+    /// long-lived open session refreshes its 7-day overview instead of going stale.
+    pub memory_ctx_at: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     /// Permission settings (category -> allowed), shared across connections
     pub permissions: Arc<Mutex<std::collections::HashMap<String, bool>>>,
     /// Resolver for pending permission requests
@@ -1495,22 +1498,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                                 sessions.get(&session_id).cloned().unwrap_or_default()
                             };
 
-                            // Inject memory context for new sessions (page refresh)
-                            if history.is_empty() {
-                                // Inject a memory context (daily summaries of past
-                                // conversations) as a SYSTEM message so the LLM
-                                // treats it as authoritative background, not chat.
-                                if let Some(mem_ctx) = state.memory_store.build_context_string(7) {
-                                    info!("Injecting memory context ({} chars)", mem_ctx.len());
-                                    history.push(ChatMessage::system(&mem_ctx));
+                            // Inject / refresh the daily-summary memory context (Fix D).
+                            // - New session (empty in-memory history): inject a fresh 7-day
+                            //   overview so the LLM treats it as authoritative background.
+                            // - Long-lived open session: refresh when the previous injection
+                            //   is stale, so newly generated daily summaries are picked up
+                            //   without requiring a restart. Duplicate blocks are dropped.
+                            const MEMORY_CTX_TTL_SECS: u64 = 4 * 3600;
+                            let ctx_refresh_needed = {
+                                let ts = state.memory_ctx_at.lock().unwrap();
+                                match ts.get(&session_id) {
+                                    Some(t) => crate::shallow_memory::now_secs().saturating_sub(*t) > MEMORY_CTX_TTL_SECS,
+                                    None => true,
                                 }
-                                // Do NOT replay today's full raw chat history into the
-                                // model context. The frontend already restores chat UI
-                                // from localStorage / /api/history after refresh. Raw
-                                // replay here makes the model continue old unfinished
-                                // threads (e.g. keep investigating memory.db after a
-                                // simple "hello"). The memory context above provides a
-                                // concise summary instead.
+                            };
+                            if history.is_empty() || ctx_refresh_needed {
+                                if let Some(mem_ctx) = state.memory_store.build_context_string(7) {
+                                    history.retain(|m| {
+                                        !(m.role == "system"
+                                            && m.content_as_text()
+                                                .map(|s| s.contains("Past Conversation Summaries"))
+                                                .unwrap_or(false))
+                                    });
+                                    info!("Injecting/refreshing memory context ({} chars)", mem_ctx.len());
+                                    history.push(ChatMessage::system(&mem_ctx));
+                                    state.memory_ctx_at.lock().unwrap().insert(session_id.to_string(), crate::shallow_memory::now_secs());
+                                }
                             }
 
                             // Mid-session recall: if the user is asking about earlier
@@ -1519,19 +1532,29 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
                             // as an ephemeral SYSTEM message at the start of history.
                             // This is NOT persisted — the server only stores the
                             // original user content + assistant reply below.
+                            // Per-turn continuity + recall (budgeted, unconditional):
+                            // 1) session tail block (Fix B) — replay the current session's
+                            //    most recent rounds so a continuation picks up prior findings
+                            //    without re-running tools. Self-short-circuits on empty session.
+                            // 2) lightweight auto-recall (Fix A) — keyword-match the current
+                            //    message against recent conversations (all sessions) so related
+                            //    earlier exchanges are "remembered" even without a recall keyword.
+                            // Both are pure reads; injected as ephemeral SYSTEM messages and not
+                            // persisted. Budget-capped so per-turn overhead stays small.
+                            if let Some(sr) = state.memory_store.build_session_recall_block_default(&session_id) {
+                                info!("Injecting session recall block ({} chars)", sr.len());
+                                history.insert(0, ChatMessage::system(&sr));
+                            }
+                            if let Some(ar) = state.memory_store.build_auto_recall_block(&content, 14, 1800) {
+                                info!("Injecting auto-recall block ({} chars)", ar.len());
+                                history.insert(0, ChatMessage::system(&ar));
+                            }
+                            // Deeper keyword recall — broad FMTS search plus daily summaries —
+                            // still layered on top for explicit recall/continuation queries.
                             if is_recall_query(&content) || is_continuation_task(&content) {
                                 if let Some(recall) = state.memory_store.build_recall_context(&content, 14) {
                                     info!("Injecting recall context ({} chars) for query/continuation", recall.len());
                                     history.insert(0, ChatMessage::system(&recall));
-                                }
-                                // ZeroClaw-style session recall: replay the recent tail of
-                                // the current session alongside the broader recall, so a
-                                // continuation/new session picks up prior findings without
-                                // re-running tools. Budget-capped; injected after the
-                                // keyword recall so the session tail sits closest to the prompt.
-                                if let Some(sr) = state.memory_store.build_session_recall_block_default(&session_id) {
-                                    info!("Injecting session recall block ({} chars)", sr.len());
-                                    history.insert(0, ChatMessage::system(&sr));
                                 }
                             }
 
@@ -3639,6 +3662,37 @@ fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &st
         );
         if let Err(e) = state.memory_store.shallow_store(&entry) {
             tracing::warn!("Two-tier shallow memory storage failed: {e}");
+        }
+    } else if crate::shallow_memory::worth_remembering(user_text, true)
+        || (user_text.trim().chars().count() >= 24
+            && assistant_text.trim().chars().count() >= 80
+            && (user_text.trim().chars().count() + assistant_text.trim().chars().count()) >= 160)
+    {
+        // Fix C: persist a meaningful exchange even when the model did not emit a
+        // <memory> block. Gate on the existing worth_remembering heuristic OR a
+        // substantive Q&A pair so ordinary chatter does not flood shallow memory.
+        // Reads are budget-filtered / decayed downstream, so a few extra rows are fine.
+        let now = crate::shallow_memory::now_secs();
+        let assist_clean = crate::shallow_memory::strip_memory_blocks(assistant_text);
+        let trunc = |s: &str| s.chars().take(500).collect::<String>();
+        let full_text = format!("User: {}\nAssistant: {}", trunc(user_text), trunc(&assist_clean));
+        let hash = crate::shallow_memory::make_hash(session_id, &full_text);
+        let (summary, essence, tags) = crate::shallow_memory::make_auto_summary(user_text, &assist_clean);
+        let is_explicit = user_text.to_lowercase().contains("remember");
+        let importance = if is_explicit { 3.0 } else { 2.0 };
+        let entry = crate::shallow_memory::ShallowEntry::new(
+            hash,
+            full_text,
+            summary,
+            essence,
+            tags,
+            importance,
+            is_explicit,
+            session_id.to_string(),
+            now,
+        );
+        if let Err(e) = state.memory_store.shallow_store(&entry) {
+            tracing::warn!("Two-tier auto shallow memory storage failed: {e}");
         }
     }
     *assistant_text = crate::shallow_memory::strip_memory_blocks(assistant_text);

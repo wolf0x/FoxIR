@@ -805,6 +805,51 @@ impl MemoryStore {
         }
     }
 
+    /// Lightweight per-turn auto-recall: keyword-match the current message against
+    /// recent conversations and render a bounded, most-relevant block. Unlike
+    /// `build_recall_context` it does not dump daily summaries and it short-circuits
+    /// on empty queries / no hits, so it is cheap enough to inject every turn. This is
+    /// what lets the agent remember an earlier exchange without a recall keyword.
+    pub fn build_auto_recall_block(&self, query: &str, days: usize, budget_chars: usize) -> Option<String> {
+        if query.trim().is_empty() {
+            return None;
+        }
+        let hits = self.search_entries(query, days).ok()?;
+        if hits.is_empty() {
+            return None;
+        }
+        let mut s = String::new();
+        let header = "\n## Auto-recall - related past conversations on this topic:\n";
+        s.push_str(header);
+        let mut used = s.len();
+        let mut shown = 0usize;
+        for e in hits {
+            if shown >= 12 {
+                break;
+            }
+            if e.role != "user" && e.role != "assistant" {
+                continue;
+            }
+            let role_label = if e.role == "user" { "User" } else { "Assistant" };
+            let when = chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|_| e.date.clone());
+            let preview: String = e.content.chars().take(240).collect();
+            let flat = preview.replace('\n', " ");
+            let line = format!("[{}] {}: {}\n", when, role_label, flat);
+            if used + line.len() > budget_chars {
+                break;
+            }
+            used += line.len();
+            s.push_str(&line);
+            shown += 1;
+        }
+        if shown == 0 {
+            return None;
+        }
+        Some(s)
+    }
+
     /// Store a summary for a date (upsert).
     pub fn store_summary(&self, date: &str, summary: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();

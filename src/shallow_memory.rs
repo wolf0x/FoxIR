@@ -351,6 +351,38 @@ pub fn worth_remembering(user_text: &str, has_tool_calls: bool) -> bool {
     false
 }
 
+/// Extractive auto-summary for a User/Assistant pair, used when the model did
+/// not emit a `<memory>` block (Fix C). Returns (summary, essence, tags).
+/// Cheap, no LLM call: summary captures the question/topic, essence the key
+/// conclusion, tags a few salient keywords for later FTS recall.
+pub fn make_auto_summary(user_text: &str, assist_text: &str) -> (String, String, Vec<String>) {
+    let clean_user: String = user_text.trim().chars().take(160).collect();
+    let clean_assist: String = assist_text.trim().chars().take(240).collect();
+    let summary = if clean_user.is_empty() {
+        clean_assist.clone()
+    } else {
+        format!("Q: {}", clean_user)
+    };
+    let essence = if clean_assist.is_empty() {
+        clean_user.clone()
+    } else {
+        clean_assist
+    };
+    let mut tags: Vec<String> = Vec::new();
+    for tok in user_text.split(|c: char| !c.is_alphanumeric()) {
+        let t = tok.trim();
+        if t.chars().count() >= 3 && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            if !tags.contains(&t.to_string()) {
+                tags.push(t.to_string());
+            }
+        }
+        if tags.len() >= 6 {
+            break;
+        }
+    }
+    (summary, essence, tags)
+}
+
 /// LLM 回复里的 `<memory>` 块。
 #[derive(Debug, Clone)]
 pub struct ParsedMemoryBlock {
@@ -577,6 +609,16 @@ mod tests {
         assert!(worth_remembering("let's deploy to staging", false));
         assert!(!worth_remembering("thanks", false));
         assert!(!worth_remembering("ok", false));
+    }
+
+    #[test]
+    fn make_auto_summary_derives_fields() {
+        let (summary, essence, tags) =
+            make_auto_summary("analyze the disk usage report", "The disk is 82% full; clean temp files.");
+        assert!(summary.contains("analyze"));
+        assert!(essence.contains("82%"));
+        assert!(tags.iter().any(|t| t == "analyze"));
+        assert!(!summary.is_empty() && !essence.is_empty());
     }
 
     #[test]

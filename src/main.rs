@@ -716,6 +716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         expert_max_managed_rounds: Arc::new(AtomicUsize::new(config.agent.expert_max_managed_rounds)),
         orchestration_limits: Arc::new(crate::config::OrchestrationLimits::from(&config.agent.modes.instant)),
         sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        memory_ctx_at: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_index: Arc::new({
             let idx_path = std::path::Path::new(&workspace_dir).join("session_index.json");
             crate::session::SessionIndex::load(idx_path)
