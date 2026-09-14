@@ -2654,7 +2654,11 @@ function setAgentRunning(running){
   if(sendBtn){
     // 狼头 LOGO 按钮：只需切换 running class（脉冲动画），不需要切换图标
     sendBtn.classList.toggle('running',running);
-    if(!running)updateSendState();
+    // Always recompute enabled state: updateSendState() derives disabled from
+    // agentRunning, so when a session turns running it must re-enable the button
+    // even if the input is empty (STOP affordance). Old code only refreshed on
+    // !running, leaving the send/STOP button disabled after a session switch.
+    updateSendState();
   }
   if(stopBtn)stopBtn.style.display=running?'none':'none'; // 停止由 sendBtn 双态承担
   // 方案 B：导航栏狼头呼吸脉冲
