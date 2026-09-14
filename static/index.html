@@ -1706,7 +1706,16 @@ function switchSession(id){
   // truth) so a hard-switch reflects persisted history even for new tabs.
   // Skip the refresh for a session whose task is still running, so we don't
   // clobber the live streaming view with stale server history.
-  if(!runningSessions.has(id))loadHistForSession(id);
+  if(!runningSessions.has(id)){
+    // Also skip the server reload when this session already has a richer local
+    // snapshot from the current page session: its live transcript (including
+    // tool cards) lives in sessionSnapshots. Reloading from server would drop
+    // the tool cards, so only fall back to history for sessions we have no
+    // local snapshot for (e.g. opened from another tab / fresh page load).
+    const _sn=sessionSnapshots[id];
+    const hasLocal=(_sn&&(_sn.html||(_sn.pendingEvents&&_sn.pendingEvents.length)||(_sn.msgHist&&_sn.msgHist.length)));
+    if(!hasLocal)loadHistForSession(id);
+  }
   loadSessions();
   if(document.getElementById('chat')){document.getElementById('chat').classList.add('active');}
   setTimeout(()=>scrollBottom(false),50);
