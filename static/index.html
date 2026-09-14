@@ -2030,21 +2030,32 @@ function handleMsg(msg){
       loadSkills();
       break;
     case 'queued_run':
-      // A queued interjection (insert:false) has entered the execution queue and
-      // is now running. Render it as a user-side bubble so it does not vanish,
-      // but only for the session the user is currently viewing.
-      if(msg.session && msg.session!==SESSION_ID)break;
-      if(msg.content){
-        showUserMsg(msg.content,[]);
-        msgHist.push({role:'user',text:msg.content,time:nowTimeStr()});
-        saveHist();
+      {
+        // A queued interjection (insert:false) has entered the execution queue
+        // and is now running as a new task. Activate the running state for that
+        // session (so the START/STOP control reflects it and can stop it).
+        const qs=msg.session||SESSION_ID;
+        taskSessionId=qs;
+        markSessionRunning(qs,true);
+        if(qs===SESSION_ID){
+          setAgentRunning(true);
+          showTyping();
+          if(msg.content){
+            // Render it as a user-side bubble so it does not vanish.
+            showUserMsg(msg.content,[]);
+            msgHist.push({role:'user',text:msg.content,time:nowTimeStr()});
+            saveHist();
+            // It is no longer pending in the inject bar.
+            var qi=interjectList.indexOf(msg.content);
+            if(qi>=0){interjectList.splice(qi,1);renderInterjectBar();updateSendState();}
+          }
+        }else{
+          // Background session: buffer its stream; do not touch this view.
+          if(!bgBuffer[qs])bgBuffer[qs]={text:''};
+        }
+        scrollBottom();
       }
-      // It is no longer pending in the inject bar.
-      if(msg.content){
-        var qi=interjectList.indexOf(msg.content);
-        if(qi>=0){interjectList.splice(qi,1);renderInterjectBar();updateSendState();}
-      }
-      scrollBottom();break;
+      break;
     case 'done':
       hideTyping();finalizeThink();
       if(textAccum){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}
