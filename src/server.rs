@@ -1654,6 +1654,11 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             let managed = parsed["managed"].as_bool().unwrap_or(false);
                             let managed_scope = parsed["managed_scope"].as_str().unwrap_or("").to_string();
 
+                            // Per-session cancellation for Instant runs (parallel multi-session).
+                            // Managed/Expert keeps its per-task flag via `expert_tasks`.
+                            let session_cancel: Option<Arc<AtomicBool>> =
+                                if managed { None } else { state.session_slot_acquire(&session_id) };
+
                             let run_result = if managed {
                                 info!("Expert mode requested for session {}", session_id);
                                 // -- Instant -> Expert: inherit same-session Instant progress --
@@ -1952,6 +1957,9 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                                 "stop" => {
                                                                     info!("Stop signal received");
                                                                     cancelled.store(true, Ordering::SeqCst);
+                                                                    if let Some(c) = session_cancel.as_ref() {
+                                                                        c.store(true, Ordering::SeqCst);
+                                                                    }
                                                                     // Also stop the Expert-mode spawned task via its
                                                                     // per-task flag (the connection flag is reset by
                                                                     // the next message and must not be its signal).
@@ -2026,8 +2034,12 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                 }
                                             }
                                         }
-                                        // Check if user sent stop
-                                        if cancelled.load(Ordering::SeqCst) {
+                                        // Check if user sent stop (per-session for Instant runs)
+                                        let stop_requested = match session_cancel.as_ref() {
+                                            Some(c) => c.load(Ordering::SeqCst),
+                                            None => cancelled.load(Ordering::SeqCst),
+                                        };
+                                        if stop_requested {
                                             info!("Agent execution stopped by user");
                                             // For Expert mode: mark the contract as user-stopped so the
                                             // resume query can find it. The spawned task will NOT persist
@@ -2083,6 +2095,11 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                     let msg_str = err_event.to_ws_message();
                                     let _ = ws_send_bounded(&ws_sink, msg_str).await;
                                 }
+                            }
+                            // Release the per-session parallel-execution slot acquired above
+                            // (Instant runs only; managed never acquired one).
+                            if session_cancel.is_some() {
+                                state.session_slot_release(&session_id);
                             }
                         }
                         "clear" => {
