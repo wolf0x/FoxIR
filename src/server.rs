@@ -295,6 +295,15 @@ impl AppState {
             .map(|r| r.values().filter(|s| s.running).count())
             .unwrap_or(0)
     }
+
+    /// Whether `session_id` already has an in-flight run (parallel demux guard,
+    /// used to queue a follow-up task instead of spawning a second runner).
+    pub fn session_is_running(&self, session_id: &str) -> bool {
+        self.session_runs
+            .lock()
+            .map(|r| r.get(session_id).map(|s| s.running).unwrap_or(false))
+            .unwrap_or(false)
+    }
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -1320,6 +1329,121 @@ async fn ws_send_bounded(
     }
 }
 
+
+/// Drain a single session agent event stream and persist its outcome.
+
+/// Slice-2 (parallel multi-session): each Instant run is drained by its own
+/// spawned task that ONLY consumes the agent event stream. It no longer reads
+/// the shared client `ws_rx` — that is owned exclusively by the demux in
+/// `handle_ws`, which routes stop / interject / permission responses into
+/// per-session flags and the static interject queues. Instant cancellation is
+/// detected by polling the per-session cancel flag; Expert (managed) runs
+/// observe the connection-level `cancelled` flag and are drained inline.
+async fn drain_session_stream(
+    state: Arc<AppState>,
+    ws_sink: Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
+    model: String,
+    session_id: String,
+    content: String,
+    managed: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    session_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    mut event_stream: crate::agent::EventStream,
+) {
+    let mut assistant_text = String::new();
+    let mut srv_events: u64 = 0;
+    let mut srv_last = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            result = event_stream.next() => {
+                match result {
+                    Some(Ok(event)) => {
+                        srv_events += 1;
+                        if srv_last.elapsed().as_secs() >= 5 {
+                            info!("[session:{}] server event loop alive: {} events", session_id, srv_events);
+                            srv_last = std::time::Instant::now();
+                        }
+                        if let AgentEvent::TextDelta { content: c, .. } = &event {
+                            assistant_text.push_str(c);
+                        }
+                        if let AgentEvent::Usage { model: _, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
+                            let ms = state.memory_store.clone();
+                            let mdl = model.clone();
+                            let pt = *prompt_tokens;
+                            let ct = *completion_tokens;
+                            let tt = *total_tokens;
+                            let sid = session_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
+                            });
+                        }
+                        let msg_str = event.to_ws_message();
+                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
+                            break;
+                        }
+                        if event.is_done() {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
+                        let msg_str = err_event.to_ws_message();
+                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                // Periodic wake so a long tool call that emits no events can still
+                // observe a per-session stop in real time (the old inline drain did
+                // this via the shared ws_rx channel).
+            }
+        }
+        // Per-session stop for Instant runs; connection-level stop for Expert.
+        let stop_requested = match session_cancel.as_ref() {
+            Some(c) => c.load(std::sync::atomic::Ordering::SeqCst),
+            None => cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        if stop_requested {
+            info!("Agent execution stopped by user");
+            if managed {
+                state.memory_store.set_contract_stopped(&session_id);
+                info!("[managed:{}] Set USER_STOPPED marker on TaskContract", session_id);
+            }
+            let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
+            let msg_str = stop_event.to_ws_message();
+            let _ = ws_send_bounded(&ws_sink, msg_str).await;
+            let done_event = AgentEvent::done(&session_id, "system");
+            let msg_str = done_event.to_ws_message();
+            let _ = ws_send_bounded(&ws_sink, msg_str).await;
+            spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            break;
+        }
+    }
+
+    // Persist final assistant text: deep memory, session history, SQLite.
+    two_tier_write(&state, &mut assistant_text, &session_id, content.as_str());
+    spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
+    if !assistant_text.is_empty() {
+        let mut sessions = state.sessions.lock().await;
+        let hist = sessions.entry(session_id.clone()).or_insert_with(Vec::new);
+        hist.push(ChatMessage::assistant(&assistant_text));
+        if hist.len() > 50 {
+            let drop_n = hist.len() - 50;
+            hist.drain(..drop_n);
+        }
+        let _ = state.memory_store.store_entry(&session_id, "assistant", &assistant_text, None);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let _ = state.memory_store.auto_summarize_date(&today);
+    }
+
+    // Release the parallel-execution slot (Instant runs only; managed had none).
+    if session_cancel.is_some() {
+        state.session_slot_release(&session_id);
+    }
+}
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     use futures::SinkExt;
 
@@ -2358,6 +2482,21 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                         			found
                         		);
                         	}
+                        }
+                        "interject" => {
+                            // Demux: route mid-run interjections from the main loop. insert:true goes to
+                            // the static insert-now queue that the running agent loop drains each
+                            // iteration (drain_insert); insert:false is a queued follow-up.
+                            let ij_sid = parsed["session"].as_str().unwrap_or("").to_string();
+                            let ij_content = parsed["content"].as_str().unwrap_or("").to_string();
+                            let ij_insert = parsed["insert"].as_bool().unwrap_or(false);
+                            if !ij_sid.is_empty() && !ij_content.is_empty() {
+                                if ij_insert {
+                                    crate::interject::push_insert(&ij_sid, ij_content);
+                                } else {
+                                    crate::interject::push_pending(&ij_sid, ij_content);
+                                }
+                            }
                         }
                         _ => {}
                     }
