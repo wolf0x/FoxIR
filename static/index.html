@@ -1683,7 +1683,16 @@ function switchSession(id){
   // If this session is streaming a task in the background, surface whatever
   // output has accumulated so the view is not blank while it keeps running.
   const buf=bgBuffer[id];
-  if(buf&&buf.text&&buf.text.trim()){
+  const pending=(sessionSnapshots[id]&&sessionSnapshots[id].pendingEvents&&sessionSnapshots[id].pendingEvents.length)
+    ?sessionSnapshots[id].pendingEvents:null;
+  if((buf&&buf.events&&buf.events.length)||pending){
+    // Replay buffered tool_call/tool_result + text events that happened while
+    // this session was not the active view, so tool cards are not lost on the
+    // switch back. Reset the live buffer so future background deltas render once.
+    replaySessionEvents((buf&&buf.events&&buf.events.length)?buf.events:pending);
+    if(sessionSnapshots[id])sessionSnapshots[id].pendingEvents=[];
+    bgBuffer[id]={text:'',events:[]};
+  } else if(buf&&buf.text&&buf.text.trim()){
     const conv=document.getElementById('convArea');
     if(conv){
       const d=document.createElement('div');d.className='msg assistant';
@@ -1691,6 +1700,7 @@ function switchSession(id){
       conv.appendChild(d);
     }
     msgHist.push({role:'assistant',text:buf.text.trim(),time:nowTimeStr()});
+    delete bgBuffer[id];
   }
   // Always refresh the current session's transcript from the server (source of
   // truth) so a hard-switch reflects persisted history even for new tabs.
@@ -1935,10 +1945,12 @@ function handleMsg(msg){
   var _bgSess=(taskSessionId&&taskSessionId!==SESSION_ID)?taskSessionId:null;
   if(_bgSess&&_streamTypes.indexOf(msg.type)>=0){
     if(!bgBuffer[_bgSess]){
-      bgBuffer[_bgSess]={text:''};
+      bgBuffer[_bgSess]={text:'',events:[]};
       addLog('Session running in background: '+_bgSess.slice(0,8)+'…','info');
     }
-    if(msg.type==='text'&&msg.content){bgBuffer[_bgSess].text+=msg.content;}
+    var _b=bgBuffer[_bgSess];
+    _b.events.push({type:msg.type,content:msg.content,name:msg.name,call_id:msg.call_id,args:msg.args,result:msg.result});
+    if(msg.type==='text'&&msg.content){_b.text+=msg.content;}
     markSessionRunning(_bgSess,true);
     return;
   }
@@ -1949,8 +1961,12 @@ function handleMsg(msg){
     if(_fin!==SESSION_ID){
       var _snap=sessionSnapshots[_fin]||(sessionSnapshots[_fin]={msgHist:[],logHist:logHist.slice(),html:''});
       _snap.msgHist=_snap.msgHist||[];
+      _snap.pendingEvents=_snap.pendingEvents||[];
       var _b=bgBuffer[_fin];
       if(_b&&_b.text&&_b.text.trim()){_snap.msgHist.push({role:'assistant',text:_b.text.trim(),time:nowTimeStr()});}
+      // Keep the buffered tool_call/tool_result events so switching back can
+      // replay the tool cards instead of dropping them.
+      if(_b&&_b.events&&_b.events.length){_snap.pendingEvents=_snap.pendingEvents.concat(_b.events);}
       delete bgBuffer[_fin];
     }
     markSessionRunning(_fin,false);
@@ -2224,6 +2240,27 @@ function updateToolResult(blk,result){
 function toggleBlock(hdr){
   const body=hdr.nextElementSibling;
   if(body){body.classList.toggle('open');const sp=hdr.querySelector('.arrow');if(sp)sp.classList.toggle('open')}
+}
+// Replay buffered stream events (text deltas + tool_call/tool_result) for a
+// session that ran in the background, so tool cards survive switching back.
+function replaySessionEvents(events){
+  const conv=document.getElementById('convArea');
+  if(!conv||!events)return;
+  for(let i=0;i<events.length;i++){
+    const ev=events[i];
+    if(ev.type==='text'){
+      if(ev.content){hideTyping();finalizeThink();const el=getOrCreateTextBlock();appendTextContent(el,ev.content);}
+    }else if(ev.type==='tool_call'){
+      hideTyping();finalizeThink();finalizeTextBlock();
+      const tb=createToolBlock(ev.name||'tool',ev.call_id,ev.args);
+      appendToConv(tb);curToolMap[ev.call_id]=tb;
+    }else if(ev.type==='tool_result'){
+      const blk=curToolMap[ev.call_id];
+      if(blk)updateToolResult(blk,ev.result);
+    }
+    // thinking / progress are ephemeral; skip for background replay.
+  }
+  scrollBottom();
 }
 // ── Image lightbox ──
 function openLightbox(src,caption){
