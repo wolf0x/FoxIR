@@ -2099,10 +2099,18 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                         }
                         }
                         "clear" => {
-                            state.sessions.lock().await.remove(&session_id);
+                            // Route by the client-specified session so a Clear in
+                            // one session never destroys another session's
+                            // transcript. Fall back to the connection's adopted
+                            // session for older clients.
+                            let target = match parsed["session"].as_str() {
+                                Some(s) if !s.is_empty() => s.to_string(),
+                                _ => session_id.clone(),
+                            };
+                            state.sessions.lock().await.remove(&target);
                             let mut sink = ws_sink.lock().await;
                             let _ = sink
-                                .send(Message::Text(json!({"type":"cleared"}).to_string().into()))
+                                .send(Message::Text(json!({"type":"cleared","session":target}).to_string().into()))
                                 .await;
                         }
                         "cancel_subagent" => {
