@@ -65,6 +65,15 @@ impl DeepMemoryTool {
             })
             .unwrap_or_default()
     }
+    /// pin 与默认 importance：仅显式 pinned="user" 才 User(sacrosanct)；
+    /// 其余默认 Agent(可退火可 GC)。caller 仍可用 importance 参数覆写。
+    fn parse_pin_and_importance(args: &serde_json::Value) -> (PinnedBy, f32) {
+        match args["pinned"].as_str() {
+            Some("user") => (PinnedBy::User, 5.0),
+            Some("none") => (PinnedBy::None, 4.0),
+            _ => (PinnedBy::Agent, 4.0),
+        }
+    }
 
     /// Stable id: scope + subject_key (supersede) or scope + content.
     fn make_id(scope: &MemoryScope, subject_key: Option<&str>, content: &str) -> String {
@@ -86,8 +95,10 @@ impl Tool for DeepMemoryTool {
         "Manage permanent long-term memory (Deep). Actions:\n\
          - 'remember': Store a durable fact. Params: content, summary?, essence?, type?\n\
              (identity|preference|project|constraint|reference), scope? (global|\"chat\"),\n\
-             importance? (0-5, default: user=5, agent=4), subject_key?, tags?[].\n\
-             User-stated facts pin to User (never auto-demoted).\n\
+             importance? (0-5, default: user=5, else 4), pinned? (\"user\"|\"agent\"|\"none\",\n\
+             default \"agent\"), subject_key?, tags?[].\n\
+             Only set pinned=\"user\" when the user EXPLICITLY asked to remember/save this\n\
+             persistently; otherwise leave default (agent, GC-able) or let the curator distill.\n\
          - 'update': Re-judge an existing fact. Params: id, importance? (new judgment),\n\
              content?/summary?/essence? to supersede.\n\
          - 'forget': Delete a fact. Params: id (or query to find best match).\n\
@@ -135,14 +146,12 @@ impl Tool for DeepMemoryTool {
                 let scope = Self::parse_scope(args["scope"].as_str().unwrap_or("global"));
                 let fact_type = Self::parse_type(args["type"].as_str().unwrap_or("reference"));
                 let subject_key = args["subject_key"].as_str().map(String::from);
-                // Main-session writes default to User pin (sacrosanct), unless explicitly agent.
-                let pinned = match args["pinned"].as_str() {
-                    Some("agent") => PinnedBy::Agent,
-                    _ => PinnedBy::User,
-                };
-                let importance = args["importance"].as_f64()
+                // 仅显式 pinned="user" 才 User(sacrosanct)；其余默认 Agent(可退火可 GC)。
+                let (pinned, default_imp) = Self::parse_pin_and_importance(&args);
+                let importance = args["importance"]
+                    .as_f64()
                     .map(|x| x as f32)
-                    .unwrap_or(if pinned == PinnedBy::User { 5.0 } else { 4.0 })
+                    .unwrap_or(default_imp)
                     .clamp(deep_memory::IMPORTANCE_MIN, deep_memory::IMPORTANCE_MAX);
                 let tags = Self::parse_tags(&args["tags"]);
                 let summary = args["summary"].as_str().unwrap_or("").to_string();
@@ -271,3 +280,22 @@ impl Tool for DeepMemoryTool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn remember_defaults_to_agent_and_can_pin_user() {
+        let mut map = serde_json::Map::new();
+        let (p, imp) = DeepMemoryTool::parse_pin_and_importance(&serde_json::Value::Object(map));
+        assert_eq!(p, PinnedBy::Agent);
+        assert_eq!(imp, 4.0);
+
+        let mut with_user = serde_json::Map::new();
+        with_user.insert("pinned".into(), json!("user"));
+        let (p2, imp2) = DeepMemoryTool::parse_pin_and_importance(&serde_json::Value::Object(with_user));
+        assert_eq!(p2, PinnedBy::User);
+        assert_eq!(imp2, 5.0);
+    }
+}
