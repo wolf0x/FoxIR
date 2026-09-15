@@ -1636,10 +1636,15 @@ function markSessionRunning(sid,running){
 
 function snapshotCurrentSession(){
   if(!SESSION_ID)return;
+  // Don't snapshot raw DOM while a stream is mid-flight: the partial bubble
+  // (e.g. an unfinished markdown table) would be resurrected as stale HTML on
+  // switch-back and duplicate/split the message. The buffered stream rebuilds
+  // the single clean message from text instead.
+  var streamingNow = !!(curTextEl || textAccum);
   sessionSnapshots[SESSION_ID]={
     msgHist: msgHist.slice(),
     logHist: logHist.slice(),
-    html: (document.getElementById('convArea')||{}).innerHTML||'',
+    html: streamingNow ? '' : ((document.getElementById('convArea')||{}).innerHTML||''),
   };
 }
 function restoreCurrentSession(){
@@ -1690,11 +1695,24 @@ function switchSession(id){
   if((buf&&buf.events&&buf.events.length)||pending){
     // Replay buffered tool_call/tool_result + text events that happened while
     // this session was not the active view, so tool cards are not lost on the
-    // switch back. Reset the live buffer so future background deltas render once.
+    // switch back. Text deltas land in a single assistant bubble (tool_call no
+    // longer finalizes the text block), so one reply is not split across
+    // bubbles. Reset the live buffer so future background deltas render once.
     replaySessionEvents((buf&&buf.events&&buf.events.length)?buf.events:pending);
     if(sessionSnapshots[id])sessionSnapshots[id].pendingEvents=[];
-    bgBuffer[id]={text:'',events:[]};
+    if(buf){buf.text='';buf.events=[];}else{bgBuffer[id]={text:'',events:[]};}
+  } else if(buf&&buf.text&&buf.text.trim()&&runningSessions.has(id)){
+    // Session is STILL streaming this task in the background. Render what has
+    // accumulated into a LIVE assistant bubble (wires curTextEl/textAccum) and
+    // keep the buffer alive so new deltas continue the SAME bubble instead of
+    // starting a new one. The message is committed to msgHist once by done().
+    hideTyping();finalizeThink();
+    const el=getOrCreateTextBlock();
+    appendTextContent(el,buf.text);
+    buf.text='';buf.events=[];
   } else if(buf&&buf.text&&buf.text.trim()){
+    // Finished (non-running) session with only buffered text: materialize it as
+    // a single message.
     const conv=document.getElementById('convArea');
     if(conv){
       const d=document.createElement('div');d.className='msg assistant';
@@ -2019,7 +2037,7 @@ function handleMsg(msg){
       appendTextContent(txtEl,msg.content);
       scrollBottom();break;
     case 'tool_call':
-      hideTyping();finalizeThink();finalizeTextBlock();
+      hideTyping();finalizeThink();
       let tb=createToolBlock(msg.name,msg.call_id,msg.args);
       appendToConv(tb);curToolMap[msg.call_id]=tb;
       scrollBottom();break;
@@ -2282,7 +2300,7 @@ function replaySessionEvents(events){
     if(ev.type==='text'){
       if(ev.content){hideTyping();finalizeThink();const el=getOrCreateTextBlock();appendTextContent(el,ev.content);}
     }else if(ev.type==='tool_call'){
-      hideTyping();finalizeThink();finalizeTextBlock();
+      hideTyping();finalizeThink();
       const tb=createToolBlock(ev.name||'tool',ev.call_id,ev.args);
       appendToConv(tb);curToolMap[ev.call_id]=tb;
     }else if(ev.type==='tool_result'){
