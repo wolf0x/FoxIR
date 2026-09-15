@@ -246,6 +246,29 @@ fn extract_search_keywords(query: &str) -> Vec<String> {
     keywords.dedup();
     keywords
 }
+/// 用户查询与 deep fact 的确定性 keyword 相关度 ∈ [0,1]。
+/// 复用 extract_search_keywords（CJK bigram 感知）；无 I/O、无 LLM。
+pub fn keyword_relevance(query: &str, fact: &crate::deep_memory::DeepFact) -> f64 {
+    // 归一化：去掉首尾非字母数字（如 "?"），使 "running?" 能匹配 "running"。
+    let mut kws: Vec<String> = extract_search_keywords(query)
+        .into_iter()
+        .map(|k| k.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+    kws.sort();
+    kws.dedup();
+    if kws.is_empty() {
+        return 0.0;
+    }
+    let hay = format!(
+        "{} {} {} {}",
+        fact.content, fact.summary, fact.essence, fact.tags.join(" ")
+    )
+    .to_lowercase();
+    let hits = kws.iter().filter(|k| hay.contains(k.as_str())).count();
+    hits as f64 / kws.len() as f64
+}
+
 
 impl MemoryStore {
     /// Open or create the SQLite database at the given path.
@@ -1807,18 +1830,20 @@ pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>,
     pub fn deep_permanent_block(
         &self,
         scope_key: &str,
+        query: &str,
         p_max: usize,
         tau_days: f32,
-    ) -> (String, usize, Vec<String>) {
+    ) -> (String, usize, Vec<String>, Vec<String>) {
         use crate::deep_memory::{DeepParams, PinnedBy};
         let now = crate::deep_memory::now_secs();
         let params = DeepParams { tau_days, ..Default::default() };
         let facts = match self.deep_list(scope_key) {
             Ok(f) => f,
-            Err(_) => return (String::new(), 0, Vec::new()),
+            Err(_) => return (String::new(), 0, Vec::new(), Vec::new()),
         };
-        // lines: (渲染行, 价值, token 成本, 事实 id)
+        // lines: (渲染行, 排序分, token 成本, 事实 id)
         let mut lines: Vec<(String, f32, usize, String)> = Vec::new();
+        let mut relevant_ids: Vec<String> = Vec::new();
         for f in &facts {
             let pin_user = f.pinned_by == PinnedBy::User;
             let pin_agent = f.pinned_by == PinnedBy::Agent;
@@ -1832,22 +1857,27 @@ pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>,
             if !crate::deep_memory::is_visible_permanent(i_eff, pin_user, pin_agent, &params) {
                 continue;
             }
+            let rel = keyword_relevance(query, f);
+            if rel >= 0.25 {
+                relevant_ids.push(f.id.clone());
+            }
             let body = if f.summary.trim().is_empty() { f.content.trim() } else { f.summary.trim() };
             let line = format!("- [{}] {}", f.fact_type.as_str(), body);
             let cost = crate::deep_memory::estimate_tokens(&line);
-            // 上下文预算内按「统一工件价值 V=Q²·R·U」排序，优先级：重要、近期、常用。
-            lines.push((line, f.value(now) as f32, cost, f.id.clone()));
+            // 召回更准：排序分 = 价值 + 4×相关性；query 为空时纯价值（向后兼容）。
+            let score = 4.0 * (rel as f32) + (f.value(now) as f32);
+            lines.push((line, score, cost, f.id.clone()));
         }
         if lines.is_empty() {
-            return (String::new(), 0, Vec::new());
+            return (String::new(), 0, Vec::new(), relevant_ids);
         }
         let header = "## Permanent Memory (Deep) — durable facts about this user/project\n";
         let header_cost = crate::deep_memory::estimate_tokens(header);
         let body_budget = p_max.saturating_sub(header_cost);
-        let items: Vec<(f32, usize)> = lines.iter().map(|(_, i, c, _)| (*i, *c)).collect();
+        let items: Vec<(f32, usize)> = lines.iter().map(|(_, s, c, _)| (*s, *c)).collect();
         let picked = crate::deep_memory::pack_by_budget(&items, body_budget);
         if picked.is_empty() {
-            return (String::new(), 0, Vec::new());
+            return (String::new(), 0, Vec::new(), relevant_ids);
         }
         let mut out = String::from(header);
         let mut toks = header_cost;
@@ -1858,7 +1888,7 @@ pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>,
             toks += lines[*idx].2;
             picked_ids.push(lines[*idx].3.clone());
         }
-        (out, toks, picked_ids)
+        (out, toks, picked_ids, relevant_ids)
     }
 }
 
@@ -2059,6 +2089,46 @@ mod tests_two_tier {
 
         let archived = store.deep_list_archived("global").unwrap();
         assert!(archived.is_empty(), "restore removed it from archived view");
+    }
+    #[test]
+    fn keyword_relevance_ranks_related_higher() {
+        let fact = |content: &str| crate::deep_memory::DeepFact {
+            id: "x".into(), content: content.into(), summary: String::new(), essence: String::new(),
+            fact_type: crate::deep_memory::FactType::Reference, scope: crate::deep_memory::MemoryScope::Global,
+            pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
+            importance: 4.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false,
+        };
+        let related = fact("Process count is 42, running svchost and explorer");
+        let unrelated = fact("Oracle database backup completed at midnight");
+        assert!(
+            keyword_relevance("how many processes are running?", &related)
+                > keyword_relevance("how many processes are running?", &unrelated)
+        );
+        assert_eq!(keyword_relevance("", &related), 0.0);
+    }
+
+    #[test]
+    fn deep_permanent_block_ranks_relevant_first_and_flags_rel_ids() {
+        let store = tmp_store();
+        let now = crate::deep_memory::now_secs();
+        let mk = |id: &str, content: &str, imp: f32| {
+            store
+                .deep_store(&crate::deep_memory::DeepFact {
+                    id: id.into(), content: content.into(), summary: String::new(), essence: String::new(),
+                    fact_type: crate::deep_memory::FactType::Reference, scope: crate::deep_memory::MemoryScope::Global,
+                    pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
+                    importance: imp, created_at: now, last_accessed: now, tags: vec![], links: vec![], archived: false,
+                })
+                .unwrap();
+        };
+        mk("big-unrelated", "Database index maintenance scheduling", 5.0);
+        mk("small-related", "Running processes: svchost, explorer, csrss", 2.5);
+        let (block, _toks, _picked, rel) =
+            store.deep_permanent_block("global", "what processes are running", 100_000, 60.0);
+        let idx_small = block.find("Running processes").unwrap_or(usize::MAX);
+        let idx_big = block.find("Database").unwrap_or(usize::MAX);
+        assert!(idx_small < idx_big, "relevant should rank above high-importance unrelated: {block}");
+        assert!(rel.contains(&"small-related".to_string()));
     }
 }
 

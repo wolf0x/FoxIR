@@ -1798,11 +1798,13 @@ history.insert(0, ChatMessage::system(hint));
 // O2: 收敛记忆注入 —— 只注入深层永久块（自动 MEMORY.md/Blackboard），
 // 记忆注入：只注入深层永久块（对话事实由后台 curator 蒸馏进 deep_facts）。
 if state.two_tier_memory.load(Ordering::SeqCst) {
-    let (eg_block, _eg_tok, eg_ids) = state.memory_store.deep_permanent_block("global", 1024, 60.0);
+    let (eg_block, _eg_tok, _eg_ids, rel_ids) =
+        state.memory_store.deep_permanent_block("global", &content, 1024, 60.0);
     if !eg_block.trim().is_empty() {
         info!("Injected deep permanent block ({} chars)", eg_block.len());
         history.insert(0, ChatMessage::system(&eg_block));
-        if let Ok(touched) = state.memory_store.deep_touch_batch(&eg_ids) {
+        // 仅"与当前问题相关"的事实才 touch，冷门条目自然退火（解"注入即续命"）。
+        if let Ok(touched) = state.memory_store.deep_touch_batch(&rel_ids) {
             info!("Deep memory recall touched {} entries", touched);
         }
     }
