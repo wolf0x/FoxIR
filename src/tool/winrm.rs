@@ -210,7 +210,13 @@ impl Tool for WinrmExecTool {
                         timeout_secs, host
                     )
                 })?
-                .map_err(|e| format!("WinRM PowerShell execution failed: {}", e))?
+                .map_err(|e| {
+                    winrm_failure_msg(
+                        format!("WinRM PowerShell execution failed: {}", e),
+                        auth_str,
+                        use_tls,
+                    )
+                })?
         } else {
             timeout(effective_timeout, client.run_command(&host, "cmd.exe", &["/C", command]))
                 .await
@@ -220,7 +226,13 @@ impl Tool for WinrmExecTool {
                         timeout_secs, host
                     )
                 })?
-                .map_err(|e| format!("WinRM command execution failed: {}", e))?
+                .map_err(|e| {
+                    winrm_failure_msg(
+                        format!("WinRM command execution failed: {}", e),
+                        auth_str,
+                        use_tls,
+                    )
+                })?
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -254,6 +266,42 @@ fn parse_winrm_target(target: &str) -> (String, u16) {
     (target.to_string(), 0)
 }
 
+/// Append a concise, built-in troubleshooting note when a WinRM call fails with
+/// a service-side auth signature (workgroup host, HTTP 500/401/negotiate).
+/// This makes the well-known fix available BY DEFAULT at the point of failure,
+/// instead of relying on a pinned knowledge recall. It only DIAGNOSES + guides —
+/// it never applies the change (turning on Basic/AllowUnencrypted is a high-risk,
+/// security-relevant action that must stay behind the confirmation flow).
+fn winrm_failure_msg(msg: String, _auth: &str, use_tls: bool) -> String {
+    let m = msg.to_ascii_lowercase();
+    let hit = m.contains("500")
+        || m.contains("401")
+        || m.contains("ntlm handshake")
+        || m.contains("negotiate")
+        || m.contains("unauthorized")
+        || m.contains("access denied");
+    if !hit {
+        return msg;
+    }
+    let tls_note = if use_tls {
+        String::new()
+    } else {
+        " Over plain HTTP, Basic sends credentials in cleartext — OK only on an isolated/lab/DMZ net; prefer HTTPS (5986 + cert) for production."
+            .to_string()
+    };
+    format!(
+        "{}\n\n[WinRM diagnostic] This usually means the remote winrm SERVICE has Basic/AllowUnencrypted \
+         disabled on a WORKGROUP host (no Kerberos), while port 5985 is open and 5986 is closed. A reliable tell: \
+         native PowerShell remoting still works but this tool fails — that split means the problem is the server-side \
+         auth config, not connectivity or credentials. Fix on the remote host over a WORKING channel (preferred, avoids \
+         @{{...}} quoting bugs):\n  Set-Item WSMan:\\localhost\\Service\\Auth\\Basic -Value $true\n  \
+         Set-Item WSMan:\\localhost\\Service\\AllowUnencrypted -Value $true\n\
+         Then retry this tool with auth=ntlm (or basic).{}",
+        msg,
+        tls_note
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +317,27 @@ mod tests {
             ("10.0.0.5".into(), 5986)
         );
         assert_eq!(parse_winrm_target("server01"), ("server01".into(), 0));
+    }
+
+    #[test]
+    fn test_winrm_failure_msg_attaches_diagnostic_on_auth_signature() {
+        let out = winrm_failure_msg("WinRM command execution failed: HTTP 500 NTLM handshake".into(), "ntlm", false);
+        assert!(out.contains("[WinRM diagnostic]"), "should append diagnostic");
+        assert!(out.contains("WSMan:\\localhost\\Service\\Auth\\Basic"), "should include fix command");
+        // Security caveat on plain HTTP.
+        assert!(out.to_lowercase().contains("cleartext"));
+    }
+
+    #[test]
+    fn test_winrm_failure_msg_benign_error_is_passthrough() {
+        let out = winrm_failure_msg("WinRM command execution failed: connection refused".into(), "ntlm", false);
+        assert!(!out.contains("[WinRM diagnostic]"), "benign error stays untouched");
+    }
+
+    #[test]
+    fn test_winrm_failure_msg_tls_omits_cleartext_caveat() {
+        let out = winrm_failure_msg("WinRM command execution failed: HTTP 401 Unauthorized".into(), "basic", true);
+        assert!(out.contains("[WinRM diagnostic]"));
+        assert!(!out.to_lowercase().contains("cleartext"), "no cleartext caveat over TLS");
     }
 }
