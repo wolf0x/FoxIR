@@ -1650,7 +1650,22 @@ function snapshotCurrentSession(){
 function restoreCurrentSession(){
   const s=sessionSnapshots[SESSION_ID];
   const conv=document.getElementById('convArea');
-  if(s){msgHist=s.msgHist.slice();logHist=s.logHist.slice();if(conv)conv.innerHTML=s.html;}
+  if(s){
+    msgHist=s.msgHist.slice();logHist=s.logHist.slice();
+    if(conv){
+      if(s.html){
+        // Normal case: the snapshot captured a stable DOM.
+        conv.innerHTML=s.html;
+      } else if(msgHist.length){
+        // Snapshot carried no DOM because it was taken mid-stream. Re-render
+        // from stored text so user/assistant history is NOT lost on switch-back.
+        conv.innerHTML='';
+        renderHistMessages(msgHist);
+      } else {
+        conv.innerHTML='';
+      }
+    }
+  }
   else{msgHist=[];logHist=[];if(conv)conv.innerHTML='';}
 }
 function clearCurrentSessionUI(){
