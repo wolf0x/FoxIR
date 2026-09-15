@@ -339,6 +339,9 @@ pub struct DeepFact {
     pub last_accessed: u64,
     pub tags: Vec<String>,
     pub links: Vec<String>,
+    /// 软归档标记：归档事实默认不出现在活跃召回/投影中，可 deep_restore 恢复。
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl DeepFact {

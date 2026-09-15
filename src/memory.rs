@@ -1516,13 +1516,30 @@ impl MemoryStore {
                 created_at    INTEGER NOT NULL,
                 last_accessed INTEGER NOT NULL,
                 tags          TEXT NOT NULL DEFAULT '[]',
-                links         TEXT NOT NULL DEFAULT '[]'
+                links         TEXT NOT NULL DEFAULT '[]',
+                archived      INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_df_scope ON deep_facts(scope);
             CREATE INDEX IF NOT EXISTS idx_df_subject ON deep_facts(subject_key);
             CREATE INDEX IF NOT EXISTS idx_df_importance ON deep_facts(importance);",
         )
         .map_err(|e| format!("Two-tier schema failed: {e}"))?;
+        {
+            let has_archived: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('deep_facts') WHERE name='archived'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if has_archived == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE deep_facts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| format!("Two-tier schema add archived: {e}"))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1605,7 +1622,7 @@ impl MemoryStore {
     pub fn deep_list(&self, scope_key: &str) -> Result<Vec<crate::deep_memory::DeepFact>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT * FROM deep_facts WHERE scope = 'global' OR scope = ?1")
+            .prepare("SELECT * FROM deep_facts WHERE (scope = 'global' OR scope = ?1) AND archived = 0")
             .map_err(|e| format!("deep_list prepare: {e}"))?;
         let rows = stmt
             .query_map(params![scope_key], deep_row)
@@ -1733,6 +1750,56 @@ pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>,
             .map_err(|e| format!("deep_forget: {e}"))?;
         Ok(n > 0)
     }
+    /// 软归档单条：置 archived=1（不物理删除）。
+    pub fn deep_archive(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("UPDATE deep_facts SET archived = 1 WHERE id = ?1", params![id])
+            .map_err(|e| format!("deep_archive: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// 撤销软归档：置 archived=0。
+    pub fn deep_restore(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("UPDATE deep_facts SET archived = 0 WHERE id = ?1", params![id])
+            .map_err(|e| format!("deep_restore: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// 批量软归档：非 User pin 且 importance<threshold 且 last_accessed<now-tau 的事实置 archived=1。
+    pub fn deep_archive_stale(&self, tau_days: f32, importance_threshold: f32) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = crate::deep_memory::now_secs();
+        let cutoff = (now as i64) - (tau_days as i64) * 86_400;
+        let n = conn
+            .execute(
+                "UPDATE deep_facts SET archived = 1
+                 WHERE archived = 0 AND pinned_by != 'user'
+                   AND importance < ?1 AND last_accessed < ?2",
+                params![importance_threshold as f64, cutoff],
+            )
+            .map_err(|e| format!("deep_archive_stale: {e}"))?;
+        Ok(n)
+    }
+
+    /// 列出已归档事实（投影用/审计用）。
+    pub fn deep_list_archived(&self, scope_key: &str) -> Result<Vec<crate::deep_memory::DeepFact>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM deep_facts WHERE (scope = 'global' OR scope = ?1) AND archived = 1")
+            .map_err(|e| format!("deep_list_archived prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![scope_key], deep_row)
+            .map_err(|e| format!("deep_list_archived query: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("deep row: {e}"))?);
+        }
+        Ok(out)
+    }
+
 
     // ── 深层上下文装配（调纯算法）────────────────────────────
 
@@ -1823,6 +1890,7 @@ fn deep_row(r: &rusqlite::Row) -> rusqlite::Result<crate::deep_memory::DeepFact>
         last_accessed: r.get::<_, i64>(10)? as u64,
         tags: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
         links: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+        archived: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -1894,6 +1962,7 @@ mod tests_two_tier {
             last_accessed: crate::deep_memory::now_secs(),
             tags: vec![],
             links: vec![],
+            archived: false,
         };
         s.deep_store(&f).unwrap();
         let list = s.deep_list("global").unwrap();
@@ -1937,6 +2006,62 @@ mod tests_two_tier {
         assert!(s.build_session_recall_block("", 100, 50).is_none());
         assert!(s.build_session_recall_block("no-such-session", 100, 50).is_none());
     }
+
+    #[test]
+    fn deep_archive_soft_gc_preserves_user_and_returns_rows() {
+        let store = tmp_store();
+        let now = crate::deep_memory::now_secs();
+        let mk = |id: &str, importance: f32, pinned: &str, last: u64| {
+            let fact = crate::deep_memory::DeepFact {
+                id: id.to_string(),
+                content: format!("fact {id}"),
+                summary: String::new(),
+                essence: String::new(),
+                fact_type: crate::deep_memory::FactType::Reference,
+                scope: crate::deep_memory::MemoryScope::Global,
+                pinned_by: match pinned {
+                    "user" => crate::deep_memory::PinnedBy::User,
+                    "agent" => crate::deep_memory::PinnedBy::Agent,
+                    _ => crate::deep_memory::PinnedBy::None,
+                },
+                subject_key: None,
+                importance,
+                created_at: 1,
+                last_accessed: last,
+                tags: vec![],
+                links: vec![],
+                archived: false,
+            };
+            store.deep_store(&fact).unwrap();
+        };
+        // stale + low importance + non-user -> should be archived
+        mk("a", 2.0, "agent", now - 100 * 86_400);
+        // stale + high importance -> keep
+        mk("b", 4.5, "agent", now - 100 * 86_400);
+        // stale + low + user pin -> keep
+        mk("c", 2.0, "user", now - 100 * 86_400);
+        // fresh + low -> keep
+        mk("d", 2.0, "agent", now);
+
+        let n = store.deep_archive_stale(60.0, 3.0).unwrap();
+        assert_eq!(n, 1, "only 'a' should be archived");
+
+        let active = store.deep_list("global").unwrap();
+        let ids: Vec<String> = active.iter().map(|f| f.id.clone()).collect();
+        assert!(!ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"b".to_string()));
+        assert!(ids.contains(&"c".to_string()));
+        assert!(ids.contains(&"d".to_string()));
+
+        assert!(store.deep_restore("a").unwrap());
+        let after_restore = store.deep_list("global").unwrap();
+        assert!(after_restore.iter().any(|f| f.id == "a"));
+
+        let archived = store.deep_list_archived("global").unwrap();
+        assert!(archived.is_empty(), "restore removed it from archived view");
+    }
 }
+
+
 
 

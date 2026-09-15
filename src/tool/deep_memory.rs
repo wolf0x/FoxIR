@@ -162,6 +162,7 @@ impl Tool for DeepMemoryTool {
                     last_accessed: now,
                     tags,
                     links: vec![],
+                    archived: false,
                 };
                 self.memory_store.deep_store(&fact)?;
                 Ok(json!({

@@ -2632,6 +2632,7 @@ async fn deep_memory_create_handler(
         last_accessed: deep_now(),
         tags: body.tags,
         links: Vec::new(),
+        archived: false,
     };
     match state.memory_store.deep_store(&fact) {
         Ok(()) => Json(json!({ "success": true, "fact": serde_json::to_value(&fact).unwrap_or(Value::Null) })),
@@ -2876,6 +2877,7 @@ Ignore one-off or transient details, and do not re-state the same point more tha
                 last_accessed: now,
                 tags: Vec::new(),
                 links: Vec::new(),
+                archived: false,
             };
             if let Err(e) = state.memory_store.deep_store(&fact) {
                 tracing::warn!("[deep-curator] store failed: {e}");
