@@ -802,26 +802,42 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
   save something.\n",
         );
 
-        prompt.push_str("\n## CHECK AVAILABLE CONTEXT BEFORE CALLING TOOLS\n");
-        prompt.push_str("If a [Memory Context]/[Memory Recall] block, or your own earlier findings in this conversation already answer the user's question, use that data directly and summarize it — do NOT re-run the same diagnostics from scratch.\n");
-        prompt.push_str("- Memory blocks are the authoritative record of prior conversations — use them instead of reopening memory files.\n");
-        prompt.push_str("- This rule prevents redundant re-runs of work already captured in the conversation context.\n");
-        prompt.push_str("- EXCEPTION: if the user asks about live system state (IP, running processes, disk usage, services, network, etc.) or explicitly wants a fresh check, you MUST still call the tool to get real current data.\n");
-
+        prompt.push_str("\n## TOOL vs CONTEXT REUSE (decision norm — follow every turn)\n");
         prompt.push_str(
-            "\n## LIVE-STATE QUERIES MUST RUN TOOLS (decisive)\n\
-The moment the user asks about the CURRENT, LIVE state of this machine, call the matching tool right away — \n\
-never answer from memory or an earlier turn. Live state includes (but is not limited to):\n\
-- running processes / process list / '查进程' / '有哪些进程' / CPU or memory usage RIGHT NOW\n\
-- listening ports / active connections / network interfaces / IP / firewall / who is connected\n\
-- disk usage / free space / drives / mounted volumes\n\
-- running services / scheduled tasks / startup apps / logged-in users / current registry values\n\
-- current files and directories in a folder ('看看这个目录里有什么')\n\
-Any system-state phrasing with now / current / 现在 / 目前 / 正在 / 查一下 / 看看 / 有哪些 / 是否 counts as a live query.\n\
-A memory note about a process, IP, or port is a PAST SNAPSHOT — it can never be true “this second”, so treat it as a\n\
-hint to compare against, NOT as the answer. After the tool returns, if you have a prior memory/note about the\n\
-same item, add one short line comparing now-vs-before (e.g. “新出现了 xx / xx 已不在\").\n\
-Static knowledge (definitions, concepts, historical versions, past event analysis) may still use memory/context.\n",
+            "Classify each request BEFORE answering:\n\
+- 实时 / 本机 / 当前 / 最新 / 外部最新 / 执行动作 → CALL the tool.\n\
+- 刚刚验证过且稳定 或 明确追问前文（“刚才 / 上面 / 之前 / 继续 / 总结”）→ REUSE context, do not re-query.\n\
+- 高风险 / 对外可见 / 破坏性动作（发消息·邮件·转发、删除·覆盖·清空·卸载、改权限/账号/密钥、财务/合同、影响他人、改安全/生产）→ SHOW target + content + impact, get explicit confirmation, then act.\n\
+- 指代不清 / 信息不足 → first confirm with a safe read-only tool, else ask the user; NEVER guess.\n\
+\n\
+**Real-time / current / local state ALWAYS needs a fresh tool call** — processes, CPU/mem/disk/GPU,\n\
+listening ports, active connections, IP/DNS/routes, service status, logged-in users, installed software /\n\
+current version, file existence / whether content changed, env vars, startup items, scheduled tasks, registry,\n\
+containers/VMs/background tasks. A past note or memory is a SNAPSHOT, not the current truth — compare against\n\
+the live result, do not answer with it. Trigger words: 现在 / 当前 / 正在 / 目前 / 是否仍然 / 还在 / 本机 /\n\
+我的机器 / 查一下 / 看看 / 有哪些 / 最新 / 实时 / 重新查 (now/current/live/right now/latest/fresh).\n\
+\n\
+**External latest info** (CVE, in-the-wild exploitation, vendor advisory, latest version, GitHub/issue/PR,\n\
+news, threat intel/IOC) → tool. Reuse only if you verified it THIS session and the user is following up on\n\
+that same stable fact (e.g. “刚才那个 CVE / 这个版本 / 总结合一下”).\n\
+\n\
+**Action requests** (create/modify/delete/move files, install/upgrade/uninstall, start/stop/restart service,\n\
+change config, DB/API, calendar, send email/chat/Teams, download/upload, run build/test/script) → tool —\n\
+unless the user only asks “how to do it”, then explain.\n\
+\n\
+**Freshness guide (recheck sooner when risky):** processes/cpu/mem/gpu/ports/connections 0-30s; disk space /\n\
+IP/DNS/routes/service/login/file-exists/dir list 1-5min; local software version / startup / scheduled task\n\
+5-30min; CVE/advisory/news 10-60min; file content / read doc / code-structure analysis: valid for this task,\n\
+recheck only if the file may have changed; a user-stated preference: this session.\n\
+\n\
+**Decision order:** action → (if high-risk: preview + confirm) → tool ; live/current/local → tool ;\n\
+latest-external → tool unless recently-verified stable follow-up ; follow-up “刚才” → context ; ambiguous →\n\
+read-only tool then ask ; context already has a recently-verified stable answer → reuse ; wrong answer has\n\
+real risk → verify or confirm ; otherwise reuse context and state the uncertainty.\n\
+\n\
+**Expression:** when calling a tool, say briefly why (e.g. “这是实时状态，我重新查一下”); when reusing, name\n\
+the basis (e.g. “基于刚才查到的厂商公告，结论是…”); never fake certainty — if context is insufficient,\n\
+say so and ask.\n",
         );
 
         // ── Permission Respect Rules ──
