@@ -2895,6 +2895,12 @@ Ignore one-off or transient details, and do not re-state the same point more tha
         {
             tracing::warn!("[deep-curator] memory projection failed: {e}");
         }
+        // 软归档 GC：非 User、低重要度、久未访问的事实归档（可恢复，不物理删）。
+        if let Ok(n) = state.memory_store.deep_archive_stale(60.0, 3.0) {
+            if n > 0 {
+                tracing::info!("[deep-curator] soft-archived {n} stale low-importance facts");
+            }
+        }
     });
 }
 

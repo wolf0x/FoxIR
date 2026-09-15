@@ -1679,6 +1679,7 @@ pub fn deep_search_keyword(&self, query: &str, limit: usize) -> Vec<crate::deep_
     out
 }
 
+
 /// Read-only projection: render the durable deep facts (global scope) into the
 /// workspace `MEMORY.md` so the user can view it from the original memory window.
 /// This is a projection only — it never modifies DB rows. It refreshes on every
@@ -1688,40 +1689,55 @@ pub fn write_memory_projection(&self, workspace_dir: &str) -> Result<(), String>
 
     let mut md = String::new();
     md.push_str("# FoxIR Long-Term Memory (read-only projection)\n\n");
+    let archived_facts = self.deep_list_archived("global").unwrap_or_default();
     md.push_str(&format!(
-        "_Generated from `deep_facts` · {} durable fact(s)_.  \n",
-        facts.len()
+        "_Generated from `deep_facts` · {} active + {} archived fact(s)_.  \n",
+        facts.len(),
+        archived_facts.len()
     ));
     md.push_str("_Edit facts with the `deep_memory` tool, not by editing this file._\n\n");
     if facts.is_empty() {
         md.push_str("_(no durable facts yet — the background curator distills them from conversations)_\n");
     }
 
-    let mut sorted = facts;
-    sorted.sort_by(|a, b| {
-        let pa = matches!(a.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
-        let pb = matches!(b.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
-        pb.cmp(&pa)
-            .then(b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    for (i, f) in sorted.iter().enumerate() {
-        let pinned = match f.pinned_by {
-            crate::deep_memory::PinnedBy::User => "user",
-            crate::deep_memory::PinnedBy::Agent => "agent",
-            crate::deep_memory::PinnedBy::None => "none",
-        };
-        md.push_str(&format!(
-            "{}. **`{}`** — importance {} · pinned `{}`\n",
-            i + 1,
-            f.fact_type.as_str(),
-            f.importance,
-            pinned
-        ));
-        md.push_str(&format!("   {}\n", f.content));
-        if let Some(k) = &f.subject_key {
-            md.push_str(&format!("   key: `{}`\n", k));
+    const TOP_PER_GROUP: usize = 8;
+    let groups = projection_groups(&facts, TOP_PER_GROUP);
+    for (t, shown, collapsed) in &groups {
+        md.push_str(&format!("### {}\n", t.as_str()));
+        let mut in_group: Vec<_> = facts.iter().filter(|f| f.fact_type == *t).collect();
+        in_group.sort_by(|a, b| {
+            let pa = matches!(a.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+            let pb = matches!(b.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+            pb.cmp(&pa)
+                .then(b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for f in in_group.iter().take(*shown) {
+            let pinned = match f.pinned_by {
+                crate::deep_memory::PinnedBy::User => "user",
+                crate::deep_memory::PinnedBy::Agent => "agent",
+                crate::deep_memory::PinnedBy::None => "none",
+            };
+            md.push_str(&format!(
+                "- **`{}`** — importance {} · pinned `{}`\n  {}\n",
+                f.fact_type.as_str(),
+                f.importance,
+                pinned,
+                f.content
+            ));
+            if let Some(k) = &f.subject_key {
+                md.push_str(&format!("  key: `{}`\n", k));
+            }
+        }
+        if *collapsed > 0 {
+            md.push_str(&format!("- …and {} more (importance-led; view via deep_memory recall/list)\n", collapsed));
         }
         md.push('\n');
+    }
+    if !archived_facts.is_empty() {
+        md.push_str(&format!(
+            "\n## Archived (soft-GC, recoverable)\n_{} fact(s) archived; restore with the `deep_memory` tool (`update`) or `deep_restore`._\n",
+            archived_facts.len()
+        ));
     }
 
     // ── Recent Conversation Highlights ──
@@ -1927,6 +1943,37 @@ fn deep_row(r: &rusqlite::Row) -> rusqlite::Result<crate::deep_memory::DeepFact>
 
 
 
+/// 投影分组统计：按 FactType 分组，返回 (类型, 展示数, 折叠数)。
+pub fn projection_groups(
+    facts: &[crate::deep_memory::DeepFact],
+    top_per_group: usize,
+) -> Vec<(crate::deep_memory::FactType, usize, usize)> {
+    use crate::deep_memory::FactType;
+    let order = [
+        FactType::Identity,
+        FactType::Preference,
+        FactType::Project,
+        FactType::Constraint,
+        FactType::Reference,
+    ];
+    let mut out = Vec::new();
+    for t in order {
+        let mut in_group: Vec<_> = facts.iter().filter(|f| f.fact_type == t).collect();
+        if in_group.is_empty() {
+            continue;
+        }
+        in_group.sort_by(|a, b| {
+            let pa = matches!(a.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+            let pb = matches!(b.pinned_by, crate::deep_memory::PinnedBy::User) as u8;
+            pb.cmp(&pa)
+                .then(b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let shown = in_group.len().min(top_per_group);
+        out.push((t, shown, in_group.len() - shown));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests_two_tier {
     use super::*;
@@ -2131,7 +2178,22 @@ mod tests_two_tier {
         assert!(rel.contains(&"small-related".to_string()));
     }
 }
-
-
-
-
+    #[test]
+    fn projection_groups_caps_per_group_and_counts_collapsed() {
+        let f = |id: &str, t: crate::deep_memory::FactType| crate::deep_memory::DeepFact {
+            id: id.into(), content: id.into(), summary: String::new(), essence: String::new(),
+            fact_type: t, scope: crate::deep_memory::MemoryScope::Global,
+            pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
+            importance: 3.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false,
+        };
+        let mut facts = Vec::new();
+        for i in 0..10 {
+            facts.push(f(&format!("r{i}"), crate::deep_memory::FactType::Reference));
+        }
+        facts.push(f("p1", crate::deep_memory::FactType::Preference));
+        let groups = projection_groups(&facts, 8);
+        let refs = groups.iter().find(|g| g.0 == crate::deep_memory::FactType::Reference).unwrap();
+        assert_eq!(refs, &(crate::deep_memory::FactType::Reference, 8, 2));
+        let prefs = groups.iter().find(|g| g.0 == crate::deep_memory::FactType::Preference).unwrap();
+        assert_eq!(prefs, &(crate::deep_memory::FactType::Preference, 1, 0));
+    }
