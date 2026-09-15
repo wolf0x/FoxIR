@@ -2837,9 +2837,9 @@ Ignore one-off or transient details, and do not re-state the same point more tha
             let existing = cf.subject_key.as_deref().and_then(|sk| {
                 state
                     .memory_store
-                    .deep_list("global")
+                    .deep_find_subject_any("global", sk)
                     .ok()
-                    .and_then(|l| l.into_iter().find(|e| e.subject_key.as_deref() == Some(sk)))
+                    .flatten()
             });
             if existing.is_none() {
                 let dup = state
@@ -2860,6 +2860,7 @@ Ignore one-off or transient details, and do not re-state the same point more tha
                 fact.fact_type = deep_parse_type(&cf.fact_type);
                 fact.importance = fact.importance.max(4.0);
                 fact.last_accessed = now;
+                fact.archived = false;
                 if state.memory_store.deep_store(&fact).is_ok() {
                     tracing::info!("[deep-curator] updated durable fact: {}", fcontent);
                 }

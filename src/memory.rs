@@ -1838,6 +1838,22 @@ pub fn deep_get(&self, id: &str) -> Result<Option<crate::deep_memory::DeepFact>,
         }
         Ok(out)
     }
+    /// 按 subject_key 查一条事实（含已归档），供 curator 复活同主题事实。
+    /// deep_list 已过滤 archived，这里不做过滤，避免 curator 重捕时错过已归档行。
+    pub fn deep_find_subject_any(&self, scope_key: &str, subject_key: &str) -> Result<Option<crate::deep_memory::DeepFact>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM deep_facts WHERE (scope = 'global' OR scope = ?1) AND subject_key = ?2")
+            .map_err(|e| format!("deep_find_subject_any prepare: {e}"))?;
+        let mut rows = stmt
+            .query_map(params![scope_key, subject_key], deep_row)
+            .map_err(|e| format!("deep_find_subject_any query: {e}"))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| format!("deep row: {e}"))?)),
+            None => Ok(None),
+        }
+    }
+
 
 
     // ── 深层上下文装配（调纯算法）────────────────────────────
@@ -2197,3 +2213,38 @@ mod tests_two_tier {
         let prefs = groups.iter().find(|g| g.0 == crate::deep_memory::FactType::Preference).unwrap();
         assert_eq!(prefs, &(crate::deep_memory::FactType::Preference, 1, 0));
     }
+
+#[test]
+fn deep_find_subject_any_includes_archived() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("mem.db").to_str().unwrap().to_string();
+    std::mem::forget(dir);
+    let store = MemoryStore::new(&p).unwrap();
+    let now = crate::deep_memory::now_secs();
+    store
+        .deep_store(&crate::deep_memory::DeepFact {
+            id: "eg1".into(),
+            content: "target host 10.0.0.5".into(),
+            summary: String::new(),
+            essence: String::new(),
+            fact_type: crate::deep_memory::FactType::Reference,
+            scope: crate::deep_memory::MemoryScope::Global,
+            pinned_by: crate::deep_memory::PinnedBy::Agent,
+            subject_key: Some("host-10.0.0.5".into()),
+            importance: 2.0,
+            created_at: now - 100 * 86_400,
+            last_accessed: now - 100 * 86_400,
+            tags: vec![],
+            links: vec![],
+            archived: false,
+        })
+        .unwrap();
+    // 真实软归档：importance<3 且久未访问 → archived=1。
+    assert_eq!(store.deep_archive_stale(60.0, 3.0).unwrap(), 1);
+    // 活跃列表过滤掉归档行。
+    assert!(store.deep_list("global").unwrap().is_empty());
+    // subject-any 能命中归档行，供 curator 复活。
+    let found = store.deep_find_subject_any("global", "host-10.0.0.5").unwrap();
+    assert!(found.is_some());
+    assert_eq!(found.unwrap().id, "eg1");
+}
