@@ -451,6 +451,10 @@ impl ManagedRunner {
             // Track how many times LLM human intervention has been attempted
             let mut human_intervention_attempts: usize = 0;
             let mut focus_rounds: usize = 0;
+            // Planning failures (manager produced an unusable plan) are tracked
+            // separately from executor stagnation so they never trip the
+            // no-progress Human gate.
+            let mut planning_failures: usize = 0;
             // F5: per-round archive directory for audit trail.
             let archive_dir = std::path::Path::new(&workspace_dir)
                 .join("managed").join(&contract_id);
@@ -727,6 +731,19 @@ impl ManagedRunner {
                     }
                     ManagerRoute::Invalid(reason) => {
                         warn!("[managed:{}] Invalid manager plan: {}", session, reason);
+                        // A planner failure is NOT executor stagnation: keep it out of
+                        // the no-progress Human gate, but do not loop forever.
+                        planning_failures += 1;
+                        stale_rounds = 0;
+                        if planning_failures >= 3 {
+                            let _ = tx.send(Ok(AgentEvent::text(
+                                "\n\n⚠️ *[Manager 连续规划失败]* 连续 3 次无法给出有效计划（子任务缺失或路由无效）——请检查模型/策略，或提供新指令。\n\n",
+                                &contract_id, "manager"
+                            ))).await;
+                            contract.block("Repeated Manager planning failures".to_string());
+                            persist_contract(&memory_store, &contract_id, &session, &contract);
+                            break;
+                        }
                         round += 1;
                         continue;
                     }

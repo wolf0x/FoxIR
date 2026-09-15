@@ -545,26 +545,51 @@ pub async fn plan_next(
         while dummy_rx.recv().await.is_some() {}
     });
 
-    let resp = provider
-        .chat_stream(model, &messages, &[], dummy_tx.clone(), &contract.id, "manager")
-        .await;
-    let (content, _reasoning, _tool_calls, _usage, _finish_reason) = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            let fb = fallback_model.filter(|f| !f.is_empty() && f != &model);
-            if let Some(fb) = fb {
-                warn!("[manager] primary model '{}' failed ({}), switching to fallback '{}'", model, e, fb);
-                provider
-                    .chat_stream(fb, &messages, &[], dummy_tx, &contract.id, "manager")
-                    .await
-                    .map_err(|e2| format!("Manager LLM call (fallback) failed: {}", e2))?
-            } else {
-                return Err(format!("Manager LLM call failed: {}", e));
+    // A "successful" LLM reply with an empty/missing Subtask used to feed the
+    // no-progress human gate (each Invalid plan burned a round silently and the
+    // 3-round gate then mis-reported "blocked"). Retry a few times; only give up
+    // with a distinct error after exhausting attempts so the runner reports a
+    // clear planning failure instead of a false block.
+    const MAX_PLAN_ATTEMPTS: usize = 3;
+    let mut last_raw_len: usize = 0;
+    for attempt in 0..MAX_PLAN_ATTEMPTS {
+        let resp = provider
+            .chat_stream(model, &messages, &[], dummy_tx.clone(), &contract.id, "manager")
+            .await;
+        let (content, _reasoning, _tool_calls, _usage, _finish_reason) = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let fb = fallback_model.filter(|f| !f.is_empty() && f != &model);
+                if let Some(fb) = fb {
+                    warn!("[manager] primary model '{}' failed ({}), switching to fallback '{}'", model, e, fb);
+                    provider
+                        .chat_stream(fb, &messages, &[], dummy_tx.clone(), &contract.id, "manager")
+                        .await
+                        .map_err(|e2| format!("Manager LLM call (fallback) failed: {}", e2))?
+                } else {
+                    return Err(format!("Manager LLM call failed: {}", e));
+                }
             }
+        };
+        last_raw_len = content.len();
+        let plan = parse_manager_plan(&content);
+        if !plan.subtask.trim().is_empty() {
+            return Ok(plan);
         }
-    };
+        warn!(
+            "[manager] attempt {} returned an empty/invalid plan (no subtask); raw head: {}",
+            attempt + 1,
+            content.chars().take(500).collect::<String>()
+        );
+        if attempt + 1 < MAX_PLAN_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(((attempt + 1) as u64) * 1000)).await;
+        }
+    }
 
-    Ok(parse_manager_plan(&content))
+    Err(format!(
+        "Manager produced an empty/invalid plan after {} attempts (no subtask specified; last raw {} bytes)",
+        MAX_PLAN_ATTEMPTS, last_raw_len
+    ))
 }
 
 
