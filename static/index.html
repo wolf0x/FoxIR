@@ -2056,7 +2056,7 @@ function handleMsg(msg){
       appendTextContent(txtEl,msg.content);
       scrollBottom();break;
     case 'tool_call':
-      hideTyping();finalizeThink();
+      hideTyping();finalizeThink();finalizeTextBlock();
       let tb=createToolBlock(msg.name,msg.call_id,msg.args);
       appendToConv(tb);curToolMap[msg.call_id]=tb;
       scrollBottom();break;
@@ -2319,7 +2319,7 @@ function replaySessionEvents(events){
     if(ev.type==='text'){
       if(ev.content){hideTyping();finalizeThink();const el=getOrCreateTextBlock();appendTextContent(el,ev.content);}
     }else if(ev.type==='tool_call'){
-      hideTyping();finalizeThink();
+      hideTyping();finalizeThink();finalizeTextBlock();
       const tb=createToolBlock(ev.name||'tool',ev.call_id,ev.args);
       appendToConv(tb);curToolMap[ev.call_id]=tb;
     }else if(ev.type==='tool_result'){
