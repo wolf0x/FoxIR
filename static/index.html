@@ -2023,9 +2023,13 @@ function handleMsg(msg){
       _snap.pendingEvents=_snap.pendingEvents||[];
       var _b=bgBuffer[_fin];
       if(_b&&_b.text&&_b.text.trim()){_snap.msgHist.push({role:'assistant',text:_b.text.trim(),time:nowTimeStr()});}
-      // Keep the buffered tool_call/tool_result events so switching back can
-      // replay the tool cards instead of dropping them.
-      if(_b&&_b.events&&_b.events.length){_snap.pendingEvents=_snap.pendingEvents.concat(_b.events);}
+      // Keep only tool_call/tool_result events for replay so switching back can
+      // restore tool cards. The full assistant text was already pushed to
+      // msgHist above; re-playing text events here would render it twice.
+      if(_b&&_b.events&&_b.events.length){
+        var _toolEv=_b.events.filter(function(ev){return ev.type==='tool_call'||ev.type==='tool_result';});
+        if(_toolEv.length){_snap.pendingEvents=_snap.pendingEvents.concat(_toolEv);}
+      }
       delete bgBuffer[_fin];
     }
     markSessionRunning(_fin,false);
@@ -2034,7 +2038,7 @@ function handleMsg(msg){
   // Expert mode multi-round: when the invocation_id changes (Manager Plan vs
   // Executor round, or between Executor rounds), finalize the current text
   // block so the next segment starts a fresh bubble instead of appending.
-  if(msg.invocation_id&&lastInvId&&msg.invocation_id!==lastInvId){if(textAccum&&textAccum.trim()){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}finalizeTextBlock();}
+  if(managedMode&&msg.invocation_id&&lastInvId&&msg.invocation_id!==lastInvId){if(textAccum&&textAccum.trim()){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}finalizeTextBlock();}
   if(msg.invocation_id){lastInvId=msg.invocation_id;}
   switch(msg.type){
     case 'auth_ok':connected=true;reconnectAttempts=0;updateStatus();addLog('Authenticated','info');loadModels();sendPerms();renderPerms();break;
