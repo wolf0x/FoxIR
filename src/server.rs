@@ -1426,11 +1426,12 @@ async fn drain_session_stream(
                 // this via the shared ws_rx channel).
             }
         }
-        // Per-session stop for Instant runs; connection-level stop for Expert.
-        let stop_requested = match session_cancel.as_ref() {
-            Some(c) => c.load(std::sync::atomic::Ordering::SeqCst),
-            None => cancelled.load(std::sync::atomic::Ordering::SeqCst),
-        };
+        // Stop if EITHER the per-session flag is set (session STOP — Instant OR
+        // Expert) or the connection-level flag is set (disconnect / disconnect
+        // propagation). OR-ing keeps disconnect-terminates-Expert intact.
+        let stop_requested =
+            session_cancel.as_ref().map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false)
+            || cancelled.load(std::sync::atomic::Ordering::SeqCst);
         if stop_requested {
             info!("Agent execution stopped by user");
             if managed {
@@ -1820,10 +1821,12 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             let managed = parsed["managed"].as_bool().unwrap_or(false);
                             let managed_scope = parsed["managed_scope"].as_str().unwrap_or("").to_string();
 
-                            // Per-session cancellation for Instant runs (parallel multi-session).
-                            // Managed/Expert keeps its per-task flag via `expert_tasks`.
+                            // Register EVERY run (Instant AND Expert) in the per-session
+                            // cancel registry so STOP can reach an Expert task too, and so
+                            // the drain can be spawned (Expert no longer blocks the demux
+                            // loop). Falls back to connection-level cancel when the cap is full.
                             let session_cancel: Option<Arc<AtomicBool>> =
-                                if managed { None } else { state.session_slot_acquire(&session_id) };
+                                state.session_slot_acquire(&session_id);
 
                             let run_result = if managed {
                                 info!("Expert mode requested for session {}", session_id);
@@ -2074,17 +2077,20 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                             st, w, m2, s2, c2, false, can2, sc2, event_stream,
                                         ));
                                     } else {
-                                        drain_session_stream(
-                                            state.clone(),
-                                            ws_sink.clone(),
-                                            model.clone(),
-                                            session_id.clone(),
-                                            content.clone(),
-                                            true,
-                                            cancelled.clone(),
-                                            None,
-                                            event_stream,
-                                        ).await;
+                                        // Expert (managed): spawn a dedicated drain just like
+                                        // Instant so the demux loop stays responsive (STOP
+                                        // reaches the per-session cancel flag) and other
+                                        // sessions keep working while this task audits.
+                                        let st = state.clone();
+                                        let w = ws_sink.clone();
+                                        let s2 = session_id.clone();
+                                        let m2 = model.clone();
+                                        let c2 = content.clone();
+                                        let can2 = cancelled.clone();
+                                        let sc2 = session_cancel.clone();
+                                        tokio::spawn(drain_session_stream(
+                                            st, w, m2, s2, c2, true, can2, sc2, event_stream,
+                                        ));
                                     }
                                 }
                                 Err(e) => {

@@ -1711,6 +1711,8 @@ function switchSession(id){
   restoreCurrentSession();
   // Sync the running/STOP pulse to the newly active session (per-session isolation).
   setAgentRunning(runningSessions.has(id));
+  // Apply this session's own mode; a fresh/untouched session defaults to Instant.
+  setManagedMode(currentSessionMode());
   // Refresh the inject bar so pending interjects belong to the new session only.
   renderInterjectBar();
   // If this session is streaming a task in the background, surface whatever
@@ -1793,6 +1795,7 @@ async function newSession(){
     const conv=document.getElementById('convArea');
     if(conv)conv.innerHTML='';
     msgHist=[];logHist=[];clearCurrentSessionUI();
+    setManagedMode(currentSessionMode()); // new session defaults to Instant
     sessionSnapshots[d.id]={msgHist:[],logHist:[],html:''};
     if(ws&&connected){ws.send(JSON.stringify({type:'clear',session:SESSION_ID}));}
     loadSessions();
@@ -1872,7 +1875,9 @@ async function deleteSession(btn){
 // refresh the list (e.g. after providers/connect).
 function initSessionPanel(){loadSessions();}
 let intentionalDisconnect=false,reconnectTimer=null,reconnectAttempts=0;
-let managedMode=false; // Managed (long-task) mode state
+let managedMode=false; // Managed (long-task) mode state (active view; per-session below)
+const managedModes={}; // sessionId -> bool; absent = false (Instant)
+function currentSessionMode(){return !!managedModes[SESSION_ID];}
 function asstPrefix(){
   const cls=managedMode?' expert':'';
   return '<div class="msg-avatar'+cls+'">&#129418;</div><div class="msg-body"><div class="msg-role'+cls+'">'+(managedMode?'Expert':'Agent')+'</div>';
@@ -3838,6 +3843,7 @@ function toggleComputerUse(enabled){
 // ── Managed Mode (Long Tasks) ──
 function setManagedMode(on){
   managedMode=on;
+  managedModes[SESSION_ID]=on;
   // Update segmented control
   document.querySelectorAll('#modeSeg button').forEach(b=>{
     b.classList.toggle('active',(on&&b.dataset.mode==='managed')||(!on&&b.dataset.mode==='normal'));
