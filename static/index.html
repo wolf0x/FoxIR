@@ -1784,10 +1784,27 @@ function loadHistForSession(id){
     .catch(()=>{});
 }
 
+// Friendly, humanized English session names (adjective + animal) so every new
+// session is easy to tell apart instead of a bland "New session".
+const usedSessionNames=new Set();
+const NAME_PREFIXES=['Curious','Brave','Clever','Wise','Gentle','Quick','Bright','Bold','Swift','Calm','Cheerful','Daring','Eager','Friendly','Graceful','Honest','Jolly','Lively','Mighty','Nimble','Playful','Steady','Witty','Zippy','Focused','Trusty'];
+const NAME_ANIMALS=['Fox','Falcon','Panda','Otter','Owl','Raven','Wolf','Lynx','Hawk','Dolphin','Tiger','Koala','Badger','Robin','Heron','Jaguar','Kiwi','Lark','Orca','Puffin','Quokka','Squirrel','Toucan','Viper','Weasel','Zebra','Marten','Newt'];
+function randomSessionName(){
+  let name='',tries=0;
+  do{
+    name=NAME_PREFIXES[Math.floor(Math.random()*NAME_PREFIXES.length)]
+        +' '+NAME_ANIMALS[Math.floor(Math.random()*NAME_ANIMALS.length)];
+    tries++;
+  }while(usedSessionNames.has(name)&&tries<50);
+  usedSessionNames.add(name);
+  return name;
+}
+
 async function newSession(){
+
   snapshotCurrentSession();
   try{
-    const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'New session'})});
+    const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:randomSessionName()})});
     const d=await r.json();
     if(!d||!d.id)return;
     SESSION_ID=d.id;

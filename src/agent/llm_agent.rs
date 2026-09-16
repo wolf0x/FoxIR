@@ -1696,8 +1696,17 @@ impl Agent for LlmAgent {
                 }
             }
 
-            // Rabbit hole detection: track identical tool calls (same name + same args)
-            let mut call_signatures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            // Session-lifetime set of already-executed tool signatures. Used ONLY by
+            // trim_redundant_tool_calls to drop redundant trailing calls; kept separate
+            // from the contiguous rabbit-hole streak below so the two never interfere.
+            let mut executed_sigs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            // Contiguous rabbit-hole detection (v1.0.11): only CONSECUTIVE rounds that emit
+            // the exact same tool batch count. Any interleaved different batch (or a result
+            // change, reset in the stall section) breaks the streak, so a tool called 5x
+            // across 50 rounds of normal progress no longer false-triggers. This replaces
+            // the old lifetime-accumulating call_signatures counter.
+            let mut prev_rabbit_batch: Option<String> = None;
+            let mut rabbit_streak: usize = 0;
             // Automatic stall self-heal state (no human required).
             // last_result: per-tool (last content digest, consecutive repeat count).
             // no_new_state_iters: consecutive iterations that produced no new result.
@@ -1707,7 +1716,16 @@ impl Agent for LlmAgent {
             // rabbit_hole_threshold, so a single knob tunes both loop and stall detection.
             let stall_repeat_threshold = rabbit_hole_threshold.max(2);
             const TEXT_REPEAT_LIMIT: usize = 6;
-            let mut last_result: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
+            // F3 (v1.0.11): last_result key is (tool_name, args_digest) so the same tool
+            // with different arguments never shares a "repeated result" counter; the value
+            // is (last content digest, consecutive repeat count).
+            let mut last_result: std::collections::HashMap<(String, u64), (u64, usize)> = std::collections::HashMap::new();
+            // F3: bounded LRU window of recently seen exact (name,args,result) triples for a
+            // robust "no genuinely new state" check — small cycles are still caught, while an
+            // occasional short-result collision no longer reads as stagnation.
+            let mut recent_results: std::collections::VecDeque<(u64, u64, u64)> = std::collections::VecDeque::new();
+            const F3_RECENT_WINDOW: usize = 20;
+            const F3_SHORT_LIMIT: usize = 32;
             let mut no_new_state_iters: usize = 0;
             let mut reconsider_events: usize = 0;
             let mut last_resp_digest: u64 = 0;
@@ -1821,25 +1839,34 @@ impl Agent for LlmAgent {
                 match result {
                     Ok((content, reasoning, tool_calls, usage, finish_reason)) => {
                         // Text-loop detection: halt when the assistant emits the same
-                        // textual turn repeatedly with no visible progress. This catches
-                        // loops that identical-tool-call / identical-result checks miss
-                        // (e.g. varying read attempts or narration-only turns).
-                        let resp_digest = content_digest(&format!("{}\n{}", content, reasoning));
-                        if resp_digest == last_resp_digest {
-                            consecutive_resp += 1;
-                        } else {
-                            last_resp_digest = resp_digest;
-                            consecutive_resp = 1;
-                        }
-                        if consecutive_resp >= TEXT_REPEAT_LIMIT {
-                            warn!("[session:{}] Text-loop: identical assistant turn repeated {} times; terminating with summary", session_id, consecutive_resp);
-                            let _ = tx.send(Ok(AgentEvent::text(
-                                &format!("\n\n*[Auto-stop] The agent repeated the same response {} times without progress. Stopping. Send a new message to continue.*\n\n", consecutive_resp),
-                                &invocation_id, &author
-                            ))).await;
-                            let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
-                            for s in &cleanup_sessions { let _ = s.close().await; }
-                            return;
+                        // textual turn repeatedly with no visible progress. v1.0.11: only
+                        // NON-tool rounds are counted — a pure tool-call turn for a
+                        // non-reasoning model has empty content+reasoning, so digesting
+                        // every round would flag a legitimate multi-step tool workflow
+                        // (>=6 consecutive tool calls) as an "identical text loop" and
+                        // kill it. Tool-round stalls are handled by the contiguous
+                        // rabbit-hole / auto-stall checks instead.
+                        if tool_calls.is_empty() {
+                            // A narration-only round breaks any contiguous tool-batch loop.
+                            prev_rabbit_batch = None;
+                            rabbit_streak = 0;
+                            let resp_digest = content_digest(&format!("{}\n{}", content, reasoning));
+                            if resp_digest == last_resp_digest {
+                                consecutive_resp += 1;
+                            } else {
+                                last_resp_digest = resp_digest;
+                                consecutive_resp = 1;
+                            }
+                            if consecutive_resp >= TEXT_REPEAT_LIMIT {
+                                warn!("[session:{}] Text-loop: identical assistant turn repeated {} times; terminating with summary", session_id, consecutive_resp);
+                                let _ = tx.send(Ok(AgentEvent::text(
+                                    &format!("\n\n*[Auto-stop] The agent repeated the same response {} times without progress. Stopping. Send a new message to continue.*\n\n", consecutive_resp),
+                                    &invocation_id, &author
+                                ))).await;
+                                let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
+                                for s in &cleanup_sessions { let _ = s.close().await; }
+                                return;
+                            }
                         }
                         // Emit token usage event if available
                         if let Some(ref u) = usage {
@@ -2045,7 +2072,7 @@ impl Agent for LlmAgent {
                                 let sig = format!("{}:{}",
                                     tc.function.name.as_deref().unwrap_or("unknown"),
                                     tc.function.arguments.as_deref().unwrap_or("{}"));
-                                call_signatures.get(&sig).copied().unwrap_or(0) == 0
+                                executed_sigs.get(&sig).copied().unwrap_or(0) == 0
                             }).cloned().collect::<Vec<_>>();
                             let dropped = tool_calls.len() - kept.len();
                             if dropped > 0 {
@@ -2088,36 +2115,44 @@ impl Agent for LlmAgent {
                         info!("[session:{}] Agent returned {} tool call(s)", session_id, tool_calls.len());
 
                         // ── Rabbit hole detection: check BEFORE pushing to history or executing ──
-                        // If the same tool + args is called repeatedly, skip execution and force
-                        // the LLM to change approach via a correction message. This replaces the
-                        // old passive warning that still wasted tool calls.
+                        // v1.0.11+: CONTIGUOUS semantics. Only a run of consecutive rounds
+                        // emitting the exact same tool batch (same name+args, order-
+                        // insensitive) with no result change accumulates. Interleaved
+                        // different work or a result change (see the stall section) resets
+                        // the streak, so a tool called a few times amid long normal progress
+                        // no longer false-fires.
                         let mut rabbit_hole_fired = false;
-                        for tc in &tool_calls {
-                            let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                            let args_str = tc.function.arguments.as_deref().unwrap_or("{}");
-                            let sig = format!("{}:{}", tool_name, args_str);
-                            if let Some((count, _warning_msg)) = rabbit_hole_check(
-                                &mut call_signatures, &sig, tool_name, rabbit_hole_threshold,
+                        if !tool_calls.is_empty() {
+                            // Record executed signatures for the session-lifetime trim/dedup.
+                            for tc in &tool_calls {
+                                let sig = format!("{}:{}",
+                                    tc.function.name.as_deref().unwrap_or("unknown"),
+                                    tc.function.arguments.as_deref().unwrap_or("{}"));
+                                *executed_sigs.entry(sig).or_insert(0) += 1;
+                            }
+                            let batch_sig = build_batch_signature(&tool_calls);
+                            if let Some(count) = rabbit_hole_check(
+                                &mut prev_rabbit_batch, &mut rabbit_streak, &batch_sig, rabbit_hole_threshold,
                             ) {
-                                warn!("[session:{}] Rabbit hole: '{}' called with same args {} times: {}", session_id, tool_name, count, args_str);
-                                // Push a specific correction message — the LLM must see this
-                                // as the latest user message and respond to it.
+                                let names = tool_calls.iter()
+                                    .map(|tc| tc.function.name.as_deref().unwrap_or("unknown"))
+                                    .collect::<Vec<_>>().join(", ");
+                                warn!("[session:{}] Rabbit hole: identical tool batch ({}) repeated {} consecutive times with no state change", session_id, names, count);
                                 let correction = format!(
-                                    "You called `{}` with the same arguments {} times and the task is not progressing.\n\n\
+                                    "You called the same tool batch ({}) with identical arguments {} times in a row and the observed state did not change.\n\n\
                                      You MUST stop and try a different approach. Options:\n\
-                                     1. Use different arguments for `{}`\n\
+                                     1. Use different arguments\n\
                                      2. Use a completely different tool\n\
                                      3. If you already have enough information, provide your analysis as text\n\n\
-                                     Do NOT repeat the same tool call with the same arguments.",
-                                    tool_name, count, tool_name
+                                     Do NOT repeat the same tool calls expecting a different result.",
+                                    names, count
                                 );
                                 history.push(ChatMessage::user(&correction));
                                 let _ = tx.send(Ok(AgentEvent::text(
-                                    &format!("\n\n*[Rabbit hole: {} repeated {} times with same args — execution halted, LLM must change approach]*\n\n", tool_name, count),
+                                    &format!("\n\n*[Rabbit hole: identical tool batch ({}) repeated {} consecutive times — execution halted, LLM must change approach]*\n\n", names, count),
                                     &invocation_id, &author
                                 ))).await;
                                 rabbit_hole_fired = true;
-                                break; // One warning per iteration is enough
                             }
                         }
 
@@ -2226,32 +2261,62 @@ impl Agent for LlmAgent {
                         // state" windows. On stall it condenses duplicated results in history,
                         // injects an automatic strategy reconsideration, and (bounded) terminates
                         // gracefully with a summary if still stuck. No human intervention needed.
-                        let tool_msgs = collect_tool_results(&history[hist_start..]);
+                        let tool_msgs = collect_tool_results_args(&history[hist_start..]);
                         let mut stalled = false;
                         if !tool_msgs.is_empty() {
-                            let mut saw_new_state = false;
-                            for (name, content) in &tool_msgs {
-                                let dig = content_digest(content);
-                                let entry = last_result.entry(name.clone()).or_insert((dig, 0));
-                                if entry.0 == dig {
+                            // F3 3c: a round counts as "no new state" only if EVERY exact
+                            // (name,args,result) triple it produced was already seen in the
+                            // recent LRU window. This catches small cycles (A,B,A,B, period
+                            // <= F3_RECENT_WINDOW) while an occasional short-result collision
+                            // or same-result-repeated-with-different-args no longer reads as
+                            // stagnation.
+                            let mut round_any_new = false;
+                            let mut round_fps: Vec<(u64, u64, u64)> = Vec::new();
+                            for (name, args_dig, content, dig) in &tool_msgs {
+                                let fp = (content_digest(name), *args_dig, *dig);
+                                if !recent_results.iter().any(|t| *t == fp) {
+                                    round_any_new = true;
+                                }
+                                round_fps.push(fp);
+                                // F3 3a: key by (name, args_digest) so `Test-Path A` and
+                                // `Test-Path B` never share a "same result" counter.
+                                let entry = last_result.entry((name.clone(), *args_dig)).or_insert((*dig, 0));
+                                if entry.0 == *dig {
                                     entry.1 += 1;
-                                    if entry.1 >= stall_repeat_threshold {
-                                        info!("[session:{}] Stall: '{}' returned identical result {}x", session_id, name, entry.1);
+                                    // F3 3b: short outputs (small alphabet) carry less
+                                    // information, so require twice as many before stalling.
+                                    let threshold = if content.chars().count() < F3_SHORT_LIMIT {
+                                        stall_repeat_threshold.saturating_mul(2)
+                                    } else {
+                                        stall_repeat_threshold
+                                    };
+                                    if entry.1 >= threshold {
+                                        info!("[session:{}] Stall: '{}' (args {:016x}) returned identical result {}x", session_id, name, args_dig, entry.1);
                                         stalled = true;
                                     }
                                 } else {
-                                    entry.0 = dig;
+                                    entry.0 = *dig;
                                     entry.1 = 1;
-                                    saw_new_state = true;
                                 }
                             }
-                            if saw_new_state {
+                            for fp in &round_fps { recent_results.push_back(*fp); }
+                            while recent_results.len() > F3_RECENT_WINDOW { recent_results.pop_front(); }
+
+                            if round_any_new {
                                 // Real progress this iteration: reset the per-tool
                                 // identical-result counter so NON-consecutive repeats
                                 // (e.g. re-reading an unchanged file between other work)
                                 // do not accumulate into a false stall across the session.
                                 last_result.clear();
                                 no_new_state_iters = 0;
+                                // F4 (v1.0.11): a genuine new state resets the reconsider
+                                // tally, so only CONTIGUOUS no-progress stalls can terminate
+                                // the run — 3 unrelated (possibly false-positive) stalls
+                                // no longer kill a task that otherwise keeps progressing.
+                                reconsider_events = 0;
+                                // A result change exempts wait-for-change polling from rabbit.
+                                prev_rabbit_batch = None;
+                                rabbit_streak = 0;
                             } else if !stalled {
                                 no_new_state_iters += 1;
                                 if no_new_state_iters >= stall_repeat_threshold {
@@ -3100,14 +3165,39 @@ fn content_digest(s: &str) -> u64 {
     h.finish()
 }
 
-/// Collect (tool_name, content) pairs from tool-role messages in a slice.
-fn collect_tool_results(messages: &[ChatMessage]) -> Vec<(String, String)> {
+/// Collect (name, args_digest, content, content_digest) from tool-role messages.
+/// Arguments are resolved by matching each tool result's `tool_call_id` to the
+/// corresponding assistant tool-call, so the same tool with different arguments
+/// keys separately (F3 3a). When arguments cannot be resolved, args_digest falls
+/// back to the empty-object digest — grouping unknown-args results by name only,
+/// which is no worse than the pre-F3 behavior.
+fn collect_tool_results_args(messages: &[ChatMessage]) -> Vec<(String, u64, String, u64)> {
+    let mut args_by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages {
+        if m.role == "assistant" {
+            if let Some(calls) = &m.tool_calls {
+                for tc in calls {
+                    args_by_id.insert(
+                        tc.id.clone(),
+                        tc.function.arguments.clone().unwrap_or_else(|| "{}".to_string()),
+                    );
+                }
+            }
+        }
+    }
+    let fallback = content_digest("{}");
     let mut out = Vec::new();
     for m in messages {
         if m.role == "tool" {
             if let Some(txt) = m.content_as_text() {
                 let name = m.name.clone().unwrap_or_else(|| "tool".to_string());
-                out.push((name, txt));
+                let args_dig = m.tool_call_id
+                    .as_ref()
+                    .and_then(|id| args_by_id.get(id))
+                    .map(|a| content_digest(a))
+                    .unwrap_or(fallback);
+                let content_dig = content_digest(&txt);
+                out.push((name, args_dig, txt, content_dig));
             }
         }
     }
@@ -3145,22 +3235,45 @@ fn dedup_tool_results(history: &mut Vec<ChatMessage>) -> usize {
     replaced
 }
 
+/// Build an order-insensitive signature for a whole tool-call batch: the union of
+/// `name:args` pairs, sorted and joined. Two batches are "identical" iff their
+/// signatures match regardless of call order, so reordering is not a false loop.
+fn build_batch_signature(tool_calls: &[crate::model::ToolCallDelta]) -> String {
+    let mut parts: Vec<String> = tool_calls
+        .iter()
+        .map(|tc| {
+            format!(
+                "{}:{}",
+                tc.function.name.as_deref().unwrap_or("unknown"),
+                tc.function.arguments.as_deref().unwrap_or("{}"),
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join(" | ")
+}
+
+/// Rabbit-hole detection with CONTIGUOUS semantics: only consecutive rounds that emit
+/// the exact same batch (plus, via the result-reset in the loop, no state change)
+/// accumulate. A different batch breaks the streak and restarts from 1. Returns the
+/// streak count once it crosses `threshold`, then resets the streak.
 fn rabbit_hole_check(
-    call_signatures: &mut std::collections::HashMap<String, usize>,
+    prev_batch: &mut Option<String>,
+    streak: &mut usize,
     signature: &str,
-    tool_name: &str,
     threshold: usize,
-) -> Option<(usize, String)> {
-    let count = call_signatures.entry(signature.to_string()).or_insert(0);
-    *count += 1;
-    if *count >= threshold {
-        let c = *count;
-        *count = 0;
-        Some((c, format!(
-            "WARNING: You have called {} with the SAME arguments {} times and the task is not completing. \
-             You must try a DIFFERENT approach, use different arguments, or explain what went wrong and stop.",
-            tool_name, c
-        )))
+) -> Option<usize> {
+    if prev_batch.as_deref() == Some(signature) {
+        *streak += 1;
+    } else {
+        *prev_batch = Some(signature.to_string());
+        *streak = 1;
+    }
+    if *streak >= threshold {
+        let c = *streak;
+        *prev_batch = None;
+        *streak = 0;
+        Some(c)
     } else {
         None
     }
@@ -3639,13 +3752,102 @@ mod tests {
         assert!(orchestration_delivered_for(Expert, 0, true).is_empty());
         assert!(orchestration_delivered_for(Instant, 1, true).is_empty());
     }
+    // ── Loop-guard helpers (v1.0.11) ──
+    fn tcd(name: &str, args: &str) -> crate::model::ToolCallDelta {
+        crate::model::ToolCallDelta {
+            id: "t".into(),
+            call_type: "function".into(),
+            function: crate::model::FunctionCallDelta {
+                name: Some(name.into()),
+                arguments: Some(args.into()),
+            },
+        }
+    }
+
+    /// build_batch_signature is order-insensitive: same call set in any order yields
+    /// the same signature, so a reordered batch is not mistaken for a different loop.
+    #[test]
+    fn batch_signature_order_independent() {
+        let a = vec![tcd("net_stat", "{}"), tcd("file_read", r#"{"p":"a.txt"}"#)];
+        let b = vec![tcd("file_read", r#"{"p":"a.txt"}"#), tcd("net_stat", "{}")];
+        assert_eq!(build_batch_signature(&a), build_batch_signature(&b));
+    }
+
+    /// build_batch_signature distinguishes argument changes: Test-Path A vs Test-Path B
+    /// are different batches, so they cannot accumulate into a shared false loop.
+    #[test]
+    fn batch_signature_arg_sensitive() {
+        assert_ne!(
+            build_batch_signature(&[tcd("Test-Path", "A")]),
+            build_batch_signature(&[tcd("Test-Path", "B")]),
+        );
+    }
+
+    /// rabbit_hole_check fires only on CONTIGUOUS identical batches crossing threshold.
+    #[test]
+    fn rabbit_consecutive_same_batch_triggers() {
+        let mut prev: Option<String> = None;
+        let mut streak = 0usize;
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "X", 5).is_none()); // 1
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "X", 5).is_none()); // 2
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "X", 5).is_none()); // 3
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "X", 5).is_none()); // 4
+        assert_eq!(rabbit_hole_check(&mut prev, &mut streak, "X", 5), Some(5)); // fires
+        // After firing, state resets so the cycle can start again.
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "X", 5).is_none());
+    }
+
+    /// Interleaved different batches RESET the streak: a tool called a few times across
+    /// a long run amid other work never accumulates to a false lifetime trigger.
+    #[test]
+    fn rabbit_resets_on_interleaved_work() {
+        let mut prev: Option<String> = None;
+        let mut streak = 0usize;
+        rabbit_hole_check(&mut prev, &mut streak, "A", 5);
+        rabbit_hole_check(&mut prev, &mut streak, "B", 5);
+        rabbit_hole_check(&mut prev, &mut streak, "A", 5);
+        rabbit_hole_check(&mut prev, &mut streak, "C", 5);
+        rabbit_hole_check(&mut prev, &mut streak, "A", 5);
+        // Total "A" count = 4, but never 5 consecutive; must not fire.
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "A", 5).is_none());
+        // B two in a row still below threshold.
+        assert!(rabbit_hole_check(&mut prev, &mut streak, "B", 5).is_none());
+    }
+    /// F3 3a: same tool with different arguments must produce different args_digests,
+    /// so their repeated-result counters never share an entry (Test-Path A vs B).
+    #[test]
+    fn stall_args_keying_separates_same_tool_diff_args() {
+        let tc = |id: &str, name: &str, args: &str| crate::model::ToolCallDelta {
+            id: id.into(),
+            call_type: "function".into(),
+            function: crate::model::FunctionCallDelta {
+                name: Some(name.into()),
+                arguments: Some(args.into()),
+            },
+        };
+        let asst = ChatMessage::assistant_with_tool_calls(vec![
+            tc("c1", "Test-Path", "A"),
+            tc("c2", "Test-Path", "B"),
+        ]);
+        let r1 = ChatMessage::tool_result("c1", "Test-Path", "False");
+        let r2 = ChatMessage::tool_result("c2", "Test-Path", "False");
+        let got = collect_tool_results_args(&[asst, r1, r2]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "Test-Path");
+        assert_eq!(got[1].0, "Test-Path");
+        // Identical results, but different args => different keys, so they don't stack.
+        assert_ne!(got[0].1, got[1].1, "different args must key separately");
+        assert_eq!(got[0].2, got[1].2, "both return the same short result");
+    }
+
+    /// F3 fallback: a tool result whose call cannot be resolved groups by name only
+    /// (same args_digest), which is no worse than the pre-F3 name-only behavior.
+    #[test]
+    fn stall_args_fallback_groups_by_name_when_unknown() {
+        let r1 = ChatMessage::tool_result("zz", "Test-Path", "False");
+        let r2 = ChatMessage::tool_result("yy", "Test-Path", "False");
+        let got = collect_tool_results_args(&[r1, r2]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].1, got[1].1, "unresolvable args use the same fallback digest");
+    }
 }
-
-
-
-
-
-
-
-
-
