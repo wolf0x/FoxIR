@@ -2975,6 +2975,7 @@ async fn sessions_list_handler(State(state): State<Arc<AppState>>) -> Json<Value
             "title": meta.title.unwrap_or_else(|| "New session".to_string()),
             "created_at": meta.created_at.to_rfc3339(),
             "updated_at": meta.updated_at.to_rfc3339(),
+            "main": meta.main,
         }))
         .collect();
     Json(json!({ "sessions": sessions, "count": sessions.len() }))

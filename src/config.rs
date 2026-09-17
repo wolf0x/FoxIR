@@ -713,6 +713,38 @@ pub fn sync_user_name_to_user_md(workspace_dir: &str, detected_name: &str) -> Re
     Ok(true)
 }
 
+/// Language declared in USER.md, if an explicit language line exists.
+/// Recognises English "Language:" lines and Chinese "语言"/"默认语言" lines.
+pub fn user_md_language(workspace_dir: &str) -> Option<String> {
+    let path = std::path::Path::new(workspace_dir).join("USER.md");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let low = line.to_lowercase();
+        let trimmed = line.trim();
+        if low.contains("language") || trimmed.contains("语言") {
+            if low.contains("english") || trimmed.contains("英文") || trimmed.contains("英语") { return Some("English".to_string()); }
+            if trimmed.contains("中文") || trimmed.contains("简体") || low.contains("chinese") { return Some("Chinese".to_string()); }
+        }
+    }
+    None
+}
+
+/// Persist the preferred default reply language into USER.md (best-effort).
+/// Used when the user explicitly asks for a language, so it becomes the saved default.
+pub fn set_user_md_language(workspace_dir: &str, lang: &str) -> Result<(), String> {
+    let path = std::path::Path::new(workspace_dir).join("USER.md");
+    let mut content = std::fs::read_to_string(&path).map_err(|e| format!("read USER.md: {e}"))?;
+    let en = if lang.eq_ignore_ascii_case("english") { "English" } else { "Chinese" };
+    let zh = if lang.eq_ignore_ascii_case("english") { "英文" } else { "中文" };
+    let is_lang_line = |l: &&str| { let low = l.to_lowercase(); l.contains("语言") || low.contains("language") };
+    if let Some(old) = content.lines().find(is_lang_line).map(|l| l.to_string()) {
+        content = content.replace(&old, &format!("- Language: {en} (默认语言: {zh})"));
+    } else {
+        content.push_str(&format!("\n## Language\n- Language: {en} (默认语言: {zh})\n"));
+    }
+    std::fs::write(&path, &content).map_err(|e| format!("write USER.md: {e}"))
+}
+
 impl Config {
     /// Load config from the workspace directory. If no config exists, check the
     /// exe directory for backward compatibility, then generate a minimal default

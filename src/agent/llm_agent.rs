@@ -559,36 +559,64 @@ impl LlmAgent {
     /// Resolve the user's default reply language from USER.md (中文 -> Chinese, English -> English).
     fn resolve_default_language(&self) -> String {
         if !self.workspace_dir.is_empty() {
+            // 1) An explicit Language line in USER.md wins.
+            if let Some(lang) = crate::config::user_md_language(&self.workspace_dir) {
+                return lang;
+            }
+            // 2) Keyword + writing-system sniff for legacy USER.md without a Language line.
             let user_md_path = std::path::Path::new(&self.workspace_dir).join("USER.md");
             if let Ok(content) = std::fs::read_to_string(&user_md_path) {
                 if content.contains("中文") || content.contains("简体") { return "Chinese".to_string(); }
                 if content.contains("English") || content.contains("英文") { return "English".to_string(); }
+                if detect_user_language(&content).eq_ignore_ascii_case("chinese") { return "Chinese".to_string(); }
+                return "English".to_string();
             }
         }
         "Chinese".to_string()
     }
 
-    /// Resolve the reply language rule: explicit user request wins, else the
-    /// USER.md default language. Applies to main and CRON sessions.
+    /// A gentle, adaptive language instruction: default = USER.md, mirror the
+    /// user's own language, and never force a language the user didn't choose.
+    fn adaptive_language_rule(&self, lang: &str) -> String {
+        format!(
+            "Your user's default language is {lang} (from USER.md). Match the language the user actually writes in each turn (plain greetings like hi/hello do not count as a switch); if the user explicitly asks for a language, use that instead. Keep EVERYTHING you generate in that same language: thinking/reasoning, tool calls, todo/task lists, permission-approval prompts, and the reply body (headings, bullets, table cells, greetings and closings). Never force a language the user hasn't chosen.",
+        )
+    }
+
+    /// Detect an explicit language request in this turn's message.
+    fn detect_explicit_lang_request(&self, msg: &str) -> Option<String> {
+        let lower = msg.to_lowercase();
+        let want_cn = msg.contains("中文") || msg.contains("简体") || lower.contains("chinese");
+        let want_en = msg.contains("英文") || msg.contains("英语") || lower.contains("english");
+        if want_cn && !want_en { return Some("Chinese".to_string()); }
+        if want_en && !want_cn { return Some("English".to_string()); }
+        None
+    }
+
+    /// True when a message is only a short greeting (no real language switch).
+    fn looks_like_greeting(text: &str) -> bool {
+        let lower = text.trim().to_lowercase();
+        if lower.split_whitespace().count() > 4 { return false; }
+        ["hi","hello","hey","yo","你好","您好","早上好","下午好","晚上好","在吗","gm","good morning","good afternoon","good evening"]
+            .iter().any(|g| lower.contains(g))
+    }
+
+    /// Resolve the reply language rule. Priority:
+    /// 1) explicit per-turn request -> honor + persist to USER.md;
+    /// 2) mirror the language the user wrote in (except plain greetings);
+    /// 3) fall back to the USER.md default language.
+    /// Applies to main, CRON and both Instant/Expert loops via the system prompt.
     fn resolve_language_rule(&self, user_message: &str) -> String {
-        let msg_lower = user_message.to_lowercase();
-        let explicit_cn = user_message.contains("中文");
-        let explicit_en = user_message.contains("英文")
-            || (msg_lower.contains("english")
-                && (msg_lower.contains("reply") || msg_lower.contains("respond") || msg_lower.contains("use")));
-        if explicit_cn {
-            "The user explicitly asked you to reply in Chinese. Write your ENTIRE reply in Chinese (headings, bullets, table cells, greetings and closings included). Do not switch to English or mix languages."
-                .to_string()
-        } else if explicit_en {
-            "The user explicitly asked you to reply in English. Write your ENTIRE reply in English (headings, bullets, table cells, greetings and closings included). Do not switch to Chinese or mix languages."
-                .to_string()
-        } else if self.resolve_default_language().eq_ignore_ascii_case("english") {
-            "Your user's default language is English (from USER.md). Unless the user explicitly asks for another language, write your ENTIRE reply in English (headings, bullets, table cells, greetings and closings included). Do not switch to Chinese or mix languages."
-                .to_string()
-        } else {
-            "Your user's default language is Chinese (from USER.md). Unless the user explicitly asks for another language, write your ENTIRE reply in Chinese (headings, bullets, table cells, greetings and closings included). Do not switch to English or mix languages."
-                .to_string()
+        if let Some(lang) = self.detect_explicit_lang_request(user_message) {
+            let _ = crate::config::set_user_md_language(&self.workspace_dir, &lang);
+            return self.adaptive_language_rule(&lang);
         }
+        if !Self::looks_like_greeting(user_message) {
+            let msg_lang = detect_user_language(user_message);
+            return self.adaptive_language_rule(&msg_lang);
+        }
+        let default_lang = self.resolve_default_language();
+        self.adaptive_language_rule(&default_lang)
     }
 
     /// Deterministic per-turn knowledge pre-retrieval (thClaws-KMS pattern).
@@ -814,6 +842,7 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
 - 别每句都喊用户名字。\n\
 - 别念内部流程：不要“我先调用工具查一下”“让我去检索文档”“正在读取记忆库”。工具、文件名、技能名、内部机制一律不报给用户。\n\
 - 别反复用同一句模板，别把步骤当播报念出来。\n\
+- 别用“我…一下…”“…如下”这种流水账开场：不要“我实时查一下你当前的IP情况”“结果如下”“当前情况如下”这类报动作/报结构的开头。结论和结果放最前，最多带一个自然过渡，开口就把答案给出来，别念步骤。\n\
 - 别硬装确定，不确定就明说并温柔追问。\n\
 \n\
 **需要出动工具时，自然带一句**：\n\

@@ -23,6 +23,8 @@ pub struct SessionMeta {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub deleted: bool,
+    #[serde(default)]
+    pub main: bool,
 }
 
 impl SessionMeta {
@@ -33,6 +35,7 @@ impl SessionMeta {
             created_at: now,
             updated_at: now,
             deleted: false,
+            main: false,
         }
     }
 }
@@ -210,6 +213,8 @@ impl SessionIndex {
             None => {
                 let mut meta = SessionMeta::new(title);
                 meta.updated_at = now;
+                // First-ever session becomes the permanent main Chat session.
+                if !metas.values().any(|m| m.main) { meta.main = true; }
                 metas.insert(session_id.to_string(), meta);
             }
         }
@@ -232,6 +237,9 @@ impl SessionIndex {
     pub fn soft_delete(&self, session_id: &str) -> Result<(), String> {
         let mut metas = self.metas.lock().map_err(|e| format!("SessionIndex lock: {e}"))?;
         if let Some(meta) = metas.get_mut(session_id) {
+            if meta.main {
+                return Err("The main Chat session cannot be deleted".to_string());
+            }
             meta.deleted = true;
             meta.updated_at = Utc::now();
         }
@@ -248,6 +256,12 @@ impl SessionIndex {
             .collect();
         v.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
         v
+    }
+
+    /// The id of the designated main Chat session, if any.
+    pub fn main(&self) -> Option<String> {
+        self.metas.lock().ok()
+            .and_then(|g| g.iter().find(|(_, m)| m.main).map(|(id, _)| id.clone()))
     }
 
     pub fn get(&self, session_id: &str) -> Option<SessionMeta> {
