@@ -181,10 +181,11 @@ pub struct SessionIndex {
 impl SessionIndex {
     /// Load the index from `path` (creating an empty one if missing/corrupt).
     pub fn load(path: std::path::PathBuf) -> Self {
-        let metas = std::fs::read_to_string(&path)
+        let mut metas = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<HashMap<String, SessionMeta>>(&raw).ok())
             .unwrap_or_default();
+        Self::ensure_main(&mut metas);
         Self { path, metas: Mutex::new(metas) }
     }
 
@@ -213,9 +214,9 @@ impl SessionIndex {
             None => {
                 let mut meta = SessionMeta::new(title);
                 meta.updated_at = now;
-                // First-ever session becomes the permanent main Chat session.
-                if !metas.values().any(|m| m.main) { meta.main = true; }
                 metas.insert(session_id.to_string(), meta);
+                // A main Chat session always exists; designate this one if none yet.
+                Self::ensure_main(&mut metas);
             }
         }
         drop(metas);
@@ -258,7 +259,24 @@ impl SessionIndex {
         v
     }
 
-    /// The id of the designated main Chat session, if any.
+    /// Guarantee exactly one main Chat session exists: if none is marked yet,
+    /// promote the earliest-created non-deleted session. The main Chat session
+    /// is a persistent primary conversation and is never deleted.
+    fn ensure_main(metas: &mut HashMap<String, SessionMeta>) {
+        if metas.values().any(|m| m.main) {
+            return;
+        }
+        if let Some((_, meta)) = metas
+            .iter_mut()
+            .filter(|(_, m)| !m.deleted)
+            .min_by_key(|(_, m)| m.created_at)
+        {
+            meta.main = true;
+        }
+    }
+
+    /// The id of the always-present main Chat session (None only before any
+    /// session has been created).
     pub fn main(&self) -> Option<String> {
         self.metas.lock().ok()
             .and_then(|g| g.iter().find(|(_, m)| m.main).map(|(id, _)| id.clone()))

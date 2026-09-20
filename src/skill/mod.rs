@@ -111,6 +111,10 @@ impl SkillManager {
         // Load enabled state
         let state = self.load_state();
 
+        // Canonical base once so dir_depth can strip the prefix reliably
+        // (Windows path casing / 8.3 aliases won't break the comparison).
+        let canon_base = self.skills_dir.canonicalize().unwrap_or_else(|_| self.skills_dir.clone());
+
         // Scan directory-based skills recursively (skills/*/*/SKILL.md) so nested
         // child skills are discovered and can be loaded via skill_read_file.
         let dir_pattern = format!("{}/**/SKILL.md", self.skills_dir.display());
@@ -131,7 +135,7 @@ impl SkillManager {
                                 skill.metadata.enabled = *enabled;
                             }
                             info!("Loaded skill: {} from {} (enabled={})", skill.metadata.name, path.display(), skill.metadata.enabled);
-                            skills.push(skill);
+                            insert_skill_unique(&mut skills, &canon_base, skill);
                         }
                         Err(e) => {
                             warn!("{}", e);
@@ -608,6 +612,35 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
 /// `Lazy` - the body is not read from disk or tokenized at startup, keeping
 /// boot cheap even with many (or very large) skills. It is loaded on first
 /// use via [`Skill::body`].
+/// Number of path components between `base` and `dir`; larger = deeper.
+/// Used to prefer the canonical (top-level) skill directory over a nested
+/// versioned copy when the same skill name is found in more than one place.
+fn dir_depth(dir: &str, base: &std::path::Path) -> usize {
+    std::path::Path::new(dir)
+        .strip_prefix(base)
+        .map(|p| p.components().count())
+        .unwrap_or(usize::MAX)
+}
+
+/// Insert a skill, de-duplicating by (case-insensitive) name so the skills
+/// list never shows two cards with the same name. When the same name is found
+/// in several directories (e.g. a versioned copy nested inside the skill
+/// folder), keep the shallowest / canonical directory as the single source.
+fn insert_skill_unique(skills: &mut Vec<Skill>, skills_dir: &std::path::Path, skill: Skill) {
+    let name_lower = skill.metadata.name.to_lowercase();
+    let skill_depth = dir_depth(&skill.skill_dir, skills_dir);
+    if let Some(existing) = skills
+        .iter_mut()
+        .find(|s| s.metadata.name.to_lowercase() == name_lower)
+    {
+        if skill_depth < dir_depth(&existing.skill_dir, skills_dir) {
+            *existing = skill;
+        }
+        return;
+    }
+    skills.push(skill);
+}
+
 fn parse_skill_frontmatter(path: &Path, skill_dir: String) -> Result<Skill, String> {
     let content = read_until_frontmatter_end(path)
         .ok_or_else(|| format!("Failed to read frontmatter of {}: no closing '---' fence", path.display()))?;

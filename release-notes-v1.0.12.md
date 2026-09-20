@@ -3,7 +3,7 @@
 本次发布聚焦三块：一个不可删除的主 Chat 会话、统一的语言规则（修掉“推理英文、总结却中文”）、以及多会话切换时历史/工具卡不再串台或丢失。
 
 ### 主 Chat 会话保护（会话管理）
-- **首个会话成为永久“主 Chat”**：SessionMeta 新增 main 标记，最早创建的会话被锁定为主会话，soft_delete 拒绝删除它。
+- **主 Chat 会话恒常存在且不可删除**：SessionMeta 新增 main 标记，系统始终保证恰有一个主会话（加载或创建时若无 main 则自动提升最早的非删除会话），soft_delete 拒绝删除它。
 - **Sessions 列表只显示用户额外创建的子会话**：sessions_list 暴露 main，前端 loadSessions 过滤掉主会话，只有子会话出现在导航栏。
 - **启动与删除都回到主 Chat**：activateChatView/goChat 保证启动默认落在主 Chat 页；删除正在使用的子会话后自动切回主 Chat。
 - 集中点：src/session.rs、src/server.rs、static/index.html。

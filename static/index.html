@@ -716,7 +716,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 .mcp-card{background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:12px;padding:16px;transition:transform .2s,box-shadow .2s}
 .mcp-card:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,.08)}
 .mcp-card-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
-.mcp-card-name{font-weight:700;font-size:14px;color:#1e293b}
+.mcp-card-name{font-weight:700;font-size:14px;color:#1e293b}.skill-ver{color:#94a3b8;font-size:11px;font-weight:500;margin-left:6px}
 .mcp-transport{background:#e0f2fe;color:#0369a1;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600}
 .mcp-status{font-size:12px;margin-left:auto;font-weight:500}
 .mcp-tools{font-size:11px;color:#64748b;line-height:1.5;margin-bottom:12px;word-break:break-word}
@@ -3143,7 +3143,7 @@ async function loadSkills(){
         const triggers=(s.triggers||[]).map(t=>'<span class="skill-tag">'+esc(t)+'</span>').join('');
         return '<div class="mcp-card">'+
           '<div class="mcp-card-header">'+
-            '<span class="mcp-card-name">'+esc(s.name)+'</span>'+
+            '<span class="mcp-card-name">'+esc(s.name)+'<span class="skill-ver">'+(s.version?' v'+esc(s.version):' v1.0.0')+'</span></span>'+
             '<span class="mcp-status" style="color:'+statusColor+'">&#9679; '+statusText+'</span>'+
           '</div>'+
           (s.description?'<div class="mcp-tools">'+esc(s.description)+'</div>':'')+
