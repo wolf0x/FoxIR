@@ -320,6 +320,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/skills", get(skills_handler))
         .route("/api/skills", post(skills_create_handler))
+        .route("/api/skills/metrics", get(skills_metrics_handler))
         .route("/api/skills/reload", post(skills_reload_handler))
         .route("/api/skills/{name}", delete(skills_delete_handler))
         .route("/api/skills/{name}/toggle", post(skills_toggle_handler))
@@ -982,6 +983,12 @@ async fn skills_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
 
     let skills = state.skill_manager.list();
     Json(json!({ "skills": skills, "count": skills.len() }))
+}
+
+async fn skills_metrics_handler() -> Json<Value> {
+    let metrics = crate::skill::metrics::snapshot();
+    crate::skill::metrics::save();
+    Json(metrics)
 }
 
 async fn skills_create_handler(

@@ -171,7 +171,7 @@ fn manager_system_prompt(lang: &str, domain: TaskDomain, tool_defs: &[ToolDefini
 
     prompt.push_str("\n## CAPABILITY ROUTING (Two-Layer Decision)\n\n");
     prompt.push_str("Layer 1 — Capability Selection:\n");
-    prompt.push_str("1. If a Skill matches the subtask domain, instruct the Executor to use it (hot skills auto-inject; cold via skill_read_file)\n");
+    prompt.push_str("1. If a Skill matches the subtask domain, instruct the Executor to use it (load it via skill_read_file on demand)\n");
     prompt.push_str("2. Select tools closest to the data source — prefer domain-specific tools over generic shell/browser:\n");
     prompt.push_str("   - EVTX → ir_eventlog, PCAP → ir_pcap_analyze, Memory → ir_memdump\n");
     prompt.push_str("   - Registry → ir_registry, Prefetch → ir_prefetch, Timeline → ir_timeline\n");

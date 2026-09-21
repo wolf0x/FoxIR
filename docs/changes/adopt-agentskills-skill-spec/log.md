@@ -10,6 +10,12 @@
 | 2026-09-21 | P1 | 移除 `curated` 只读保护 | `should_improve`、`improve_skill`、相关单测 | self_improve.rs |
 | 2026-09-21 | P1 | 管理侧 + 前端去 `triggers` | `manager.rs` 去掉 triggers；`index.html` 卡片改 platforms/deps | — |
 | 2026-09-21 | P1 | 编译与单测验证 | `cargo check` 通过；`cargo test --lib skill::` 28/28 通过 | — |
+| 2026-09-21 | P2 | `build_skills_prompt(Query)` 改纯目录模型自路由 | 无正文内联；`HOT_MIN_SCORE` 删除；`task_skill_active` 恒 false | mod.rs |
+| 2026-09-21 | P2 | 保留 `find_matching` 仅给 Expert executor 预注 | `score_skill`/`tokenize` 仍在 Expert 路径使用；主 Instant 路径不再用词面打分 | runner.rs |
+| 2026-09-21 | P3 | `platforms`/`deps` 可用性门控 | `unavailable_reason` + 注册时跳过不兼容技能；29/29 测试 | mod.rs |
+| 2026-09-21 | P4 | 迁移 9 个运行时技能 frontmatter（去 triggers） | 备份 output/skills-migration-*/；huashu 中文/版本完好；无 triggers 残留 | ${workspace}/skills |
+| 2026-09-21 | P5 | 遥测计量 + 端点 + 前端 | `src/skill/metrics.rs`；`GET /api/skills/metrics`；技能页遥测行 | metrics.rs / server.rs |
+| 2026-09-21 | 决策 | 不重加 `lexical` 回退模式 | 与移除词面打分方向一致；`router_mode:"llm"`；listing 策略仍可调 | — |
 
 ## 数据（灰度对比）
 

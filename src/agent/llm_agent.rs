@@ -692,7 +692,7 @@ Only treat activity as a security incident when the user asks, or clear evidence
 ## CAPABILITY ROUTING (Two-Layer Decision)\n\
 \n\
 Layer 1 — Capability Selection (WHAT to use):\n\
-1. Check if a Skill applies (hot skills are already inlined below; cold skills use skill_read_file on demand)\n\
+1. Check if a Skill applies (skills are listed by name:description below; load the one that fits with skill_read_file on demand)\n\
 2. Pick the tool/MCP closest to the data source:\n\
    - Email investigation → M365/Email skill, NOT browser→Outlook\n\
    - Remote logs → WinRM/SSH tool, NOT RDP\n\
@@ -1322,10 +1322,10 @@ impl Agent for LlmAgent {
         let invocation_id = &ctx.base.invocation_id;
         let author = &ctx.agent_name;
         let max_iter = ctx.max_iterations;
-        // P1 guard: NamesOnly / DiscoverToolOnly strategies tell the model to load
-        // skill bodies via `skill_read_file`. If that tool is NOT in the current
-        // tool set (e.g. filtered/unregistered), fall back to Query so bodies are
-        // inlined directly instead of pointing the model at a dead tool.
+        // P1 guard: NamesOnly / DiscoverToolOnly tell the model to load skill
+        // bodies via `skill_read_file`. If that tool is NOT in the current tool
+        // set (e.g. filtered/unregistered), fall back to Query so a readable
+        // name:description catalog is shown instead of pointing at a dead tool.
         let skill_strategy = {
             if matches!(
                 ctx.skill_listing_strategy,

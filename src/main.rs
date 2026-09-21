@@ -404,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load skills (resolve skills dir from workspace)
     let skills_dir = std::path::Path::new(&workspace_dir).join("skills");
+    crate::skill::metrics::init(skills_dir.join(".metrics.json"));
     let skill_manager = Arc::new(SkillManager::new_with_notify(
         skills_dir.to_str().unwrap_or("skills"),
         Some(notify_tx.clone()),

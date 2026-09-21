@@ -2,15 +2,8 @@ pub mod steps;
 pub mod types;
 pub mod verify;
 pub mod self_improve;
+pub mod metrics;
 pub use self::types::SkillListingStrategy;
-
-/// Minimum relevance score for a skill to be auto-injected (hot) on matching.
-/// Scoring is metadata-only (name ×4.0, description ×2.5) — the former
-/// `triggers`/`always` inputs were removed with the agentskills.io schema.
-/// The bar is set low enough that a genuine name or description-term overlap
-/// elevates the top candidates into the inlined set while incidental matches
-/// stay in the on-demand catalog.
-const HOT_MIN_SCORE: f32 = 2.0;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,10 +126,21 @@ impl SkillManager {
                             if let Some(enabled) = state.get(&skill.metadata.name) {
                                 skill.metadata.enabled = *enabled;
                             }
+                            // Availability gate (agentskills.io): a skill whose
+                            // `platforms` excludes this OS, or whose `deps` are
+                            // not present on PATH, is not registered.
+                            if let Some(reason) = unavailable_reason(&skill.metadata) {
+                                warn!(
+                                    "Skill '{}' unavailable on this host ({}); not registered (platforms={:?}, deps={:?})",
+                                    skill.metadata.name, reason, skill.metadata.platforms, skill.metadata.deps
+                                );
+                                continue;
+                            }
                             info!("Loaded skill: {} from {} (enabled={})", skill.metadata.name, path.display(), skill.metadata.enabled);
                             insert_skill_unique(&mut skills, &canon_base, skill);
                         }
                         Err(e) => {
+                            metrics::record_load_failure();
                             warn!("{}", e);
                         }
                     }
@@ -238,20 +242,18 @@ impl SkillManager {
     /// Chinese/Japanese/Korean text still produces meaningful overlap.
     /// Build the "Active Skills Context" section of the system prompt.
     ///
-    /// Skills whose `name`/`description` strongly match the current
-    /// `matching_context` (top-K by `score_skill`, bounded by `max_inline_chars`)
-    /// get their instruction body inlined. All remaining enabled skills are
-    /// listed as a compact `name: description` catalog (`catalog_max` entries)
-    /// with a note about loading them on demand via `skill_read_file`.
-    /// `NamesOnly` only emits a name list; `DiscoverToolOnly` emits nothing
-    /// (rely on discover).
+    /// Pure model self-routing: every enabled skill is listed as a compact
+    /// `name: description` catalog (`catalog_max` entries); the model decides
+    /// which skill applies and loads its body on demand via `skill_read_file`.
+    /// No lexical scoring, no auto-inlining. `NamesOnly` only emits a name
+    /// list; `DiscoverToolOnly`/`Disabled` emit nothing.
     pub fn build_skills_prompt(
         &self,
-        matching_context: &str,
+        _matching_context: &str,
         strategy: SkillListingStrategy,
-        max_inline_chars: usize,
+        _max_inline_chars: usize,
         catalog_max: usize,
-        hot_top_k: usize,
+        _hot_top_k: usize,
     ) -> (Option<String>, bool) {
         if matches!(strategy, SkillListingStrategy::DiscoverToolOnly | SkillListingStrategy::Disabled) {
             return (None, false);
@@ -264,16 +266,15 @@ impl SkillManager {
         }
 
         let mut out = String::new();
-        let mut task_skill_active = false;
         out.push_str("## Active Skills Context\n");
         out.push_str(
-            "The following skill(s) are available. Hot skills have their instructions \
-             injected below - follow them directly. Cold skills are listed by \
-             name:description - to use one, load it with `skill_read_file` \
-             (skill=\"<name>\", empty path lists its files) so its instructions are \
-             injected. Large supporting/reference files (e.g. 'reference.md') are \
-             never auto-injected; read them with `skill_read_file`. Do NOT use \
-             generic `file_read`/`shell` to locate skill files.\n\n",
+            "The following skill(s) are available. Review each name:description \
+             and decide whether any Skill directly applies to the current task. \
+             To use one, load it with `skill_read_file` (skill=\"<name>\", empty \
+             path lists its files) so its instructions are injected. Large \
+             supporting/reference files (e.g. 'reference.md') are never \
+             auto-injected; read them with `skill_read_file`. Do NOT use generic \
+             `file_read`/`shell` to locate skill files.\n\n",
         );
 
         match strategy {
@@ -282,82 +283,27 @@ impl SkillManager {
                 out.push_str(&format!("Available skills: {}\n", names.join(", ")));
             }
             SkillListingStrategy::Query => {
-                let query_tokens = Self::tokenize(matching_context);
-
-                let mut scored: Vec<(&Skill, f32)> = enabled
-                    .iter()
-                    .copied()
-                    .filter_map(|s| {
-                        let score = Self::score_skill(s, &query_tokens);
-                        // Only strong name/description overlaps reach HOT_MIN_SCORE;
-                        // weak incidental matches fall through to the on-demand catalog.
-                        if score >= HOT_MIN_SCORE { Some((s, score)) } else { None }
-                    })
-                    .collect();
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                scored.truncate(hot_top_k);
-                // A task-matched (non-always) skill body was inlined → the current task
-                // is driven by a SKILL. Used to suppress SOP replay in the same turn.
-                task_skill_active = !scored.is_empty();
-
-                let mut seen = std::collections::HashSet::new();
-                if !scored.is_empty() {
-                    out.push_str("### Hot Skills (instructions injected)\n");
-                    for (s, _score) in scored {
-                        if seen.insert(s.metadata.name.clone()) {
-                            out.push_str(&format!("- **{}**: matched current task\n", s.metadata.name));
-                            out.push_str(&Self::inline_body(s, max_inline_chars));
-                            let _contract = s.step_contract();
-                            if let Some(block) = steps::contract_block(&_contract) {
-info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name, _contract.len(), _contract.iter().enumerate().map(|(i,x)| format!("{}.{}", i+1, x.label)).collect::<Vec<_>>().join(" | "));
-                                out.push_str(&block);
-                            }
-                        }
+                let mut n = 0usize;
+                let total = enabled.len();
+                for s in &enabled {
+                    if n >= catalog_max {
+                        let omitted = total - n;
+                        out.push_str(&format!(
+                            "- ... and {} more (use `list_skills` to see them all)\n",
+                            omitted
+                        ));
+                        break;
                     }
-                }
-
-                let cold: Vec<&Skill> = enabled
-                    .iter()
-                    .filter(|s| !seen.contains(&s.metadata.name))
-                    .copied()
-                    .collect();
-                if !cold.is_empty() {
-                    out.push_str("\n### Other Skills (load on demand)\n");
-                    let mut n = 0usize;
-                    let cold_total = cold.len();
-                    for s in &cold {
-                        if n >= catalog_max {
-                            let omitted = cold_total - n;
-                            out.push_str(&format!(
-                                "- ... and {} more (use `list_skills` to see them all)\n",
-                                omitted
-                            ));
-                            break;
-                        }
-                        let desc = s.metadata.description.chars().take(120).collect::<String>();
-                        out.push_str(&format!("- **{}**: {}\n", s.metadata.name, desc));
-                        n += 1;
-                    }
+                    let desc = s.metadata.description.chars().take(120).collect::<String>();
+                    out.push_str(&format!("- **{}**: {}\n", s.metadata.name, desc));
+                    n += 1;
                 }
             }
             SkillListingStrategy::Disabled => unreachable!("Disabled is short-circuited at the top of build_skills_prompt"),
         }
 
-        (Some(out), task_skill_active)
-    }
-
-    /// Render a hot skill body for injection, truncating at a char boundary.
-    fn inline_body(s: &Skill, max_chars: usize) -> String {
-        let owned = s.body().into_owned();
-        if owned.chars().count() > max_chars {
-            let mut truncated: String = owned.chars().take(max_chars).collect();
-            truncated.push_str(
-                "\n\n[... skill body truncated for context budget; use `skill_read_file` \
-                 to read the full instructions ...]\n",
-            );
-            return format!("```markdown\n{}\n```\n", truncated);
-        }
-        format!("```markdown\n{}\n```\n", owned)
+        metrics::record_catalog_turn();
+        (Some(out), false)
     }
 
     fn tokenize(text: &str) -> Vec<String> {
@@ -605,6 +551,58 @@ fn insert_skill_unique(skills: &mut Vec<Skill>, skills_dir: &std::path::Path, sk
         return;
     }
     skills.push(skill);
+}
+
+/// Current host OS platform token (agentskills.io platform name).
+fn current_os_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// True when `cmd` is resolvable on PATH (checks bare name + `.exe`/`.cmd`).
+fn command_on_path(cmd: &str) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| {
+        for name in [
+            cmd_lower.clone().into(),
+            format!("{}.exe", cmd_lower),
+            format!("{}.cmd", cmd_lower),
+            format!("{}.bat", cmd_lower),
+        ] {
+            if dir.join(&name).is_file() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Return a human-readable reason when a skill is not usable on this host,
+/// or `None` when it passes the agentskills.io availability gate
+/// (`platforms` ⊆ current OS, every `deps` resolvable on PATH).
+pub fn unavailable_reason(meta: &SkillMetadata) -> Option<String> {
+    if !meta.platforms.is_empty() {
+        let os = current_os_platform();
+        let hit = meta.platforms.iter().any(|p| p.to_lowercase() == os);
+        if !hit {
+            return Some(format!(
+                "declared platforms {:?} do not include this OS '{}'",
+                meta.platforms, os
+            ));
+        }
+    }
+    for dep in &meta.deps {
+        if !command_on_path(dep) {
+            return Some(format!("required dependency '{}' not found on PATH", dep));
+        }
+    }
+    None
 }
 
 fn parse_skill_frontmatter(path: &Path, skill_dir: String) -> Result<Skill, String> {
@@ -907,6 +905,7 @@ list the files available in the skill directory."
         })
     }
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> AgentResult<Value> {
+        metrics::record_read_call();
         let name = args["skill"].as_str().unwrap_or_default().trim();
         if name.is_empty() { return Err("Missing 'skill'".into()); }
         let rel = args["path"].as_str().unwrap_or("").trim().to_string();
@@ -919,11 +918,13 @@ list the files available in the skill directory."
                 skills.iter().find(|s| Path::new(&s.skill_dir).file_name().map(|n| n.to_string_lossy().to_lowercase() == dir_name).unwrap_or(false))
             });
         let Some(skill) = found else {
+            metrics::record_read_failure();
             let available: Vec<&str> = skills.iter().map(|s| s.metadata.name.as_str()).collect();
             return Err(format!("Skill '{}' not found. Available skills: {:?}", name, available).into());
         };
         let skill_dir = PathBuf::from(&skill.skill_dir);
         let Ok(skill_canon) = skill_dir.canonicalize() else {
+            metrics::record_read_failure();
             return Err(format!("Skill directory not accessible: {}", skill_dir.display()).into());
         };
         // Empty path -> list directory entries so the model can discover reference files.
@@ -1020,6 +1021,7 @@ impl Tool for ImproveSkillTool {
         // rollback hint to the user rather than silently reverting (human gate).
         let regressed = self_improve::should_suggest_rollback(&self.skills_dir, name, 10, 0.5);
         let new_version = self_improve::apply_patch(&self.skills_dir, &skills[idx], new_content)?;
+        metrics::record_improvement();
         let path = std::path::Path::new(&skills[idx].skill_dir).join("SKILL.md");
         skills[idx].content = SkillContent::Lazy { path: path.clone(), cell: Arc::new(OnceLock::new()) };
         skills[idx].metadata.version = new_version.clone();
@@ -1242,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn build_skills_prompt_matched_vs_cold() {
+    fn build_skills_prompt_catalog_only() {
         let tmp = std::env::temp_dir().join(format!("rs_skill_prompt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("AlwaysSkill")).unwrap();
@@ -1265,13 +1267,17 @@ mod tests {
         let (q_opt, q_act) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 20_000, 40, 3);
         let q = q_opt.expect("query section present");
         let ql = q.to_lowercase();
-        assert!(ql.contains("# process body"), "matched body should be inlined: {}", q);
-        assert!(!ql.contains("# always body"), "non-matching skill must NOT be auto-inlined: {}", q);
-        assert!(ql.contains("alwaysskill"), "non-matching skill should still be catalogued: {}", q);
-        assert!(ql.contains("coldskill"), "cold skill should be listed by name: {}", q);
-        assert!(!ql.contains("# noisy body"), "weak skill body must not be auto-inlined: {}", q);
-        assert!(ql.contains("noisyskill"), "weak skill should still be catalogued: {}", q);
-        assert!(q_act, "matched skill should mark task_skill_active");
+        // Model self-routing: no body is auto-inlined; every enabled skill is a
+        // catalogue entry the model loads on demand via skill_read_file.
+        assert!(!ql.contains("# process body"), "no body should be inlined: {}", q);
+        assert!(!ql.contains("# always body"), "no body should be inlined: {}", q);
+        assert!(!ql.contains("# cold body"), "no body should be inlined: {}", q);
+        assert!(!ql.contains("# noisy body"), "no body should be inlined: {}", q);
+        assert!(ql.contains("processskill"), "skill should be catalogued: {}", q);
+        assert!(ql.contains("alwaysskill"), "skill should be catalogued: {}", q);
+        assert!(ql.contains("coldskill"), "skill should be catalogued: {}", q);
+        assert!(ql.contains("noisyskill"), "skill should be catalogued: {}", q);
+        assert!(!q_act, "catalog-only routing must NOT mark a task skill active");
 
         let (n_opt, _) = mgr.build_skills_prompt("process", SkillListingStrategy::NamesOnly, 20_000, 40, 3);
         let n = n_opt.expect("names section present");
@@ -1279,10 +1285,6 @@ mod tests {
         assert!(!n.contains("# always body"), "names-only must not inline bodies: {}", n);
 
         assert!(mgr.build_skills_prompt("x", SkillListingStrategy::DiscoverToolOnly, 0, 0, 0).0.is_none());
-
-        let (t_opt, _) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 5, 40, 3);
-        let t = t_opt.expect("truncated section present");
-        assert!(t.contains("truncated for context budget"), "expected truncation note: {}", t);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1313,6 +1315,32 @@ mod tests {
         for n in ["install_skill", "skill_read_file", "improve_skill", "list_skills", "remove_skill"] {
             assert!(names.iter().any(|s| s == n), "missing skill tool {}", n);
         }
+    }
+
+    /// G-availability: skills whose `platforms` exclude the host OS, or whose
+    /// `deps` are missing from PATH, are not registered (agentskills.io gate).
+    #[test]
+    fn availability_gate_excludes_incompatible_platforms() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_avail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("HostSkill")).unwrap();
+        std::fs::create_dir_all(tmp.join("ForeignSkill")).unwrap();
+        std::fs::create_dir_all(tmp.join("DepSkill")).unwrap();
+        let os = current_os_platform();
+        let other = if os == "linux" { "windows" } else { "linux" };
+        std::fs::write(tmp.join("HostSkill/SKILL.md"),
+            format!("---\nname: HostSkill\ndescription: host-native\nplatforms: [{}]\n---\n# H\n", os)).unwrap();
+        std::fs::write(tmp.join("ForeignSkill/SKILL.md"),
+            format!("---\nname: ForeignSkill\ndescription: foreign\nplatforms: [{}]\n---\n# F\n", other)).unwrap();
+        std::fs::write(tmp.join("DepSkill/SKILL.md"),
+            "---\nname: DepSkill\ndescription: needs a tool\ndeps: [zz_foxir_nonexistent_tool_xyz]\n---\n# D\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let loaded: Vec<String> = mgr.list().iter().map(|m| m.name.clone()).collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(loaded.contains(&"HostSkill".to_string()), "native-platform skill should load: {:?}", loaded);
+        assert!(!loaded.contains(&"ForeignSkill".to_string()), "foreign-platform skill must NOT load: {:?}", loaded);
+        assert!(!loaded.contains(&"DepSkill".to_string()), "missing-dep skill must NOT load: {:?}", loaded);
     }
 
 }

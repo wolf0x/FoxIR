@@ -1273,6 +1273,7 @@ input:checked+.slider:before{transform:translateX(20px)}
       <div class="settings-scroll modern-page">
         <div class="settings-section">
           <h3><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l1.9 5.7h6.1l-4.9 3.6 1.9 5.7-4.9-3.6-5 3.6 1.9-5.7-4.9-3.6h6.1z"/><path d="M4 4v16h3V4H4zm13 0v16h3V4h-3z" opacity=".55"/></svg> Skills Management</h3>
+          <div id="skillMetrics" style="font-size:12px;color:var(--t3);margin-bottom:10px">…</div>
           <div id="skillList" style="font-size:13px;color:var(--t2)">Loading...</div>
         </div>
       </div>
@@ -3158,7 +3159,19 @@ async function loadSkills(){
       }).join('')+'</div>';
     } else el.innerHTML='<span style="color:var(--t3)">No skills installed</span>';
   }catch(e){document.getElementById('skillList').innerHTML='<span style="color:var(--red)">Failed to load</span>'}
+  loadSkillMetrics();
   loadSlashSkills(); // refresh slash popup cache
+}
+async function loadSkillMetrics(){
+  const el=document.getElementById('skillMetrics');
+  try{
+    const r=await fetch('/api/skills/metrics');const d=await r.json();
+    el.innerHTML='<strong>Telemetry</strong> (router: llm) — catalog turns: '+(d.catalog_turns||0)+
+      ' · read calls: '+(d.read_skill_calls||0)+
+      ' · read failures: '+(d.read_skill_failures||0)+
+      ' · load failures: '+(d.load_failures||0)+
+      ' · improvements: '+(d.improvements||0);
+  }catch(e){el.innerHTML='';}
 }
 async function toggleSkill(name){
   try{
