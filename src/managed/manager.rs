@@ -511,12 +511,6 @@ pub async fn plan_next(
                 "- **{}**: {}",
                 skill.name, skill.description
             ));
-            if !skill.triggers.is_empty() {
-                system_prompt.push_str(&format!(
-                    " (triggers: {})",
-                    skill.triggers.join(", ")
-                ));
-            }
             system_prompt.push('\n');
         }
     }

@@ -1049,13 +1049,13 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         }
 
         // ── Active Skills (hot/cold, lazy bodies) ──
-        // Hot skills (always:true + top-K fuzzy matches) get their instructions
-        // inlined; cold skills are listed name:desc for on-demand load via
-        // skill_read_file. Matching uses a bounded window so an earlier-turn
-        // activation stays "sticky" across follow-up turns.
+        // Top-K matched skills get their instructions inlined; the rest are
+        // listed name:desc for on-demand load via skill_read_file. Matching uses
+        // a bounded window so an earlier-turn activation stays "sticky" across
+        // follow-up turns.
         let matching_context = Self::build_skill_matching_context(history, user_message);
         // build_skills_prompt returns (Option<String>, bool); the bool reports whether
-        // a task-matched (non-always) skill body was inlined — this turn is driven by a
+        // a task-matched skill body was inlined — this turn is driven by a
         // SKILL. Used to suppress a competing SOP replay at the injection point below.
         let mut task_skill_active = false;
         // Agents built with `.without_skills()` have no SkillManager (B4.3) and

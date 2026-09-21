@@ -5,13 +5,12 @@ pub mod self_improve;
 pub use self::types::SkillListingStrategy;
 
 /// Minimum relevance score for a skill to be auto-injected (hot) on matching.
-/// Mirrors thClaws/microclaw's explicit-activation model: a skill's *own*
-/// declared triggers and strong metadata overlap raise its score past this
-/// bar; weak/incidental overlaps stay in the on-demand catalog instead of
-/// being force-injected (which used to pull in unrelated skills like
-/// browser-skill/PathProbe for a hunt task). A full trigger-phrase hit adds
-/// +10, a name hit +4, a description hit +2.5, a trigger-word hit +2.
-const HOT_MIN_SCORE: f32 = 8.0;
+/// Scoring is metadata-only (name ×4.0, description ×2.5) — the former
+/// `triggers`/`always` inputs were removed with the agentskills.io schema.
+/// The bar is set low enough that a genuine name or description-term overlap
+/// elevates the top candidates into the inlined set while incidental matches
+/// stay in the on-demand catalog.
+const HOT_MIN_SCORE: f32 = 2.0;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -183,9 +182,6 @@ impl SkillManager {
     /// Scoring weights (inspired by adk-skill's lexical overlap model):
     /// - Name match:         ×4.0
     /// - Description match:  ×2.5
-    /// - Trigger token match: ×2.0
-    /// - Body token overlap: ×1.0
-    /// - Trigger substring bonus: +10.0 (when a full trigger phrase appears in the message)
     ///
     /// The raw score is normalized by `sqrt(body_token_count)` to prevent
     /// large documents (e.g. 33KB VPS skill) from dominating via sheer token volume.
@@ -200,7 +196,7 @@ impl SkillManager {
             .iter()
             .filter(|s| s.metadata.enabled)
             .filter_map(|s| {
-                let score = Self::score_skill(s, &query_tokens, user_message);
+                let score = Self::score_skill(s, &query_tokens);
                 if score >= policy.min_score {
                     Some((s.body().into_owned(), score))
                 } else {
@@ -216,9 +212,8 @@ impl SkillManager {
     }
 
     /// Compute weighted relevance score for a single skill against query tokens.
-    fn score_skill(skill: &Skill, query_tokens: &[String], message: &str) -> f32 {
+    fn score_skill(skill: &Skill, query_tokens: &[String]) -> f32 {
         let mut score: f32 = 0.0;
-        let msg_lower = message.to_lowercase();
 
         // Name token overlap (weight: 4.0)
         let name_tokens = Self::tokenize(&skill.metadata.name);
@@ -229,17 +224,6 @@ impl SkillManager {
         let desc_tokens = Self::tokenize(&skill.metadata.description);
         let desc_hits = query_tokens.iter().filter(|t| desc_tokens.contains(t)).count();
         score += desc_hits as f32 * 2.5;
-
-        // Trigger token overlap (weight: 2.0)
-        for trigger in &skill.metadata.triggers {
-            let trigger_tokens = Self::tokenize(trigger);
-            let trigger_hits = query_tokens.iter().filter(|t| trigger_tokens.contains(t)).count();
-            score += trigger_hits as f32 * 2.0;
-            // Bonus: full trigger phrase appears as substring in the message
-            if !trigger.is_empty() && msg_lower.contains(&trigger.to_lowercase()) {
-                score += 10.0;
-            }
-        }
 
         // (Body-token overlap and length normalization removed on purpose:
         // scoring is metadata-only so matching never forces a lazy body load.)
@@ -254,12 +238,13 @@ impl SkillManager {
     /// Chinese/Japanese/Korean text still produces meaningful overlap.
     /// Build the "Active Skills Context" section of the system prompt.
     ///
-    /// Hot skills - those marked `always: true` plus the top-K fuzzy matches
-    /// for the current `matching_context` - get their full instruction body
-    /// inlined (bounded by `max_inline_chars`). Cold skills are listed as a
-    /// compact `name: description` catalog (`catalog_max` entries) with a note
-    /// about loading them on demand via `skill_read_file`. `NamesOnly` only
-    /// emits a name list; `DiscoverToolOnly` emits nothing (rely on discover).
+    /// Skills whose `name`/`description` strongly match the current
+    /// `matching_context` (top-K by `score_skill`, bounded by `max_inline_chars`)
+    /// get their instruction body inlined. All remaining enabled skills are
+    /// listed as a compact `name: description` catalog (`catalog_max` entries)
+    /// with a note about loading them on demand via `skill_read_file`.
+    /// `NamesOnly` only emits a name list; `DiscoverToolOnly` emits nothing
+    /// (rely on discover).
     pub fn build_skills_prompt(
         &self,
         matching_context: &str,
@@ -299,15 +284,13 @@ impl SkillManager {
             SkillListingStrategy::Query => {
                 let query_tokens = Self::tokenize(matching_context);
 
-                let mut hot: Vec<&Skill> = enabled.iter().filter(|s| s.metadata.always).copied().collect();
                 let mut scored: Vec<(&Skill, f32)> = enabled
                     .iter()
-                    .filter(|s| !s.metadata.always)
                     .copied()
                     .filter_map(|s| {
-                        let score = Self::score_skill(s, &query_tokens, matching_context);
-                        // Only strong/triggered overlaps reach HOT_MIN_SCORE; weak
-                        // incidental matches fall through to the on-demand catalog.
+                        let score = Self::score_skill(s, &query_tokens);
+                        // Only strong name/description overlaps reach HOT_MIN_SCORE;
+                        // weak incidental matches fall through to the on-demand catalog.
                         if score >= HOT_MIN_SCORE { Some((s, score)) } else { None }
                     })
                     .collect();
@@ -318,19 +301,8 @@ impl SkillManager {
                 task_skill_active = !scored.is_empty();
 
                 let mut seen = std::collections::HashSet::new();
-                if !hot.is_empty() || !scored.is_empty() {
+                if !scored.is_empty() {
                     out.push_str("### Hot Skills (instructions injected)\n");
-                    for s in hot.drain(..) {
-                        if seen.insert(s.metadata.name.clone()) {
-                            out.push_str(&format!("- **{}**: always loaded\n", s.metadata.name));
-                            out.push_str(&Self::inline_body(s, max_inline_chars));
-                            let _contract = s.step_contract();
-                            if let Some(block) = steps::contract_block(&_contract) {
-info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name, _contract.len(), _contract.iter().enumerate().map(|(i,x)| format!("{}.{}", i+1, x.label)).collect::<Vec<_>>().join(" | "));
-                                out.push_str(&block);
-                            }
-                        }
-                    }
                     for (s, _score) in scored {
                         if seen.insert(s.metadata.name.clone()) {
                             out.push_str(&format!("- **{}**: matched current task\n", s.metadata.name));
@@ -362,11 +334,7 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
                             ));
                             break;
                         }
-                        let desc = if s.metadata.when_to_use.is_empty() {
-                            s.metadata.description.chars().take(120).collect::<String>()
-                        } else {
-                            s.metadata.when_to_use.chars().take(120).collect::<String>()
-                        };
+                        let desc = s.metadata.description.chars().take(120).collect::<String>();
                         out.push_str(&format!("- **{}**: {}\n", s.metadata.name, desc));
                         n += 1;
                     }
@@ -427,8 +395,8 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
     }
 
     /// Create a new skill as a directory: skills/{name}/SKILL.md + optional extra files.
-    pub fn create_skill(&self, name: &str, description: &str, triggers: &[String], content: &str) -> Result<String, String> {
-        self.create_skill_with_files(name, description, triggers, content, None)
+    pub fn create_skill(&self, name: &str, description: &str, content: &str) -> Result<String, String> {
+        self.create_skill_with_files(name, description, content, None)
     }
 
     /// Create a skill directory with SKILL.md and optional additional files.
@@ -436,7 +404,6 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
         &self,
         name: &str,
         description: &str,
-        triggers: &[String],
         content: &str,
         files: Option<Vec<(String, String)>>,
     ) -> Result<String, String> {
@@ -444,11 +411,10 @@ info!("[skills] Injected step contract for '{}' ({} steps): {}", s.metadata.name
         std::fs::create_dir_all(&self.skills_dir)
             .map_err(|e| format!("Failed to create dir: {}", e))?;
 
-        let triggers_yaml: Vec<String> = triggers.iter().map(|t| format!("  - {}", yaml_quote(t))).collect();
         let clean_content = strip_frontmatter(content);
         let md_content = format!(
-            "---\nname: {}\ndescription: {}\ntriggers:\n{}\n---\n\n{}\n",
-            yaml_quote(name), yaml_quote(description), triggers_yaml.join("\n"), clean_content
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            yaml_quote(name), yaml_quote(description), clean_content
         );
 
         // Always create directory: skills/{dir_name}/SKILL.md
@@ -778,7 +744,11 @@ impl Tool for InstallSkillTool {
             "properties": {
                 "name": { "type": "string", "description": "Skill name identifier — preserved exactly as provided (also used as directory name)." },
                 "description": { "type": "string", "description": "Skill description for matching and display" },
-                "triggers": { "type": "array", "items": { "type": "string" }, "description": "Trigger phrases for skill matching (optional, falls back to description keywords)" },
+                "version": { "type": "string", "description": "Optional semantic version (defaults to 1.0.0)." },
+                "license": { "type": "string", "description": "Optional SPDX license identifier (agentskills.io)." },
+                "platforms": { "type": "array", "items": { "type": "string" }, "description": "Optional target platforms: windows / macos / linux / ..." },
+                "deps": { "type": "array", "items": { "type": "string" }, "description": "Optional required external commands / packages." },
+                "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Optional pre-approved tool names the skill may use (serialized as 'allowed-tools')." },
                 "content": { "type": "string", "description": "Skill instructions inline (markdown body of SKILL.md). Use only for small skills; for large ones use content_file." },
                 "content_file": { "type": "string", "description": "Workspace-relative path to a file containing the skill instructions (e.g. 'output/my_skill.md'). Alternative to 'content' for large skills." },
                 "dir_name": { "type": "string", "description": "Override skill directory name (optional, rarely needed — defaults to the skill name)." },
@@ -802,10 +772,17 @@ impl Tool for InstallSkillTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         let name = args["name"].as_str().ok_or_else(|| "Missing 'name'".to_string())?;
         let desc = args["description"].as_str().unwrap_or("");
-        let triggers: Vec<String> = args["triggers"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
+        let version = args["version"].as_str().map(String::from).unwrap_or_else(|| "1.0.0".to_string());
+        let license = args["license"].as_str().map(String::from);
+        let str_list = |key: &str| {
+            args[key]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let platforms = str_list("platforms");
+        let deps = str_list("deps");
+        let allowed_tools = str_list("allowed_tools");
 
         // Resolve skill body: inline 'content' or read from 'content_file'
         let content = if let Some(inline) = args["content"].as_str() {
@@ -823,11 +800,34 @@ impl Tool for InstallSkillTool {
             .map(|s| sanitize_dir_name(s))
             .unwrap_or_else(|| sanitize_dir_name(name));
 
-        let triggers_yaml: Vec<String> = triggers.iter().map(|t| format!("  - {}", yaml_quote(t))).collect();
+        let list_yaml = |items: &[String]| -> Vec<String> {
+            items.iter().map(|t| format!("  - {}", yaml_quote(t))).collect()
+        };
         let clean_content = strip_frontmatter(&content);
+        let mut fm_lines = vec![
+            format!("name: {}", yaml_quote(name)),
+            format!("description: {}", yaml_quote(desc)),
+            format!("version: {}", yaml_quote(&version)),
+        ];
+        if let Some(lic) = &license {
+            fm_lines.push(format!("license: {}", yaml_quote(lic)));
+        }
+        if !platforms.is_empty() {
+            fm_lines.push("platforms:".to_string());
+            fm_lines.extend(list_yaml(&platforms));
+        }
+        if !deps.is_empty() {
+            fm_lines.push("deps:".to_string());
+            fm_lines.extend(list_yaml(&deps));
+        }
+        if !allowed_tools.is_empty() {
+            fm_lines.push("allowed-tools:".to_string());
+            fm_lines.extend(list_yaml(&allowed_tools));
+        }
         let md_content = format!(
-            "---\nname: {}\ndescription: {}\ntriggers:\n{}\n---\n\n{}\n",
-            yaml_quote(name), yaml_quote(desc), triggers_yaml.join("\n"), clean_content
+            "---\n{}\n---\n\n{}\n",
+            fm_lines.join("\n"),
+            clean_content
         );
 
         std::fs::create_dir_all(&self.skills_dir)
@@ -1007,9 +1007,6 @@ impl Tool for ImproveSkillTool {
         let Some(idx) = skills.iter().position(|s| s.metadata.name == name) else {
             return Err(format!("Skill '{}' not found.", name).into());
         };
-        if skills[idx].metadata.curated {
-            return Err(format!("Skill '{}' is curated (human-managed) and read-only; cannot auto-improve.", name).into());
-        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1044,7 +1041,7 @@ struct ListSkillsTool {
 #[async_trait]
 impl Tool for ListSkillsTool {
     fn name(&self) -> &str { "list_skills" }
-    fn description(&self) -> &str { "List all currently installed skills with their names, descriptions, and triggers." }
+    fn description(&self) -> &str { "List all currently installed skills with their names, descriptions, versions, and platforms." }
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
@@ -1056,7 +1053,11 @@ impl Tool for ListSkillsTool {
                 json!({
                     "name": s.metadata.name,
                     "description": s.metadata.description,
-                    "triggers": s.metadata.triggers,
+                    "version": s.metadata.version,
+                    "license": s.metadata.license,
+                    "platforms": s.metadata.platforms,
+                    "deps": s.metadata.deps,
+                    "allowed_tools": s.metadata.allowed_tools,
                     "enabled": s.metadata.enabled,
                     "skill_dir": s.skill_dir,
                 })
@@ -1222,7 +1223,16 @@ mod tests {
     #[test]
     fn eager_body_borrows_in_memory_content() {
         let sk = Skill {
-            metadata: SkillMetadata { name: "Eager".to_string(), description: "e".to_string(), triggers: vec![], enabled: true, always: false, when_to_use: String::new(), version: String::new(), curated: false },
+            metadata: SkillMetadata {
+                name: "Eager".to_string(),
+                description: "e".to_string(),
+                license: None,
+                version: String::new(),
+                platforms: vec![],
+                deps: vec![],
+                allowed_tools: vec![],
+                enabled: true,
+            },
             content: SkillContent::Eager("# Eager Body\n".to_string()),
             skill_dir: String::new(),
             contract: Arc::new(OnceLock::new()),
@@ -1232,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn build_skills_prompt_hot_cold_and_always() {
+    fn build_skills_prompt_matched_vs_cold() {
         let tmp = std::env::temp_dir().join(format!("rs_skill_prompt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("AlwaysSkill")).unwrap();
@@ -1240,29 +1250,28 @@ mod tests {
         std::fs::create_dir_all(tmp.join("ColdSkill")).unwrap();
         std::fs::create_dir_all(tmp.join("NoisySkill")).unwrap();
         std::fs::write(tmp.join("AlwaysSkill/SKILL.md"),
-            "---\nname: AlwaysSkill\ndescription: always available\nalways: true\ntriggers: []\n---\n# Always Body\n").unwrap();
+            "---\nname: AlwaysSkill\ndescription: always available\n---\n# Always Body\n").unwrap();
         std::fs::write(tmp.join("ProcessSkill/SKILL.md"),
-            "---\nname: ProcessSkill\ndescription: process reporting and triage\ntriggers: [process]\n---\n# Process Body\nStep here\n").unwrap();
+            "---\nname: ProcessSkill\ndescription: process report and triage\ntriggers: [process]\n---\n# Process Body\nStep here\n").unwrap();
         std::fs::write(tmp.join("ColdSkill/SKILL.md"),
-            "---\nname: ColdSkill\ndescription: unrelated cold skill\ntriggers: []\n---\n# Cold Body\n").unwrap();
-        // Weak match: generic browser-ish description whose triggers never
-        // fire for the query -- must stay in the on-demand catalog, not inline.
+            "---\nname: ColdSkill\ndescription: unrelated cold skill\n---\n# Cold Body\n").unwrap();
+        // Weak match: generic browser-ish description shares no tokens with the
+        // query -- must stay in the on-demand catalog, not inline.
         std::fs::write(tmp.join("NoisySkill/SKILL.md"),
-            "---\nname: NoisySkill\ndescription: browser automation page rendering\ntriggers: [bsk]\n---\n# Noisy Body\n").unwrap();
+            "---\nname: NoisySkill\ndescription: browser automation page rendering\n---\n# Noisy Body\n").unwrap();
 
         let mgr = SkillManager::new(tmp.to_str().unwrap());
 
         let (q_opt, q_act) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 20_000, 40, 3);
         let q = q_opt.expect("query section present");
         let ql = q.to_lowercase();
-        assert!(ql.contains("# always body"), "always body should be inlined: {}", q);
         assert!(ql.contains("# process body"), "matched body should be inlined: {}", q);
+        assert!(!ql.contains("# always body"), "non-matching skill must NOT be auto-inlined: {}", q);
+        assert!(ql.contains("alwaysskill"), "non-matching skill should still be catalogued: {}", q);
         assert!(ql.contains("coldskill"), "cold skill should be listed by name: {}", q);
-        // Weak/incidental overlap must NOT be hot-inlined (thClaws/microclaw
-        // explicit-activation model), but should remain listable on demand.
         assert!(!ql.contains("# noisy body"), "weak skill body must not be auto-inlined: {}", q);
         assert!(ql.contains("noisyskill"), "weak skill should still be catalogued: {}", q);
-        assert!(q_act, "non-always matched skill should mark task_skill_active");
+        assert!(q_act, "matched skill should mark task_skill_active");
 
         let (n_opt, _) = mgr.build_skills_prompt("process", SkillListingStrategy::NamesOnly, 20_000, 40, 3);
         let n = n_opt.expect("names section present");
@@ -1286,7 +1295,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("Alpha")).unwrap();
         std::fs::write(tmp.join("Alpha/SKILL.md"),
-            "---\nname: Alpha\ndescription: alpha\ntriggers: [alpha]\n---\n# Alpha\nalways: true\n").unwrap();
+            "---\nname: Alpha\ndescription: alpha\n---\n# Alpha\n").unwrap();
         let mgr = SkillManager::new(tmp.to_str().unwrap());
         assert!(!mgr.list().is_empty(), "Alpha skill should load");
         let (p, active) = mgr.build_skills_prompt("alpha", SkillListingStrategy::Disabled, 20_000, 40, 3);

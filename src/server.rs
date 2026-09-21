@@ -991,13 +991,10 @@ async fn skills_create_handler(
     let name = body["name"].as_str().unwrap_or("").to_string();
     let description = body["description"].as_str().unwrap_or("").to_string();
     let content = body["content"].as_str().unwrap_or("").to_string();
-    let triggers: Vec<String> = body["triggers"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
     if name.is_empty() || content.is_empty() {
         return Json(json!({ "success": false, "error": "Name and content are required" }));
     }
-    match state.skill_manager.create_skill(&name, &description, &triggers, &content) {
+    match state.skill_manager.create_skill(&name, &description, &content) {
         Ok(filename) => Json(json!({ "success": true, "filename": filename })),
         Err(e) => Json(json!({ "success": false, "error": e })),
     }

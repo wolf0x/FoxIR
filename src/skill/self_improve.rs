@@ -5,8 +5,7 @@
 //! (tool-error spikes, apology markers, empty final answer). Every change is:
 //! - version-bumped (frontmatter `version`),
 //! - backed up to `<skills>/_audit/<skill>-<ts>.skills.md` (revertible),
-//! - gated by a per-skill cooldown (manifest),
-//! - refused for human-curated (`curated: true`) skills.
+//! - gated by a per-skill cooldown (manifest).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,15 +103,11 @@ pub fn last_improved_at(skills_dir: &Path, name: &str) -> Option<u64> {
 }
 
 /// Should we allow improving this skill right now?
-/// - never for curated (human) skills,
-/// - not again within [`IMPROVE_COOLDOWN_SECS`].
+/// Not again within [`IMPROVE_COOLDOWN_SECS`].
 /// Cooldown is checked twice for persistence: the _audit manifest (authoritative)
 /// and, as a fallback when the manifest entry is missing, the `updated_at` field
 /// written into the skill's own frontmatter on the last improvement.
 pub fn should_improve(skills_dir: &Path, skill: &Skill, now: u64) -> bool {
-    if skill.metadata.curated {
-        return false;
-    }
     match last_improved_at(skills_dir, &skill.metadata.name) {
         Some(last) => now.saturating_sub(last) >= IMPROVE_COOLDOWN_SECS,
         None => {
@@ -294,17 +289,17 @@ mod tests {
         d
     }
 
-    fn skill(name: &str, version: &str, curated: bool) -> Skill {
+    fn skill(name: &str, version: &str) -> Skill {
         Skill {
             metadata: SkillMetadata {
                 name: name.to_string(),
                 description: String::new(),
-                triggers: vec![],
-                enabled: true,
-                always: false,
-                when_to_use: String::new(),
+                license: None,
                 version: version.to_string(),
-                curated,
+                platforms: vec![],
+                deps: vec![],
+                allowed_tools: vec![],
+                enabled: true,
             },
             content: crate::skill::SkillContent::Eager(format!("# {}\n", name)),
             contract: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -329,11 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn curated_refused_and_cooldown() {
+    fn cooldown_gates_improve() {
         let d = tmp("cooldown");
-        let curated = skill("B", "1.0.0", true);
-        assert!(!should_improve(&d, &curated, 1000), "curated must be read-only");
-        let fresh = skill("C", "1.0.0", false);
+        let fresh = skill("C", "1.0.0");
         assert!(should_improve(&d, &fresh, 1000), "fresh skill should be improvable");
         record_improved(&d, "C", 1000);
         assert!(!should_improve(&d, &fresh, 1000 + IMPROVE_COOLDOWN_SECS - 1));
@@ -346,7 +339,7 @@ mod tests {
         let recent: u64 = 5;
         std::fs::write(skdir.join("SKILL.md"),
             format!("---\nname: CFront\nversion: 1.0.0\nupdated_at: {}\n---\n\n# B\n", recent)).unwrap();
-        let mut cfront = skill("CFront", "1.0.0", false);
+        let mut cfront = skill("CFront", "1.0.0");
         cfront.skill_dir = skdir.to_string_lossy().to_string();
         assert!(!should_improve(&d, &cfront, recent), "frontmatter updated_at should gate");
         assert!(should_improve(&d, &cfront, recent + IMPROVE_COOLDOWN_SECS));
@@ -360,7 +353,7 @@ mod tests {
         std::fs::create_dir_all(&skdir).unwrap();
         std::fs::write(skdir.join("SKILL.md"),
             "---\nname: MySkill\ndescription: d\nversion: 1.0.0\n---\n\n# Old body\n").unwrap();
-        let mut sk = skill("MySkill", "1.0.0", false);
+        let mut sk = skill("MySkill", "1.0.0");
         sk.skill_dir = skdir.to_string_lossy().to_string();
         let v = apply_patch(&d, &sk, "# New body\nbetter steps").unwrap();
         assert_eq!(v, "1.0.1");
@@ -378,7 +371,7 @@ mod tests {
         let skdir = d.join("X");
         std::fs::create_dir_all(&skdir).unwrap();
         std::fs::write(skdir.join("SKILL.md"), "# body").unwrap();
-        let mut sk = skill("X", "1.0.0", false);
+        let mut sk = skill("X", "1.0.0");
         sk.skill_dir = skdir.to_string_lossy().to_string();
         let b = backup_skill(&d, &sk).unwrap();
         assert!(b.exists());

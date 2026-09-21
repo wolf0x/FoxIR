@@ -3140,14 +3140,16 @@ async function loadSkills(){
       el.innerHTML='<div class="mcp-grid">'+d.skills.map(s=>{
         const statusColor=s.enabled?'var(--green)':'var(--t3)';
         const statusText=s.enabled?'Enabled':'Disabled';
-        const triggers=(s.triggers||[]).map(t=>'<span class="skill-tag">'+esc(t)+'</span>').join('');
+        const platforms=(s.platforms||[]).map(t=>'<span class="skill-tag">'+esc(t)+'</span>').join('');
+        const deps=(s.deps||[]).map(t=>'<span class="skill-tag">'+esc('dep:'+t)+'</span>').join('');
         return '<div class="mcp-card">'+
           '<div class="mcp-card-header">'+
             '<span class="mcp-card-name">'+esc(s.name)+'<span class="skill-ver">'+(s.version?' v'+esc(s.version):' v1.0.0')+'</span></span>'+
             '<span class="mcp-status" style="color:'+statusColor+'">&#9679; '+statusText+'</span>'+
           '</div>'+
           (s.description?'<div class="mcp-tools">'+esc(s.description)+'</div>':'')+
-          (triggers?'<div class="skill-triggers">'+triggers+'</div>':'')+
+          (platforms?'<div class="skill-triggers"><span class="skill-tag" style="background:var(--t2)">platforms</span>'+platforms+'</div>':'')+
+          (deps?'<div class="skill-triggers"><span class="skill-tag" style="background:var(--t2)">deps</span>'+deps+'</div>':'')+
           '<div class="mcp-actions">'+
             '<button class="btn btn-s" style="padding:4px 10px;font-size:11px" onclick="toggleSkill(\''+esc(s.name)+'\')">'+(s.enabled?'Disable':'Enable')+'</button>'+
             '<button class="btn btn-d" style="padding:4px 10px;font-size:11px" onclick="deleteSkill(\''+esc(s.name)+'\')">Delete</button>'+
