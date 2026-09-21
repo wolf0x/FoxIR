@@ -21,7 +21,7 @@
 - [x] `deps` 存在性探测（PATH/exe 检查，`command_on_path`）；缺失不注册
 - [x] 门控原因落地为日志（`unavailable_reason`），不注册不可用技能
 - [x] `static/index.html` 卡片对齐：name + version + platforms + deps 徽标（`triggers` 已替换）
-- [ ] 前端按新字段 toggle/delete（按 name，去重）
+- [x] 前端按新字段 toggle/delete（按 name，去重；后端 delete/toggle/improve 统一为大小写不敏感匹配）
 
 ## P4 · 迁移现有 9 技能
 - [x] 9 个运行时技能（${workspace}/skills/*）frontmatter 已清洗：去 `triggers`，保留 name/description/version；备份于 output/skills-migration-*/

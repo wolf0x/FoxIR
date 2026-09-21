@@ -391,7 +391,8 @@ impl SkillManager {
     /// Delete a skill by name (removes the skill directory and reloads).
     pub fn delete_skill(&self, name: &str) -> Result<(), String> {
         let skills = self.skills.read().unwrap();
-        let skill = skills.iter().find(|s| s.metadata.name == name)
+        let name_lower = name.to_lowercase();
+        let skill = skills.iter().find(|s| s.metadata.name.to_lowercase() == name_lower)
             .ok_or_else(|| format!("Skill '{}' not found", name))?;
         let skill_dir = skill.skill_dir.clone();
         drop(skills);
@@ -422,7 +423,8 @@ impl SkillManager {
     /// Toggle a skill's enabled state.
     pub fn toggle_skill(&self, name: &str) -> Option<bool> {
         let mut skills = self.skills.write().unwrap();
-        let skill = skills.iter_mut().find(|s| s.metadata.name == name)?;
+        let name_lower = name.to_lowercase();
+        let skill = skills.iter_mut().find(|s| s.metadata.name.to_lowercase() == name_lower)?;
         skill.metadata.enabled = !skill.metadata.enabled;
         let enabled = skill.metadata.enabled;
         drop(skills);
@@ -1005,7 +1007,8 @@ impl Tool for ImproveSkillTool {
             return Err("Provide both 'name' and 'new_content'".into());
         }
         let mut skills = self.skills.write().unwrap();
-        let Some(idx) = skills.iter().position(|s| s.metadata.name == name) else {
+        let name_lower = name.to_lowercase();
+        let Some(idx) = skills.iter().position(|s| s.metadata.name.to_lowercase() == name_lower) else {
             return Err(format!("Skill '{}' not found.", name).into());
         };
         let now = std::time::SystemTime::now()
@@ -1341,6 +1344,24 @@ mod tests {
         assert!(loaded.contains(&"HostSkill".to_string()), "native-platform skill should load: {:?}", loaded);
         assert!(!loaded.contains(&"ForeignSkill".to_string()), "foreign-platform skill must NOT load: {:?}", loaded);
         assert!(!loaded.contains(&"DepSkill".to_string()), "missing-dep skill must NOT load: {:?}", loaded);
+    }
+
+    /// Name-keyed management is case-insensitive, matching the dedup in
+    /// `insert_skill_unique` — a delete/toggle by different case hits the
+    /// canonical skill (agentskills.io: `name` is the uniqueness key).
+    #[test]
+    fn delete_and_toggle_are_case_insensitive() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_case_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("MySkill")).unwrap();
+        std::fs::write(tmp.join("MySkill/SKILL.md"),
+            "---\nname: MySkill\ndescription: d\n---\n# B\n").unwrap();
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        assert!(mgr.list().iter().any(|m| m.name.eq_ignore_ascii_case("myskill")), "skill should load");
+        assert!(mgr.toggle_skill("myskill").is_some(), "toggle should match case-insensitively");
+        assert!(mgr.delete_skill("myskill").is_ok(), "delete should match case-insensitively");
+        assert!(mgr.list().is_empty(), "skill should be gone after delete: {:?}", mgr.list());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
 }
