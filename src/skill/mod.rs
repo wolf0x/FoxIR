@@ -1364,6 +1364,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The installed skill-creator port must parse as a valid agentskills.io
+    /// Skill — required name/description plus optional version/platforms.
+    #[test]
+    fn load_agentskills_skill_creator_frontmatter() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_creator_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("skill-creator")).unwrap();
+        std::fs::write(tmp.join("skill-creator/SKILL.md"),
+            "---\nname: skill-creator\ndescription: \"Create, modify and improve agent skills and measure their performance.\"\nversion: \"1.0.0\"\nplatforms: [windows, macos, linux]\n---\n\n# Skill Creator\n").unwrap();
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let list = mgr.list();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(list.len(), 1, "skill should load: {:?}", list);
+        let m = &list[0];
+        assert_eq!(m.name, "skill-creator");
+        assert_eq!(m.version, "1.0.0");
+        assert_eq!(m.platforms, vec!["windows".to_string(), "macos".to_string(), "linux".to_string()]);
+        assert!(m.enabled, "newly installed skill should default to enabled");
+    }
+
 }
 
 

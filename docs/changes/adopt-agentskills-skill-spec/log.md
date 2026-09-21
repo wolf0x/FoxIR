@@ -16,6 +16,7 @@
 | 2026-09-21 | P4 | 迁移 9 个运行时技能 frontmatter（去 triggers） | 备份 output/skills-migration-*/；huashu 中文/版本完好；无 triggers 残留 | ${workspace}/skills |
 | 2026-09-21 | P5 | 遥测计量 + 端点 + 前端 | `src/skill/metrics.rs`；`GET /api/skills/metrics`；技能页遥测行 | metrics.rs / server.rs |
 | 2026-09-21 | 决策 | 不重加 `lexical` 回退模式 | 与移除词面打分方向一致；`router_mode:"llm"`；listing 策略仍可调 | — |
+| 2026-09-21 | 外部 | 安装 anthropics skill-creator（去 Claude 化） | 改写为 agentskills.io frontmatter（name/description/version/platforms）；安装于 workspace/skills/skill-creator；结构校验 + FoxIR 解析单测 31/31 通过 | workspace/skills/skill-creator |
 
 ## 数据（灰度对比）
 
