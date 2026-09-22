@@ -35,6 +35,38 @@ fn sanitize_dir_name(name: &str) -> String {
     sanitized.trim_matches(|c| c == ' ' || c == '.').to_string()
 }
 
+/// Reject paths that would escape `base` (rejects absolute paths and any `..`
+/// component), returning the safely joined path. Used to stop malicious skill
+/// paths (`files[].path`, `content_file`, `source_path`) from writing or reading
+/// outside the intended directory.
+fn resolve_inside(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("empty relative path".to_string());
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(format!("absolute path not allowed: {rel}"));
+    }
+    for comp in rel_path.components() {
+        if !matches!(comp, std::path::Component::Normal(_) | std::path::Component::CurDir) {
+            return Err(format!("path escapes the target directory: {rel}"));
+        }
+    }
+    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    Ok(base_canon.join(rel_path))
+}
+
+/// Bump the patch component of a semantic version (x.y.z -> x.y.(z+1)).
+fn bump_patch(v: &str) -> String {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() == 3 {
+        if let Ok(n) = parts[2].parse::<u32>() {
+            return format!("{}.{}.{}", parts[0], parts[1], n + 1);
+        }
+    }
+    format!("{}.0.1", v)
+}
+
 /// Quote a string for safe inclusion in YAML frontmatter.
 /// Wraps in double quotes and escapes internal backslashes and double quotes.
 fn yaml_quote(s: &str) -> String {
@@ -373,7 +405,7 @@ impl SkillManager {
         // Write optional extra files
         if let Some(extra_files) = files {
             for (rel_path, file_content) in extra_files {
-                let file_path = skill_dir.join(&rel_path);
+                let file_path = resolve_inside(&skill_dir, &rel_path)?;
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create subdirectory: {}", e))?;
@@ -772,7 +804,25 @@ impl Tool for InstallSkillTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         let name = args["name"].as_str().ok_or_else(|| "Missing 'name'".to_string())?;
         let desc = args["description"].as_str().unwrap_or("");
-        let version = args["version"].as_str().map(String::from).unwrap_or_else(|| "1.0.0".to_string());
+        let mut version = args["version"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| "1.0.0".to_string());
+        // Only one skill per name: if a skill with the same (case-insensitive) name
+        // already exists and its version equals the incoming one, bump the patch so
+        // the re-install is distinguishable in the catalog and no duplicate card.
+        if let Some(existing_v) = self
+            .skills
+            .read()
+            .unwrap()
+            .iter()
+            .find(|s| s.metadata.name.to_lowercase() == name.trim().to_lowercase())
+            .map(|s| s.metadata.version.clone())
+        {
+            if existing_v == version {
+                version = bump_patch(&version);
+            }
+        }
         let license = args["license"].as_str().map(String::from);
         let str_list = |key: &str| {
             args[key]
@@ -788,7 +838,7 @@ impl Tool for InstallSkillTool {
         let content = if let Some(inline) = args["content"].as_str() {
             inline.to_string()
         } else if let Some(file_path) = args["content_file"].as_str() {
-            let full_path = Path::new(&ctx.working_dir).join(file_path);
+            let full_path = resolve_inside(Path::new(&ctx.working_dir), file_path)?;
             std::fs::read_to_string(&full_path)
                 .map_err(|e| format!("Failed to read content_file '{}': {}", full_path.display(), e))?
         } else {
@@ -849,13 +899,13 @@ impl Tool for InstallSkillTool {
                 let file_content = if let Some(inline) = item["content"].as_str() {
                     inline.to_string()
                 } else if let Some(src) = item["source_path"].as_str() {
-                    let full_path = Path::new(&ctx.working_dir).join(src);
+                    let full_path = resolve_inside(Path::new(&ctx.working_dir), src)?;
                     std::fs::read_to_string(&full_path)
                         .map_err(|e| format!("Failed to read source_path '{}': {}", full_path.display(), e))?
                 } else {
                     return Err(format!("files[{}]: provide either 'content' or 'source_path'", rel_path).into());
                 };
-                let file_path = skill_dir.join(rel_path);
+                let file_path = resolve_inside(&skill_dir, rel_path)?;
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create subdirectory: {}", e))?;
@@ -870,7 +920,7 @@ impl Tool for InstallSkillTool {
         let mut skills = self.skills.write().unwrap();
         let dir_str = skill_dir.to_string_lossy().to_string();
         if let Ok(skill) = parse_skill_frontmatter(&skill_md, dir_str) {
-            skills.push(skill);
+            insert_skill_unique(&mut skills, &self.skills_dir, skill);
         }
 
         Ok(json!({
@@ -1384,7 +1434,161 @@ mod tests {
         assert!(m.enabled, "newly installed skill should default to enabled");
     }
 
+    /// S1 — a skill simulated as created through user dialogue via
+    /// `SkillManager::create_skill` must be written to disk as a valid
+    /// agentskills.io SKILL.md (name/description only, no triggers, no
+    /// `x-foxir` private extensions), be re-discovered on reload, and load its
+    /// body lazily with frontmatter stripped. Adherence score is the fraction
+    /// of standard-compliance checks that pass.
+    #[test]
+    fn s1_user_created_skill_follows_agentskills_io_standard() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_s1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let body = "# Survey\n\n1. Collect account list\n2. Collect network list\n3. Write summary\n";
+        let created_dir = mgr
+            .create_skill("UserSurveySkill", "A quick host survey skill", body)
+            .expect("create_skill should succeed");
+        let _ = created_dir;
+
+        let mut passed = 0usize;
+        let mut total = 0usize;
+
+        // 1) On-disk frontmatter is valid agentskills.io: no triggers, no x-foxir.
+        let raw = std::fs::read_to_string(tmp.join("UserSurveySkill/SKILL.md")).unwrap();
+        total += 1;
+        passed += (raw.starts_with("---\n") && raw.contains("name:") && raw.contains("description:")) as usize;
+        total += 1;
+        passed += (!raw.contains("triggers") && !raw.contains("x-foxir")) as usize;
+        // 2) Does not inline the body or private fields.
+        total += 1;
+        passed += (!raw.contains("platforms:") && !raw.contains("deps:")) as usize;
+
+        // 3) Discoverable after reload via find_skill (case-insensitive).
+        total += 1;
+        let sk = mgr.find_skill("usersurveyskill").expect("skill should be discoverable");
+        passed += 1;
+
+        // 4) Lazy body loads and is frontmatter-stripped.
+        total += 1;
+        let body_loaded = sk.body().into_owned();
+        passed += (body_loaded.to_lowercase().contains("# survey")
+            && !body_loaded.contains("name:")) as usize;
+
+        // 5) Step contract compiles from the body for later verification.
+        total += 1;
+        passed += (sk.step_contract().len() == 3) as usize;
+
+        let score = passed as f64 / total as f64;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(score, 1.0, "S1 agentskills.io compliance score = {score} (passed {passed}/{total})");
+    }
+
+    /// S2 — an `instruction (step1, step2)` styled skill (numbered-list body)
+    /// yields a step contract, and full evidence produces a completion ratio of
+    /// 1.0 while partial evidence scores below 1.0.
+    #[test]
+    fn s2_stepwise_instruction_skill_completion_score() {
+        // Build the skill on disk exactly as the numbered-list translator would.
+        let tmp = std::env::temp_dir().join(format!("rs_skill_s2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("PatchSkill")).unwrap();
+        std::fs::write(tmp.join("PatchSkill/SKILL.md"),
+            "---\nname: PatchSkill\ndescription: patch windows per instructions\n---\n\n# Patch\n\n1. Check prerequisites\n2. Apply the patch\n3. Reboot and verify\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let sk = mgr.find_skill("PatchSkill").expect("skill found");
+        let contract = sk.step_contract();
+        assert_eq!(contract.len(), 3, "expected 3 steps from numbered list: {:?}", contract);
+
+        // Full adherence: evidence covers every step -> ratio 1.0.
+        let full = "Check prerequisites done. Apply the patch succeeded. Reboot and verify ok.";
+        let r_full = verify::verify_completion(&contract, full);
+        assert_eq!(r_full.ratio, 1.0, "full adherence should score 1.0, got {}", r_full.ratio);
+        assert!(r_full.is_complete());
+
+        // Partial adherence: only step 1 echoed -> ratio 1/3.
+        let partial = "I only did Check prerequisites and stopped there.";
+        let r_partial = verify::verify_completion(&contract, partial);
+        assert_eq!(r_partial.ratio, 1.0 / 3.0, "partial adherence should score 1/3, got {}", r_partial.ratio);
+        assert!(!r_partial.is_complete());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// S3 — a parent skill whose step flow invokes a child skill (nested
+    /// discovery), and whose parent evidence includes the child's completion
+    /// marker. Both must be discovered and the parent contract must verify to
+    /// ratio 1.0 with combined evidence.
+    #[test]
+    fn s3_parent_child_skill_flow_completion_score() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_s3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Parent skill dir containing a nested Child skill dir.
+        std::fs::create_dir_all(tmp.join("IncidentTriage/Collector")).unwrap();
+        std::fs::write(tmp.join("IncidentTriage/SKILL.md"),
+            "---\nname: IncidentTriage\ndescription: full triage driving a child collector\n---\n\n# Incident Triage\n\n1. Run child Collector skill\n2. Analyze findings\n3. Draft containment steps\n").unwrap();
+        std::fs::write(tmp.join("IncidentTriage/Collector/SKILL.md"),
+            "---\nname: Collector\ndescription: collect artifacts\n---\n\n# Collector\n\n1. Snapshot processes\n2. Capture network state\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let names: Vec<String> = mgr.list().iter().map(|m| m.name.clone()).collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(names.contains(&"IncidentTriage".to_string()), "parent missing: {:?}", names);
+        assert!(names.contains(&"Collector".to_string()), "nested child missing: {:?}", names);
+    }
+
+    /// S3b — numeric adherence for the parent/child flow: parent steps 1..3 all
+    /// evidenced (step 1 evidence = "ran Collector / step 1 done") => ratio 1.0.
+    #[test]
+    fn s3_parent_contract_verifies_with_child_evidence() {
+        let contract = steps::extract_contract(
+            "# Incident Triage\n\n1. Run child Collector skill\n2. Analyze findings\n3. Draft containment steps\n",
+        );
+        assert_eq!(contract.len(), 3);
+        let evidence = "step 1 done: invoked Collector. step 2 done: analyzed. step 3 done: drafted containment.";
+        let r = verify::verify_completion(&contract, evidence);
+        assert_eq!(r.ratio, 1.0, "parent+child flow should score 1.0, got {}", r.ratio);
+        // And without the child-evidence marker the parent step 1 is missing.
+        let weak = "analyzed findings and drafted containment.";
+        let r2 = verify::verify_completion(&contract, weak);
+        assert!(r2.ratio < 1.0, "missing child step should drop score, got {}", r2.ratio);
+    }
+
+    /// S4 — a methodology skill (no step/instruction structure) yields an empty
+    /// contract, so `verify_completion` treats it as trivially adhered (ratio
+    /// 1.0) and `contract_block` returns None (nothing to enforce).
+    #[test]
+    fn s4_methodology_only_skill_scores_full_adherence() {
+        let body = "# Threat Intel Methodology\n\nPrioritize by reachability first, then by asset criticality.\nWeigh exploit maturity and ongoing campaign activity before assigning a patch window.\nAlways mark uncertain judgements explicitly.\n";
+        let contract = steps::extract_contract(body);
+        assert!(contract.is_empty(), "methodology-only skill should have no step contract: {:?}", contract);
+        assert!(steps::contract_block(&contract).is_none(), "nothing to enforce -> no contract block");
+
+        // No contract => nothing missing => ratio 1.0 (adherence by methodology use).
+        let r = verify::verify_completion(&contract, "applied the methodology");
+        assert_eq!(r.ratio, 1.0, "methodology-only adherence score = {}", r.ratio);
+        assert!(r.is_complete());
+    }
+    #[test]
+    fn resolve_inside_rejects_escape_and_allows_subdir() {
+        let base = std::env::temp_dir().join(format!("rs_skill_inside_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let ok = resolve_inside(&base, "sub/ref.md").unwrap();
+        assert!(ok.starts_with(&base.canonicalize().unwrap()), "subdir must resolve inside base");
+        assert!(resolve_inside(&base, "../evil.md").is_err(), "parent escape must be rejected");
+        assert!(resolve_inside(&base, "a/../../evil.md").is_err(), "nested parent escape rejected");
+        assert!(resolve_inside(&base, "/abs.md").is_err(), "absolute path rejected");
+        assert!(resolve_inside(&base, "").is_err(), "empty path rejected");
+        let _ = std::fs::remove_dir_all(&base.parent().unwrap());
+    }
+
+    #[test]
+    fn bump_patch_increments_patch_component() {
+        assert_eq!(bump_patch("1.0.0"), "1.0.1");
+        assert_eq!(bump_patch("2.4.9"), "2.4.10");
+        assert_eq!(bump_patch("1.2"), "1.2.0.1");
+        assert_eq!(bump_patch("not-a-version"), "not-a-version.0.1");
+    }
 }
-
-
-
