@@ -124,6 +124,35 @@ impl PromptTier {
     }
 }
 
+/// Assemble the request message array: stable system prompt head, history,
+/// and the volatile per-run state block. The volatile block goes immediately
+/// BEFORE the latest user message, never at the very end: a trailing system
+/// block breaks some providers' chat templates and puts state text (e.g. the
+/// context-budget note) in the recency-hot position, which biases weaker
+/// models toward stopping mid-answer. The cache-relevant prefix
+/// (stable system + prior history) is unaffected either way.
+fn assemble_messages(
+    stable_system: &str,
+    history: &[ChatMessage],
+    volatile_state: &str,
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(2 + history.len());
+    messages.push(ChatMessage::system(stable_system));
+    if volatile_state.trim().is_empty() {
+        messages.extend(history.iter().cloned());
+        return messages;
+    }
+    let split_at = history
+        .iter()
+        .rposition(|m| m.role == "user")
+        .map(|i| i)
+        .unwrap_or(history.len());
+    messages.extend(history[..split_at].iter().cloned());
+    messages.push(ChatMessage::system(volatile_state));
+    messages.extend(history[split_at..].iter().cloned());
+    messages
+}
+
 /// Strict pure-greeting test - deliberately much stricter than
 /// `looks_like_greeting` (which only detects language-neutral small talk for
 /// the language rule): the ENTIRE message, stripped of punctuation, must
@@ -1826,7 +1855,7 @@ impl Agent for LlmAgent {
                     ],
                 );
                 volatile_state.push_str(&format!(
-                    "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Tools: {} | Memory: {} | Knowledge: {} | SOP: {} | History: {}\nPrioritize high-value content and trim/stop before exceeding the window.\n=== END BUDGET ===",
+                    "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Tools: {} | Memory: {} | Knowledge: {} | SOP: {} | History: {}\nPrioritize high-value content; hard limits are enforced by the system.\n=== END BUDGET ===",
                     report.window, report.used, report.free,
                     base_system, tools_toks, memory_toks, knowledge_toks, sop_toks, history_toks,
                 ));
@@ -1950,15 +1979,10 @@ impl Agent for LlmAgent {
                     info!("[session:{}] History trimmed from {} to {} est. tokens", session_id, total_tokens, new_tokens);
                 }
 
-                let mut messages = Vec::with_capacity(2 + history.len());
-                messages.push(ChatMessage::system(&stable_system_prompt));
-                messages.extend(history.iter().cloned());
-                // Trailing volatile state (date/lang/TODO/evidence/guidance/
-                // budget): placed after history so the system prompt +
-                // history prefix stays byte-stable across runs for caching.
-                if !volatile_state.trim().is_empty() {
-                    messages.push(ChatMessage::system(&volatile_state));
-                }
+                // Volatile state (date/lang/TODO/evidence/guidance/budget) is
+                // inserted before the latest user message — never appended as
+                // the trailing message (see assemble_messages).
+                let messages = assemble_messages(&stable_system_prompt, &history, &volatile_state);
 
                 // Build tool definitions for this request: core tools + the
                 // load_tool_schema helper + any peripheral tools already loaded.
@@ -3671,6 +3695,36 @@ mod tests {
         assert!(!is_ir_collection_batch(&[tc("ir_scan")]));
         // mixed with a non-collection tool -> not an IR batch
         assert!(!is_ir_collection_batch(&[tc("ir_scan"), tc("file_read")]));
+    }
+
+    #[test]
+    fn volatile_state_never_trails_the_request() {
+        let h = vec![
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("current question"),
+        ];
+        let msgs = assemble_messages("STABLE", &h, "VOLATILE");
+        // Layout: system head, prior history, volatile block, current user turn last.
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content_as_text().as_deref(), Some("STABLE"));
+        assert_eq!(msgs.last().unwrap().role, "user");
+        assert_eq!(
+            msgs.last().unwrap().content_as_text().as_deref(),
+            Some("current question")
+        );
+        let vol_pos = msgs
+            .iter()
+            .position(|m| m.content_as_text().as_deref() == Some("VOLATILE"))
+            .unwrap();
+        assert_eq!(vol_pos, 3, "volatile must sit right before the current user turn");
+        // No volatile block: layout untouched.
+        let plain = assemble_messages("STABLE", &h, "");
+        assert_eq!(plain.len(), 1 + h.len());
+        // Empty history: volatile goes right after the system head.
+        let only = assemble_messages("STABLE", &[], "V");
+        assert_eq!(only.len(), 2);
+        assert_eq!(only[1].content_as_text().as_deref(), Some("V"));
     }
 
     #[test]

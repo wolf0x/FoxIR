@@ -49,7 +49,7 @@
 **Stable/Volatile 二分**：
 
 - **Stable head**（`build_system_prompt` 输出）：身份、User Identity、温暖总纲、问候规则、路由、工具规则、workspace 配置文件、skills 目录——所有不随单轮变化的内容。
-- **Volatile state**：日期、本轮 LANGUAGE RULE、TODO 块、证据台账、记忆/知识/SOP 混合价值池（Context Guidance）、CONTEXT BUDGET 仪表盘——收集到 `state_core` / `volatile_state`，在消息装配时作为独立 system 消息**追加在 history 之后**（`llm_agent.rs` 主循环内的 messages 组装点）。近因位置对模型同样显著，且不再污染可缓存前缀。
+- **Volatile state**：日期、本轮 LANGUAGE RULE、TODO 块、证据台账、记忆/知识/SOP 混合价值池（Context Guidance）、CONTEXT BUDGET 仪表盘——收集到 `state_core` / `volatile_state`，在消息装配时作为独立 system 消息**插入到最后一条 user 消息之前**（`llm_agent.rs` 的 `assemble_messages`）。**不得追加在末尾**：尾部 system 块会把预算提示等文本放到近因最热的位置，弱指令层级模型会把它误当作当前操作指令（实战教训：DeepSeek-V4-Flash 读到末尾的 "trim/stop" 后叙述一半就提前收尾）。缓存前缀不受影响。
 
 预算会计同步调整：`system_tokens = estimate_tokens(stable) + estimate_tokens(volatile)`，history 预算按真实总占用扣减；`/api/budget` 仪表盘数据源不变。
 
