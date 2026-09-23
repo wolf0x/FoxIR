@@ -2,6 +2,16 @@
 
 pub mod openai;
 
+// ============================================================
+// LLM 请求超时默认值
+// ============================================================
+//
+// 这两个常量替代旧实现里 reqwest `ClientBuilder::timeout` 的 total deadline 语义。
+/// 读间隔上限（秒）。计时在每次成功读取后重置，只在中途真正静默时触发。
+pub const DEFAULT_LLM_READ_TIMEOUT_SECS: u64 = 300;
+/// 连接阶段超时（秒）。未设 total deadline 时必需的连接保护。
+pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 20;
+
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};

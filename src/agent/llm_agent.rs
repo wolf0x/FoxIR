@@ -46,6 +46,58 @@ pub fn is_ir_collection_batch(tool_calls: &[crate::model::ToolCallDelta]) -> boo
         })
 }
 
+/// 传输层截断（流被传输错误切断）后的补救决定。
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamCutRecovery {
+    /// 已无补救预算：本轮以残缺文本收尾，由主循环判定为失败结局。
+    Exhausted,
+    /// 有补救预算：把残文并入历史并再请求一轮继续收尾。
+    Continue {
+        /// 从截断流中解析出、已丢弃的工具调用数量（其参数是残缺的）。
+        dropped_tool_calls: usize,
+    },
+}
+
+/// 传输层截断后如何处置。read_timeout / 中途断连都只留下残缺前缀，与模型是否给出回答无关；
+/// 未处理时前端只会收到残缺片段，而主循环却按正常文本回答收尾。
+/// 从截断流解析出的工具调用参数残缺，任何情况下都要丢弃。
+pub fn classify_stream_cut(
+    stream_timed_out: bool,
+    parsed_tool_calls: usize,
+    recoveries_used: u32,
+    max_recoveries: u32,
+) -> Option<StreamCutRecovery> {
+    if !stream_timed_out {
+        return None;
+    }
+    if recoveries_used >= max_recoveries {
+        return Some(StreamCutRecovery::Exhausted);
+    }
+    Some(StreamCutRecovery::Continue { dropped_tool_calls: parsed_tool_calls })
+}
+
+/// 文本回路自动停止判定。截断回合的 fragment 是残缺前缀，既不推进重复计数，也不得在随后的完整回合里误触发自动停止。
+pub fn should_auto_stop_text_loop(
+    stream_timed_out: bool,
+    resp_digest: u64,
+    last_resp_digest: &mut u64,
+    consecutive_resp: &mut usize,
+    limit: usize,
+) -> bool {
+    if stream_timed_out {
+        *consecutive_resp = 0;
+        *last_resp_digest = 0;
+        return false;
+    }
+    if resp_digest == *last_resp_digest {
+        *consecutive_resp += 1;
+    } else {
+        *last_resp_digest = resp_digest;
+        *consecutive_resp = 1;
+    }
+    *consecutive_resp >= limit
+}
+
 /// Estimate token count from text content (delegates to the unified
 /// CJK-aware estimator in `deep_memory` so all budget accounting agrees).
 fn estimate_tokens(text: &str) -> usize {
@@ -1833,6 +1885,10 @@ impl Agent for LlmAgent {
             let mut used_fallback = false;
             let mut has_executed_tools = false;
             let mut reprompt_count = 0u32;
+            // 传输层截断补救计数器。流被传输错误切断时把已流出的残文并入历史，并要求模型从中断处继续。
+            // 上限为 1，避免同一次故障反复触发、堆叠出不可控的额外轮次。
+            const MAX_STREAM_RECOVERIES: u32 = 1;
+            let mut stream_recoveries = 0u32;
             // SOP 结果记录（A1）运行级状态
             let mut active_sop_id = active_sop_id;
             let run_started = std::time::Instant::now();
@@ -1941,7 +1997,7 @@ impl Agent for LlmAgent {
                     .await;
 
                 match result {
-                    Ok((content, reasoning, tool_calls, usage, finish_reason)) => {
+                    Ok((content, reasoning, tool_calls, usage, finish_reason, stream_timed_out)) => {
                         // Text-loop detection: halt when the assistant emits the same
                         // textual turn repeatedly with no visible progress. v1.0.11: only
                         // NON-tool rounds are counted — a pure tool-call turn for a
@@ -1954,14 +2010,10 @@ impl Agent for LlmAgent {
                             // A narration-only round breaks any contiguous tool-batch loop.
                             prev_rabbit_batch = None;
                             rabbit_streak = 0;
+                            // 文本回路判定。截断回合的 fragment 是残缺前缀，不代表模型主动重复，也不该推进重复计数，
+                            // 否则连续截断回合之后，一个本需transport补救的完整回合会误触发自动停止。
                             let resp_digest = content_digest(&format!("{}\n{}", content, reasoning));
-                            if resp_digest == last_resp_digest {
-                                consecutive_resp += 1;
-                            } else {
-                                last_resp_digest = resp_digest;
-                                consecutive_resp = 1;
-                            }
-                            if consecutive_resp >= TEXT_REPEAT_LIMIT {
+                            if should_auto_stop_text_loop(stream_timed_out, resp_digest, &mut last_resp_digest, &mut consecutive_resp, TEXT_REPEAT_LIMIT) {
                                 warn!("[session:{}] Text-loop: identical assistant turn repeated {} times; terminating with summary", session_id, consecutive_resp);
                                 let _ = tx.send(Ok(AgentEvent::text(
                                     &format!("\n\n*[Auto-stop] The agent repeated the same response {} times without progress. Stopping. Send a new message to continue.*\n\n", consecutive_resp),
@@ -1995,7 +2047,11 @@ impl Agent for LlmAgent {
                         // reasoning_content (DeepSeek thinking mode puts
                         // everything in reasoning_content, leaving content
                         // empty).
-                        let mut tool_calls = if tool_calls.is_empty() {
+                        // A cut stream leaves reasoning_content that may contain a partial tool-call
+                        // envelope. Treating that fragment as "the model wants to use a tool" would
+                        // fall into the re-prompt path with nothing usable to retry, so suppression
+                        // applies here and the dedicated transport recovery below takes over.
+                        let mut tool_calls = if tool_calls.is_empty() && !stream_timed_out {
                             info!("[session:{}] No native tool_calls from API, attempting text extraction (content={} chars, reasoning={} chars)",
                                   session_id, content.len(), reasoning.len());
                             let mut extracted = extract_tool_calls_from_content(&content);
@@ -2026,7 +2082,10 @@ impl Agent for LlmAgent {
                         let combined = if content.trim().is_empty() { &reasoning } else { &content };
                         info!("[session:{}] Response analysis: content={} chars, reasoning={} chars, native_tool_calls={}",
                               session_id, content.len(), reasoning.len(), tool_calls.len());
-                        if tool_calls.is_empty() && !tool_defs.is_empty() && !has_executed_tools && reprompt_count < 2 && !combined.trim().is_empty() {
+                        // stream_timed_out: a cut round is handled by the dedicated transport
+                        // recovery below, not by the malformed-envelope re-prompt (which would
+                        // re-ask with a correction unrelated to the real cause).
+                        if tool_calls.is_empty() && !stream_timed_out && !tool_defs.is_empty() && !has_executed_tools && reprompt_count < 2 && !combined.trim().is_empty() {
                             // D3 根治：是否重提示改由结构化 decide_turn 决定；散文信号
                             // （工具名子串 / 意图词 / 长度阈值）全部删除，不再参与决策。
                             // 一段实质文本回答永远被接受为 Answer（治愈“复述含 browser_cdp 的记忆”误触）。
@@ -2082,12 +2141,64 @@ impl Agent for LlmAgent {
                                 continue;
                             }
                         }
+                        // ── Transport-cut recovery ──
+                        // A transport error can cut the stream mid-transmission, whether or not the
+                        // fragment happens to contain usable tool calls. Both existing gates fail
+                        // to cover this: the malformed-envelope re-prompt is gated by
+                        // has_executed_tools, and the empty-response summary is gated by content
+                        // being empty. Leaving it unhandled makes the loop report a normal text
+                        // answer while the client only ever received the truncated prefix
+                        // (observed worst case: 7 characters), forcing a manual continue.
+                        // Tool calls parsed out of a cut stream carry truncated arguments; executing
+                        // them would fail JSON parsing or run with wrong values. They are dropped here,
+                        // before the budget check, so a cut round never reaches tool execution even
+                        // when no recovery attempt is left.
+                        let cut = classify_stream_cut(
+                            stream_timed_out, tool_calls.len(), stream_recoveries, MAX_STREAM_RECOVERIES,
+                        );
+                        if stream_timed_out {
+                            tool_calls.clear();
+                        }
+                        if let Some(StreamCutRecovery::Continue { dropped_tool_calls }) = cut {
+                            stream_recoveries += 1;
+                            warn!("[session:{}] Stream cut by transport error (content {} chars, reasoning {} chars, {} parsed tool call(s) dropped); transport recovery {}/{}",
+                                  session_id, content.chars().count(), reasoning.chars().count(), dropped_tool_calls, stream_recoveries, MAX_STREAM_RECOVERIES);
+                            // The truncated text was already streamed to the client, so it has to
+                            // go into history verbatim to keep history and UI consistent. It is
+                            // pushed as plain assistant text: a cut fragment can contain an
+                            // unfinished tool-call envelope that must not be serialised as tool_calls.
+                            // Do not push the dropped tool calls to history.
+                            if !content.trim().is_empty() {
+                                history.push(ChatMessage::assistant(&content));
+                            }
+                            history.push(ChatMessage::user(
+                                "[STREAM CUT] Your previous response was cut off mid-transmission by a transport error; what was received is truncated, not a deliberate stop. \
+                                 Continue from exactly where it stopped: output the remainder and finish the turn. \
+                                 Do NOT repeat the truncated text and do NOT re-call tools whose results you already have.",
+                            ));
+                            let _ = tx.send(Ok(AgentEvent::text(
+                                if dropped_tool_calls > 0 {
+                                    "\n\n*[Stream cut by transport error; incomplete tool call(s) dropped — asking the model to continue]*\n\n"
+                                } else {
+                                    "\n\n*[Stream cut by transport error — asking the model to continue]*\n\n"
+                                },
+                                &invocation_id, &author
+                            ))).await;
+                            continue;
+                        }
                         if tool_calls.is_empty() {
                             // Text response - done
                             // PROBE: completion signal for diagnosis (real finish_reason + stub detection)
                             let _probe_rlen = reasoning.chars().count();
                             let _probe_clen = content.chars().count();
                             let _probe_stub = _probe_clen == 0 || (_probe_rlen > 256 && _probe_clen * 4 < _probe_rlen);
+                            if cut == Some(StreamCutRecovery::Exhausted) {
+                                // 到达这里说明补救预算已耗尽（预算可用时会在上方向 continue）。
+                                // 本轮以残缺文本收尾，结局判定为失败，供 SOP 学习与人工排查使用。
+                                warn!("[session:{}] Stream cut by transport error and recovery budget exhausted; ending turn with truncated text ({} chars)",
+                                      session_id, content.chars().count());
+                                run_has_error = true;
+                            }
                             info!("[session:{}] COMPLETE_PROBE finish_reason={:?} content={}chars reasoning={}chars stub={} has_executed_tools={} reprompt_count={}",
                                   session_id, finish_reason, _probe_clen, _probe_rlen, _probe_stub, has_executed_tools, reprompt_count);
                             info!("[session:{}] Agent completed with text response ({} chars, {} tool calls)", session_id, content.len(), tool_calls.len());
@@ -2121,8 +2232,10 @@ impl Agent for LlmAgent {
                                 summary_msgs.extend(history.clone());
                                 // One more LLM call for summary (no tools) - streams to client
                                 match provider.chat_stream(&active_model, &summary_msgs, &[], tx.clone(), &invocation_id, &author).await {
-                                    Ok((summary_content, _, _, _, _)) => {
-                                        if summary_content.trim().is_empty() {
+                                    Ok((summary_content, _, _, _, _, stream_timed_out)) => {
+                                        // A cut summary round leaves only a truncated prefix on the client, so treat it like an
+                                        // empty summary and stream the static summary in full.
+                                        if stream_timed_out || summary_content.trim().is_empty() {
                                             (generate_static_summary(&history, iteration + 1), false)
                                         } else {
                                             (summary_content, true) // already streamed
@@ -2560,9 +2673,10 @@ impl Agent for LlmAgent {
             let mut summary_msgs = vec![ChatMessage::system(&system_prompt)];
             summary_msgs.extend(history.clone());
             match provider.chat_stream(&active_model, &summary_msgs, &[], tx.clone(), &invocation_id, &author).await {
-                Ok((summary_content, _, _, _, _)) => {
-                    if summary_content.trim().is_empty() {
-                        // LLM returned empty, send static summary
+                Ok((summary_content, _, _, _, _, stream_timed_out)) => {
+                    // A cut summary round leaves a truncated prefix on the client; stream the static summary in full.
+                    if stream_timed_out || summary_content.trim().is_empty() {
+                        // LLM returned empty or was cut mid-transmission, send static summary
                         let fallback = generate_static_summary(&history, max_iter);
                         let _ = tx.send(Ok(AgentEvent::text(&fallback, &invocation_id, &author))).await;
                     }
@@ -3599,6 +3713,78 @@ mod tests {
         // (they travel in the trailing volatile state message).
         assert!(!minimal.contains("LANGUAGE RULE"));
         assert!(!full.contains("Current date:"));
+    }
+
+    /// 未发生传输层截断时，分类函数不得介入，避免正常回合被误判为需要补救。
+    #[test]
+    fn stream_cut_not_classified_when_stream_intact() {
+        assert_eq!(classify_stream_cut(false, 0, 0, 1), None);
+        assert_eq!(classify_stream_cut(false, 3, 0, 1), None);
+    }
+
+    /// 有预算时按“继续收尾”处理，并如实报告丢弃的残缺工具调用数量。
+    #[test]
+    fn stream_cut_continues_with_budget() {
+        assert_eq!(
+            classify_stream_cut(true, 0, 0, 1),
+            Some(StreamCutRecovery::Continue { dropped_tool_calls: 0 })
+        );
+        assert_eq!(
+            classify_stream_cut(true, 2, 0, 1),
+            Some(StreamCutRecovery::Continue { dropped_tool_calls: 2 })
+        );
+    }
+
+    /// 预算耗尽时不得再补一轮，改判为失败结局（供 SOP 学习与人工排查）。
+    #[test]
+    fn stream_cut_exhausts_budget() {
+        assert_eq!(classify_stream_cut(true, 0, 1, 1), Some(StreamCutRecovery::Exhausted));
+        assert_eq!(classify_stream_cut(true, 5, 3, 1), Some(StreamCutRecovery::Exhausted));
+    }
+
+    /// 连续截断回合不得推进重复计数，其后一个完整回合也不得误触发自动停止。
+    #[test]
+    fn stream_cut_does_not_trip_text_loop_autostop() {
+        let mut last = 0u64;
+        let mut streak = 0usize;
+        for _ in 0..10 {
+            assert!(!should_auto_stop_text_loop(true, 42, &mut last, &mut streak, 6));
+        }
+        assert_eq!(streak, 0);
+        // 首个完整回合建立起计数，不应立即停止。
+        assert!(!should_auto_stop_text_loop(false, 42, &mut last, &mut streak, 6));
+        assert_eq!(streak, 1);
+    }
+
+    /// 未截断时，相同文本重复达到上限仍会正常自动停止。
+    #[test]
+    fn intact_repeat_still_triggers_text_loop_autostop() {
+        let mut last = 0u64;
+        let mut streak = 0usize;
+        let mut stopped = false;
+        for _ in 0..5 {
+            stopped = should_auto_stop_text_loop(false, 7, &mut last, &mut streak, 6);
+            assert!(!stopped);
+        }
+        stopped = should_auto_stop_text_loop(false, 7, &mut last, &mut streak, 6);
+        assert!(stopped);
+        assert_eq!(streak, 6);
+    }
+
+    /// 截断回合一经出现即切断重复序列：之前累计的计数被清零。
+    #[test]
+    fn cut_round_resets_accumulated_streak() {
+        let mut last = 0u64;
+        let mut streak = 0usize;
+        for _ in 0..5 {
+            should_auto_stop_text_loop(false, 9, &mut last, &mut streak, 6);
+        }
+        assert_eq!(streak, 5);
+        assert!(!should_auto_stop_text_loop(true, 9, &mut last, &mut streak, 6));
+        assert_eq!(streak, 0);
+        // 后续完整重复必须从 1 重新起算，停在旧计数上属于误停。
+        assert!(!should_auto_stop_text_loop(false, 9, &mut last, &mut streak, 6));
+        assert_eq!(streak, 1);
     }
 
     fn hist_tokens(h: &[ChatMessage]) -> usize {

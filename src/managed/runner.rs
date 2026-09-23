@@ -1343,10 +1343,19 @@ Be concise and specific. Focus on practical next steps."#;
             while dummy_rx.recv().await.is_some() {}
         });
 
-        let (content, _reasoning, _tool_calls, _usage, _finish_reason) = provider
+        let (content, _reasoning, _tool_calls, _usage, _finish_reason, stream_timed_out) = provider
             .chat_stream(manager_model, &messages, &[], dummy_tx, &contract.id, "human_guidance")
             .await
             .map_err(|e| format!("LLM call failed: {}", e))?;
+        if stream_timed_out {
+            // The guidance prompt is shown to the user as the human-gate question. A truncated
+            // question is misleading, so this is reported as an error and the caller's existing
+            // failure path stands.
+            return Err(format!(
+                "LLM stream cut by transport error while building the guidance prompt ({} chars received)",
+                content.chars().count()
+            ));
+        }
 
         Ok(content)
     }

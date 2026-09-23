@@ -433,7 +433,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let model_names: Vec<String> = initial_models.iter().map(|m| m.name.clone()).collect();
     let shared_models = Arc::new(tokio::sync::RwLock::new(initial_models));
-    let provider = Arc::new(OpenAiProvider::new_with_shared(shared_models.clone()));
+    // LLM 请求超时：不在 reqwest 客户端上设 total deadline（会切断长响应），
+    // 改用读间隔 + 连接阶段两段独立超时，均可通过 config.toml 调整。
+    let provider = Arc::new(OpenAiProvider::new_with_shared_timeouts(
+        shared_models.clone(),
+        config.agent.llm_read_timeout_secs as u64,
+        config.agent.llm_connect_timeout_secs as u64,
+    ));
     let provider_for_state = provider.clone();
     info!("Models available: {:?}", model_names);
 

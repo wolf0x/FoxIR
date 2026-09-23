@@ -83,23 +83,43 @@ struct FunctionChunk {
 
 impl OpenAiProvider {
     pub fn new(models: Vec<ModelConfig>) -> Self {
-        let insecure = std::env::var("RUST_AGENT_INSECURE_TLS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-        let client = Client::builder()
-            .danger_accept_invalid_certs(insecure)
-            .timeout(std::time::Duration::from_secs(180))  // 3 minute timeout for LLM requests
-            .build()
-            .expect("Failed to create HTTP client");
-        if insecure {
-            warn!("TLS certificate verification is DISABLED (RUST_AGENT_INSECURE_TLS=1)");
-        }
-        Self { client, models: Arc::new(tokio::sync::RwLock::new(models)) }
+        Self::new_with_shared_timeouts(
+            Arc::new(tokio::sync::RwLock::new(models)),
+            super::DEFAULT_LLM_READ_TIMEOUT_SECS,
+            super::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+        )
     }
 
     pub fn new_with_shared(models: Arc<tokio::sync::RwLock<Vec<ModelConfig>>>) -> Self {
-        let insecure = std::env::var("RUST_AGENT_INSECURE_TLS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        Self::new_with_shared_timeouts(
+            models,
+            super::DEFAULT_LLM_READ_TIMEOUT_SECS,
+            super::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+        )
+    }
+
+    /// 构建 provider，显式指定 LLM 请求的超时语义。
+    ///
+    /// 关键：**不使用 reqwest 的 `ClientBuilder::timeout`（total deadline）**。
+    /// 该语义是「整轮请求从建连到 body 读完的最长时限」。实测确认（见
+    /// output/timeout-verify/）：长响应即使持续稳定输出，只要总时长超过该值就会被硬性切断，
+    /// 只留下开头若干字符，最终被误判为「模型给出了短回答」而静默收尾。
+    ///
+    /// 改用两段独立超时：
+    /// - `connect_timeout`：连接阶段保护（未设 total deadline 时必需，否则建连可无限挂起）。
+    /// - `read_timeout`：读间隔上限，每次成功读取即重置，只在中途真正静默时触发。
+    pub fn new_with_shared_timeouts(
+        models: Arc<tokio::sync::RwLock<Vec<ModelConfig>>>,
+        read_timeout_secs: u64,
+        connect_timeout_secs: u64,
+    ) -> Self {
+        let insecure = std::env::var("RUST_AGENT_INSECURE_TLS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let client = Client::builder()
             .danger_accept_invalid_certs(insecure)
-            .timeout(std::time::Duration::from_secs(180))
+            .read_timeout(std::time::Duration::from_secs(read_timeout_secs.max(1)))
+            .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs.max(1)))
             .build()
             .expect("Failed to create HTTP client");
         if insecure {
@@ -220,7 +240,12 @@ impl OpenAiProvider {
     }
 
     /// Legacy chat_stream method for backward compat (used by agent loop internally).
-    /// Sends text deltas through an mpsc channel and returns (content, tool_calls).
+    ///
+    /// Sends text deltas through an mpsc channel. 返回 6 元组：
+    /// (content, reasoning, tool_calls, usage, finish_reason, stream_timed_out)。
+    /// stream_timed_out 是传输层标志（与 consumer_gone 同级）：为 true 时表示流在
+    /// 读完之前被传输错误（读超时或中途断连）切断，content 是残缺前缀。调用方据此决定补救方式；该标志
+    /// 不改变 finish_reason 的含义。
     pub async fn chat_stream(
         &self,
         model_name: &str,
@@ -229,7 +254,7 @@ impl OpenAiProvider {
         tx: mpsc::Sender<AgentResult<crate::agent::AgentEvent>>,
         invocation_id: &str,
         author: &str,
-    ) -> Result<(String, String, Vec<ToolCallDelta>, Option<crate::model::UsageMetadata>, Option<String>), String> {
+    ) -> Result<(String, String, Vec<ToolCallDelta>, Option<crate::model::UsageMetadata>, Option<String>, bool), String> {
         let model = self.find_model(model_name).await.ok_or("No model configured")?;
         let api_key = model.resolved_api_key();
         let url = format!("{}/chat/completions", model.api_base.trim_end_matches('/'));
@@ -268,17 +293,48 @@ impl OpenAiProvider {
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut captured_usage: Option<crate::model::UsageMetadata> = None;
         let mut finish_reason: Option<String> = None;
+        // 服务端已用终止哨兵明确结束本次应答；此后即使连接未立即关闭、读超时随后触发，也不属于截断。
+        let mut saw_done = false;
 
         // If the consumer (agent stream / WebSocket) drops the receiver, there is
         // no point continuing to read the HTTP stream. We watch for that with a
         // flag and abort the loops as soon as a send fails, instead of spamming
         // one warning per remaining chunk.
         let mut consumer_gone = false;
+        // 传输层截断标志。与 consumer_gone 同级：只标记"这是截断"而非"正常结束"，
+        // 仅当流尚未送出终止信号时才置位，由主循环决定补救方式，不改动 finish_reason 的含义。
+        let mut stream_timed_out = false;
 
         'outer: while let Some(chunk_result) = s.next().await {
             let chunk_bytes = match chunk_result {
                 Ok(b) => b,
-                Err(e) => { warn!("Stream chunk error: {}", e); break; }
+                Err(e) => {
+                    // 分类传输层错误。是否截断的唯一判据是「流有没有送出终止信号」：
+                    // 终止信号之前的任何读取错误都只留下残缺前缀，必须交给主循环补救；
+                    // 终止信号之后的错误属于连接延迟关闭，应答已完整，按正常结束处理。
+                    //
+                    // 注意：reqwest 将 body 超时包装成 Kind::Decode，Display 为
+                    // "error decoding response body"，同时 is_decode() 也为 true。
+                    // 读超时因此必须用 is_timeout() 判定，否则会把真正的 serde 解析失败一并收纳。
+                    if e.is_timeout() {
+                        // 读超时本身不是截断的充分条件：应答可能已经完整送出，只是连接延迟关闭。
+                        if saw_done || finish_reason.is_some() {
+                            debug!("Stream read timeout after the stream was terminated (done={}, finish_reason={:?}); response is already complete", saw_done, finish_reason);
+                        } else {
+                            warn!("Stream read timeout before finish_reason: {}", e);
+                            stream_timed_out = true;
+                        }
+                    }
+                    // 非超时的中途断连（连接被重置、被代理掐断、服务端重启等）同样只会留下残缺前缀。
+                    // 终止信号送出之前的任何传输错误都算截断，不能只认读超时。
+                    else if !saw_done && finish_reason.is_none() {
+                        warn!("Stream cut before finish_reason by a transport error: {}", e);
+                        stream_timed_out = true;
+                    } else {
+                        warn!("Stream chunk error: {}", e);
+                    }
+                    break;
+                }
             };
             byte_buf.extend_from_slice(&chunk_bytes);
 
@@ -289,7 +345,8 @@ impl OpenAiProvider {
                 let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim();
 
-                if line.is_empty() || line == "data: [DONE]" { continue; }
+                if line.is_empty() { continue; }
+                if line == "data: [DONE]" { saw_done = true; continue; }
 
                 if let Some(data) = line.strip_prefix("data: ") {
                     match serde_json::from_str::<StreamChunk>(data) {
@@ -385,7 +442,7 @@ impl OpenAiProvider {
             })
             .collect();
 
-        Ok((full_content, full_reasoning, tool_calls, captured_usage, finish_reason))
+        Ok((full_content, full_reasoning, tool_calls, captured_usage, finish_reason, stream_timed_out))
     }
 }
 
@@ -599,4 +656,188 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[cfg(test)]
+mod stream_timeout_guard {
+    use super::*;
+    use crate::config::ModelConfig;
+    use std::sync::Arc;
+
+    // Minimal SSE stub: writes one chunk of a streaming response, then stalls for a long
+    // time. The response is chunked and has no Content-Length, matching a real streaming
+    // LLM endpoint, so the cut happens inside the body rather than at connect time.
+    async fn spawn_stalling_sse_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"The\"}}]}\n\n";
+            let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+            let _ = sock.write_all(frame.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn model_for(api_base: String) -> ModelConfig {
+        ModelConfig {
+            title: "stub".into(),
+            name: "stub-model".into(),
+            api_base,
+            api_key: None,
+            api_key_env: None,
+            context_window: 4096,
+            max_tokens: 64,
+            temperature: 0.0,
+            supports_vision: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_timeout_marks_stream_timed_out() {
+        let api_base = spawn_stalling_sse_server().await;
+        let provider = OpenAiProvider::new_with_shared_timeouts(
+            Arc::new(tokio::sync::RwLock::new(vec![model_for(api_base)])),
+            1,
+            5,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentResult<crate::agent::AgentEvent>>(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let started = std::time::Instant::now();
+        let res = provider
+            .chat_stream("stub-model", &[ChatMessage::user("hi")], &[], tx, "inv", "test")
+            .await
+            .expect("a mid-stream timeout must surface as a result flag, not an Err");
+
+        let (content, _reasoning, _tool_calls, _usage, _finish_reason, stream_timed_out) = res;
+        assert!(stream_timed_out, "mid-stream silence must set stream_timed_out");
+        assert_eq!(content, "The", "the prefix received before the cut must be preserved");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "must not wait out the 60s stall");
+    }
+}
+
+#[cfg(test)]
+mod stream_cut_after_termination {
+    use super::*;
+    use crate::config::ModelConfig;
+    use std::sync::Arc;
+
+    async fn spawn_complete_then_stall() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Final answer \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"is done. \"}, \"finish_reason\":\"stop\"}]}\n\n"
+            );
+            let frame = format!("{:x}\r\n{}\r\n", body.len(), body);
+            let _ = sock.write_all(frame.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_secs(99)).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn model_for(api_base: String) -> ModelConfig {
+        ModelConfig {
+            title: "stub".into(),
+            name: "stub-model".into(),
+            api_base,
+            api_key: None,
+            api_key_env: None,
+            context_window: 4096,
+            max_tokens: 64,
+            temperature: 0.0,
+            supports_vision: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_timeout_after_terminal_finish_reason_is_not_truncation() {
+        let api_base = spawn_complete_then_stall().await;
+        let provider = OpenAiProvider::new_with_shared_timeouts(
+            Arc::new(tokio::sync::RwLock::new(vec![model_for(api_base)])),
+            1,
+            5,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentResult<crate::agent::AgentEvent>>(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let res = provider
+            .chat_stream("stub-model", &[ChatMessage::user("hi")], &[], tx, "inv", "test")
+            .await
+            .expect("call");
+        let (content, _reasoning, _tool_calls, _usage, finish_reason, stream_timed_out) = res;
+        // 应答已经带终止 finish_reason，读超时随后才触发；这属于服务端延迟关闭连接，
+        // 不是截断。若误判为截断，主循环会把一个完整回答再补一轮“继续输出”。
+        assert_eq!(content, "Final answer is done. ", "content before the stall must be preserved in full");
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+        assert!(!stream_timed_out, "a timeout after the terminal finish_reason is not a truncation");
+    }
+}
+
+#[cfg(test)]
+mod stream_cut_by_transport_error {
+    use super::*;
+    use crate::config::ModelConfig;
+    use std::sync::Arc;
+
+    // Server writes one SSE chunk, then closes the TCP connection WITHOUT the chunked
+    // terminator. That surfaces as a body error that is not a timeout.
+    async fn spawn_abrupt_close() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"The\"}}]}\n\n";
+            let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+            let _ = sock.write_all(frame.as_bytes()).await;
+            let _ = sock.flush().await;
+            // Drop without writing the 0-length terminator frame.
+            drop(sock);
+        });
+        format!("http://{}", addr)
+    }
+
+    fn model_for(api_base: String) -> ModelConfig {
+        ModelConfig { title: "stub".into(), name: "stub-model".into(), api_base,
+            api_key: None, api_key_env: None, context_window: 4096, max_tokens: 64,
+            temperature: 0.0, supports_vision: false }
+    }
+
+    #[tokio::test]
+    async fn abrupt_close_mid_body_is_marked_truncated() {
+        let api_base = spawn_abrupt_close().await;
+        let provider = OpenAiProvider::new_with_shared_timeouts(
+            Arc::new(tokio::sync::RwLock::new(vec![model_for(api_base)])), 3, 5);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentResult<crate::agent::AgentEvent>>(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let res = provider.chat_stream("stub-model", &[ChatMessage::user("hi")], &[], tx, "inv", "test").await;
+        let (content, _reasoning, _tool_calls, _usage, finish_reason, stream_timed_out) = res
+            .expect("a transport cut must surface as a result flag, not an Err");
+        // 非超时的中途断连同样只留下残缺前缀，必须标记为截断；
+        // 否则主循环会把 "The" 当成完整回答收尾。
+        assert!(stream_timed_out, "a transport error before the finish_reason must set stream_timed_out");
+        assert_eq!(content, "The", "the prefix received before the cut must be preserved");
+        assert!(finish_reason.is_none(), "no finish_reason was sent in this scenario");
+    }
 }

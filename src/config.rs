@@ -84,6 +84,15 @@ pub struct AgentConfig {
     /// Maximum seconds allowed for a single tool execution (default: 300)
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: usize,
+
+    /// LLM 流式请求的读间隔上限（秒）。超时计时在每次成功读取后重置，
+    /// 因此只在中途真正静默时触发，长响应（推理慢、输出长）不会被打断。
+    /// 取代 reqwest 的 total deadline 语义，默认 300。
+    #[serde(default = "default_llm_read_timeout_secs")]
+    pub llm_read_timeout_secs: usize,
+    /// LLM 连接阶段超时（秒），默认 20。未设 total deadline 时为必需的连接保护。
+    #[serde(default = "default_llm_connect_timeout_secs")]
+    pub llm_connect_timeout_secs: usize,
     /// Maximum automatic retries for retryable tool failures (default: 2)
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: usize,
@@ -469,6 +478,8 @@ impl Default for Config {
                 skill_hot_top_k: default_skill_hot_top_k(),
                 skill_self_improve: default_skill_self_improve(),
                 tool_timeout_secs: default_tool_timeout_secs(),
+                llm_read_timeout_secs: default_llm_read_timeout_secs(),
+                llm_connect_timeout_secs: default_llm_connect_timeout_secs(),
                 max_tool_retries: default_max_tool_retries(),
                 parallel_ir_tools: default_parallel_ir_tools(),
                 computer_use: false,
@@ -520,6 +531,8 @@ fn default_skill_hot_top_k() -> usize { 3 }
 fn default_skill_self_improve() -> bool { false }
 fn default_tool_timeout_secs() -> usize { 300 }
 fn default_max_tool_retries() -> usize { 2 }
+fn default_llm_read_timeout_secs() -> usize { 300 }
+fn default_llm_connect_timeout_secs() -> usize { 20 }
 fn default_parallel_ir_tools() -> bool { true }
 fn default_heartbeat_enabled() -> bool { false }
 fn default_max_tokens() -> u32 { 16384 }
@@ -818,6 +831,11 @@ skill_hot_top_k = 3
 # Enable the skill self-improvement loop (default: false)
 skill_self_improve = false
 tool_timeout_secs = 300
+# LLM 流式读间隔超时（秒）。计时在每次成功读取后重置：长响应中途持续输出时不会超时，
+# 只有真正静默达到该值才中断并触发恢复。默认 300。
+llm_read_timeout_secs = 300
+# LLM 连接阶段超时（秒），默认 20。
+llm_connect_timeout_secs = 20
 max_tool_retries = 2
 # Enable parallel execution for IR collection tools (ir_scan, ir_process, etc.)
 # Set to false to force sequential execution for debugging or compatibility

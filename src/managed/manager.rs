@@ -550,7 +550,7 @@ pub async fn plan_next(
         let resp = provider
             .chat_stream(model, &messages, &[], dummy_tx.clone(), &contract.id, "manager")
             .await;
-        let (content, _reasoning, _tool_calls, _usage, _finish_reason) = match resp {
+        let (content, _reasoning, _tool_calls, _usage, _finish_reason, stream_timed_out) = match resp {
             Ok(r) => r,
             Err(e) => {
                 let fb = fallback_model.filter(|f| !f.is_empty() && f != &model);
@@ -566,15 +566,26 @@ pub async fn plan_next(
             }
         };
         last_raw_len = content.len();
-        let plan = parse_manager_plan(&content);
-        if !plan.subtask.trim().is_empty() {
-            return Ok(plan);
+        // A plan parsed out of a stream cut by a transport error is a truncated prefix: the
+        // subtask may be cut mid-sentence or the plan may be missing later fields. Retry
+        // instead of consuming it, so the manager does not plan from partial data.
+        if stream_timed_out {
+            warn!(
+                "[manager] attempt {} LLM stream was cut by a transport error ({} chars received); discarding partial plan and retrying",
+                attempt + 1,
+                content.chars().count()
+            );
+        } else {
+            let plan = parse_manager_plan(&content);
+            if !plan.subtask.trim().is_empty() {
+                return Ok(plan);
+            }
+            warn!(
+                "[manager] attempt {} returned an empty/invalid plan (no subtask); raw head: {}",
+                attempt + 1,
+                content.chars().take(500).collect::<String>()
+            );
         }
-        warn!(
-            "[manager] attempt {} returned an empty/invalid plan (no subtask); raw head: {}",
-            attempt + 1,
-            content.chars().take(500).collect::<String>()
-        );
         if attempt + 1 < MAX_PLAN_ATTEMPTS {
             tokio::time::sleep(std::time::Duration::from_millis(((attempt + 1) as u64) * 1000)).await;
         }
@@ -620,10 +631,21 @@ pub async fn summarize_prior(
     tokio::spawn(async move {
         while dummy_rx.recv().await.is_some() {}
     });
-    let (content, _, _, _, _) = provider
-        .chat_stream(model, &messages, &[], dummy_tx, "prior-summary", "manager")
-        .await
-        .map_err(|e| format!("Prior summary LLM call failed: {}", e))?;
+    // A digest cut by a transport error would be a truncated paragraph. The call is short and
+    // bounded (WORDS), so one retry is cheap. A second cut is accepted: returning a partial
+    // digest is still better than failing the whole continue prompt.
+    let mut content = String::new();
+    for attempt in 0..2 {
+        let resp = provider
+            .chat_stream(model, &messages, &[], dummy_tx.clone(), "prior-summary", "manager")
+            .await
+            .map_err(|e| format!("Prior summary LLM call failed: {}", e))?;
+        content = resp.0;
+        if !resp.5 {
+            break;
+        }
+        warn!("[manager] prior-summary stream cut by transport error (attempt {}/2, {} chars)", attempt + 1, content.chars().count());
+    }
     Ok(content.trim().to_string())
 }
 

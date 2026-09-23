@@ -2897,7 +2897,20 @@ Ignore one-off or transient details, and do not re-state the same point more tha
             .chat_stream(&model, &messages, &[], tx, "deep-curator", "memory")
             .await
         {
-            Ok((c, _, _, _, _)) => c,
+            Ok((c, _, _, _, _, stream_timed_out)) => {
+                if stream_timed_out {
+                    // A curated JSON payload cut by a transport error will not parse, and memory
+                    // writes must not be derived from a truncated payload. Skipping this round
+                    // loses nothing: curation runs again on subsequent turns, whereas persisting
+                    // facts parsed from a cut response could write wrong entries.
+                    tracing::warn!(
+                        "[deep-curator] LLM stream cut by transport error ({} chars received); skipping curation round",
+                        c.chars().count()
+                    );
+                    return;
+                }
+                c
+            }
             Err(e) => {
                 tracing::warn!("[deep-curator] LLM call failed: {e}");
                 return;
