@@ -1378,6 +1378,7 @@ async fn drain_session_stream(
     managed: bool,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     session_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deep_injected: Vec<(String, String)>,
     mut event_stream: crate::agent::EventStream,
 ) {
     let mut assistant_text = String::new();
@@ -1454,6 +1455,20 @@ async fn drain_session_stream(
         }
     }
 
+    // 记忆 KPI：loaded = 本轮注入的深层事实；referenced = 回复文本真正命中
+    // 其关键词的事实。只降权、不删除（自然选择，不是清除）。
+    if !deep_injected.is_empty() {
+        let loaded: Vec<String> = deep_injected.iter().map(|(id, _)| id.clone()).collect();
+        let referenced: Vec<String> = deep_injected
+            .iter()
+            .filter(|(_, body)| crate::deep_memory::body_referenced(body, &assistant_text))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let ms = state.memory_store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = ms.deep_record_usage(&loaded, &referenced);
+        });
+    }
     // Persist final assistant text: deep memory, session history, SQLite.
     two_tier_write(&state, &mut assistant_text, &session_id, content.as_str());
     spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
@@ -1802,11 +1817,18 @@ history.insert(0, ChatMessage::system(hint));
 
 // O2: 收敛记忆注入 —— 只注入深层永久块（自动 MEMORY.md/Blackboard），
 // 记忆注入：只注入深层永久块（对话事实由后台 curator 蒸馏进 deep_facts）。
+// 记忆 KPI 追踪：(fact_id, 注入行) — 传入 drain，在回复落地后统计 loaded/referenced。
+let mut eg_injected: Vec<(String, String)> = Vec::new();
 if state.two_tier_memory.load(Ordering::SeqCst) {
-    let (eg_block, _eg_tok, _eg_ids, rel_ids) =
+    let (eg_block, _eg_tok, eg_ids, rel_ids) =
         state.memory_store.deep_permanent_block("global", &content, 1024, 60.0);
     if !eg_block.trim().is_empty() {
         info!("Injected deep permanent block ({} chars)", eg_block.len());
+        // picked_ids 与块内事实行同序（header 之后），zip 得到 (id, 注入行) 供 KPI 判定。
+        eg_injected = eg_ids
+            .into_iter()
+            .zip(eg_block.lines().skip(1).map(|l| l.to_string()))
+            .collect();
         history.insert(0, ChatMessage::system(&eg_block));
         // 仅"与当前问题相关"的事实才 touch，冷门条目自然退火（解"注入即续命"）。
         if let Ok(touched) = state.memory_store.deep_touch_batch(&rel_ids) {
@@ -2078,7 +2100,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         let can2 = cancelled.clone();
                                         let sc2 = session_cancel.clone();
                                         tokio::spawn(drain_session_stream(
-                                            st, w, m2, s2, c2, false, can2, sc2, event_stream,
+                                            st, w, m2, s2, c2, false, can2, sc2, eg_injected, event_stream,
                                         ));
                                     } else {
                                         // Expert (managed): spawn a dedicated drain just like
@@ -2093,7 +2115,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         let can2 = cancelled.clone();
                                         let sc2 = session_cancel.clone();
                                         tokio::spawn(drain_session_stream(
-                                            st, w, m2, s2, c2, true, can2, sc2, event_stream,
+                                            st, w, m2, s2, c2, true, can2, sc2, eg_injected, event_stream,
                                         ));
                                     }
                                 }
@@ -2652,7 +2674,7 @@ async fn deep_memory_create_handler(
         last_accessed: deep_now(),
         tags: body.tags,
         links: Vec::new(),
-        archived: false,
+        archived: false, loaded: 0, referenced: 0,
     };
     match state.memory_store.deep_store(&fact) {
         Ok(()) => Json(json!({ "success": true, "fact": serde_json::to_value(&fact).unwrap_or(Value::Null) })),
@@ -2898,7 +2920,7 @@ Ignore one-off or transient details, and do not re-state the same point more tha
                 last_accessed: now,
                 tags: Vec::new(),
                 links: Vec::new(),
-                archived: false,
+                archived: false, loaded: 0, referenced: 0,
             };
             if let Err(e) = state.memory_store.deep_store(&fact) {
                 tracing::warn!("[deep-curator] store failed: {e}");

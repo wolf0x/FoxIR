@@ -199,10 +199,10 @@ pub fn budget_report(window: usize, reserve: usize, usage: &[(&str, usize)]) -> 
     BudgetReport { window, reserve, used, free, lines }
 }
 
-/// 内部 token 预估（chars/4 上取整 +1）。
+/// 内部 token 预估：委托统一 CJK 感知估算器（与 agent/记忆预算口径一致）。
 #[allow(dead_code)]
 fn crate_cost(text: &str) -> usize {
-    (text.chars().count() / 4) + 1
+    crate::deep_memory::estimate_tokens(text)
 }
 
 #[cfg(test)]

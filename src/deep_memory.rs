@@ -37,10 +37,20 @@ pub fn strip_memory_blocks(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// Rough token estimate (chars/4, rounded up, +1), used by deep_permanent_block
-/// budgeting.
+/// Unified token estimate (single source of truth): CJK ~1.5 chars/token,
+/// Latin ~4 chars/token. Used by deep_permanent_block budgeting, the context
+/// arbiter and the agent loop so all budget accounting agrees.
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() / 4) + 1
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    ((cjk as f64 / 1.5) + (other as f64 / 4.0)).ceil() as usize
 }
 
 /// 深层记忆打分参数。
@@ -187,6 +197,50 @@ mod tests {
         archive_eps: 0.05,
     };
     const DAY: u64 = 86_400;
+
+    #[test]
+    fn effectiveness_factor_bounds() {
+        // 从未注入 → 不受惩罚
+        assert_eq!(effectiveness_factor(0, 0), 1.0);
+        // 注入但从未引用 → 降权到 0.5，但不归零
+        assert_eq!(effectiveness_factor(10, 0), 0.5);
+        // 全部引用 → 1.0
+        assert_eq!(effectiveness_factor(10, 10), 1.0);
+        // 一半引用 → 0.75
+        assert!((effectiveness_factor(10, 5) - 0.75).abs() < 1e-9);
+        // referenced 不应超过 loaded（防异常数据）
+        assert_eq!(effectiveness_factor(2, 10), 1.0);
+    }
+
+    #[test]
+    fn body_referenced_keyword_matching() {
+        let body = "- [preference] 用户偏好使用 PostgreSQL 数据库，讨厌 ORM 框架";
+        // 回复真正引用了事实（命中 postgresql + CJK 窗口“偏好使用”）→ referenced
+        assert!(body_referenced(body, "考虑到你偏好使用 PostgreSQL，这次迁移我直接用了原生 SQL"));
+        // 回复与事实无关 → not referenced
+        assert!(!body_referenced(body, "今天天气不错，适合出去走走"));
+        // 只命中一个关键词（不足 min(2)触发阈）→ not referenced
+        assert!(!body_referenced(body, "我们已经把数据迁到 PostgreSQL，不再使用 ORM 了"));
+        // 只命中短常见词（<5 字符）不算
+        assert!(!body_referenced(body, "ORM 是个好东西"));
+    }
+
+    #[test]
+    fn body_referenced_cjk_window_tolerates_paraphrase() {
+        let body = "- [project] 认证模块正在重构，会话缓存迁移到 Redis";
+        // 转述改写了字序（“认证模块重构” vs “认证模块正在重构”）仍算引用
+        assert!(body_referenced(body, "认证模块重构那块我改完了，Redis 部分也调通了"));
+    }
+
+    #[test]
+    fn reference_keywords_prefers_distinctive() {
+        let kws = reference_keywords("user prefers anyhow for error handling in Rust projects");
+        assert!(kws.iter().any(|k| k == "anyhow"));
+        assert!(kws.iter().any(|k| k == "handling"));
+        // 短词（user, for, in）不入选
+        assert!(!kws.iter().any(|k| k == "user"));
+        assert!(kws.len() <= 8);
+    }
 
     #[test]
     fn seed_clamps() {
@@ -342,6 +396,12 @@ pub struct DeepFact {
     /// 软归档标记：归档事实默认不出现在活跃召回/投影中，可 deep_restore 恢复。
     #[serde(default)]
     pub archived: bool,
+    /// 注入次数（Loaded）：该事实被装入上下文的累计回数。
+    #[serde(default)]
+    pub loaded: u32,
+    /// 引用次数（Referenced）：注入后助手回复真正命中其关键词的累计回数。
+    #[serde(default)]
+    pub referenced: u32,
 }
 
 impl DeepFact {
@@ -351,12 +411,97 @@ impl DeepFact {
     /// 用于在上下文预算内挑选“最有价值”的常驻事实（见 memory::deep_permanent_block）。
     pub fn value(&self, now: u64) -> f64 {
         let q = crate::value::quality_from_importance(self.importance, IMPORTANCE_MAX);
+        // U 分量取 Loaded/Referenced 有效性因子：注入但从不被引用的事实
+        // 逐渐降权（最低 0.5），但永不归零 —— 自然选择，不是清除。
         crate::value::unified_value(
             q,
             1,
             self.last_accessed,
             now,
             crate::value::DEFAULT_HALF_LIFE_DAYS,
-        )
+        ) * self.effectiveness()
     }
+
+    /// 该事实的 Loaded/Referenced 有效怦因子。
+    pub fn effectiveness(&self) -> f64 {
+        effectiveness_factor(self.loaded, self.referenced)
+    }
+}
+
+/// Loaded/Referenced 有效怦因子：0.5 + 0.5 × (referenced/loaded)，范围 [0.5, 1.0]。
+/// 从未注入过（loaded == 0）的事实不受惩罚，返回 1.0。
+pub fn effectiveness_factor(loaded: u32, referenced: u32) -> f64 {
+    if loaded == 0 {
+        return 1.0;
+    }
+    let ratio = (referenced as f64 / loaded as f64).min(1.0);
+    0.5 + 0.5 * ratio
+}
+
+fn is_cjk(ch: char) -> bool {
+    let cp = ch as u32;
+    (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+}
+
+fn harvest_kw(out: &mut Vec<String>, tok: &str, is_cjk_tok: bool) {
+    let min = if is_cjk_tok { 4 } else { 5 };
+    if tok.chars().count() >= min && !out.iter().any(|t| t == tok) {
+        out.push(tok.to_string());
+    }
+}
+
+/// 从注入的事实渲染行中提取最多 8 个区分度关键词，供廉价的
+/// “Referenced” 判定（纯字符串匹配，不调 LLM）。ASCII 词 ≥5 字符、CJK 连串 ≥4 字才入选；
+/// 按长度降序（越长越有区分度）。
+pub fn reference_keywords(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_cjk = false;
+    for ch in body.chars() {
+        let cjk = is_cjk(ch);
+        if cjk || ch.is_alphanumeric() {
+            if !cur.is_empty() && cur_cjk != cjk {
+                harvest_kw(&mut out, &cur, cur_cjk);
+                cur.clear();
+            }
+            cur_cjk = cjk;
+            cur.push(ch.to_lowercase().next().unwrap_or(ch));
+        } else if !cur.is_empty() {
+            harvest_kw(&mut out, &cur, cur_cjk);
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        harvest_kw(&mut out, &cur, cur_cjk);
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    out.truncate(8);
+    out
+}
+
+/// 事实是否被回复“引用”：回复文本命中足够多的区分度关键词。
+/// 候选不足 2 个时要求全部命中，否则命中任意 2 个。
+pub fn body_referenced(body: &str, reply: &str) -> bool {
+    let kws = reference_keywords(body);
+    if kws.is_empty() {
+        return false;
+    }
+    let reply = reply.to_lowercase();
+    let hit = |kw: &str| {
+        if reply.contains(kw) {
+            return true;
+        }
+        // CJK 长串：转述常改写字序或插入字（“认证模块正在重构”→“认证模块重构”），
+        // 放宽为任意 4 字窗口命中即算引用。
+        let chars: Vec<char> = kw.chars().collect();
+        if chars.len() > 4 && chars.iter().all(|c| is_cjk(*c)) {
+            return chars.windows(4).any(|w| {
+                let s: String = w.iter().collect();
+                reply.contains(&s)
+            });
+        }
+        false
+    };
+    let hits = kws.iter().filter(|k| hit(k)).count();
+    hits >= kws.len().min(2)
 }

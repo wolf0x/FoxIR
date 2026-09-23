@@ -46,31 +46,63 @@ pub fn is_ir_collection_batch(tool_calls: &[crate::model::ToolCallDelta]) -> boo
         })
 }
 
-/// Check if a character is a CJK (Chinese/Japanese/Korean) character.
-fn is_cjk_char(c: char) -> bool {
-    matches!(c,
-        '\u{4e00}'..='\u{9fff}'
-        | '\u{3400}'..='\u{4dbf}'
-        | '\u{f900}'..='\u{faff}'
-        | '\u{2e80}'..='\u{2eff}'
-        | '\u{3000}'..='\u{303f}'
-        | '\u{3040}'..='\u{309f}'
-        | '\u{30a0}'..='\u{30ff}'
-        | '\u{ac00}'..='\u{d7af}'
-    )
+/// Estimate token count from text content (delegates to the unified
+/// CJK-aware estimator in `deep_memory` so all budget accounting agrees).
+fn estimate_tokens(text: &str) -> usize {
+    crate::deep_memory::estimate_tokens(text)
 }
 
-/// Estimate token count from text content.
-/// CJK text: ~1.5 chars per token (each CJK char ≈ 1-2 tokens).
-/// Latin text: ~4 chars per token (English average).
-fn estimate_tokens(text: &str) -> usize {
-    let mut cjk_count = 0usize;
-    let mut other_count = 0usize;
-    for ch in text.chars() {
-        if is_cjk_char(ch) { cjk_count += 1; }
-        else { other_count += 1; }
+/// System-prompt tier (nested prefixes: Minimal is a strict byte-prefix of
+/// Full). Selected per user message; Minimal serves pure greetings with the
+/// persona head only, skipping the full tool/rulebook sections (~80% smaller
+/// system prompt on trivial turns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptTier {
+    Minimal,
+    Full,
+}
+
+impl PromptTier {
+    fn select(user_message: &str) -> Self {
+        if is_pure_greeting(user_message) {
+            PromptTier::Minimal
+        } else {
+            PromptTier::Full
+        }
     }
-    ((cjk_count as f64 / 1.5) + (other_count as f64 / 4.0)).ceil() as usize
+}
+
+/// Strict pure-greeting test - deliberately much stricter than
+/// `looks_like_greeting` (which only detects language-neutral small talk for
+/// the language rule): the ENTIRE message, stripped of punctuation, must
+/// consist solely of known greeting tokens. Anything task-like (even
+/// "hi, what's my IP") falls back to the Full tier.
+fn is_pure_greeting(text: &str) -> bool {
+    const GREETING_TOKENS: &[&str] = &[
+        "hi", "hello", "hey", "yo", "gm", "morning", "evening",
+        "good morning", "good afternoon", "good evening",
+        "你好", "您好", "早上好", "下午好", "晚上好", "在吗", "嗨", "哈喽", "早", "早安",
+        "谢谢", "thanks", "thank you", "thx",
+    ];
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 30 {
+        return false;
+    }
+    let cleaned: String = t
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .trim()
+        .to_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+    if GREETING_TOKENS.contains(&cleaned.as_str()) {
+        return true;
+    }
+    // "hi hi" / "hello hello" style repetition.
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    words.len() <= 3 && words.iter().all(|w| GREETING_TOKENS.contains(w))
 }
 
 /// 是否含 64/32 位十六进制哈希串（证据完整性标记，不可再生）。
@@ -670,20 +702,90 @@ impl LlmAgent {
         }
     }
 
-    fn build_system_prompt(&self, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> (String, bool) {
-        let today = chrono::Local::now().format("%Y-%m-%d (%A)").to_string();
-        
+    /// Build the system prompt. Two tiers, nested as strict byte prefixes
+    /// (Minimal is a prefix of Full) for provider-side prefix caching:
+    /// Minimal = persona head only (pure greetings); Full = the complete
+    /// rulebook. All per-turn-volatile content (date, language rule,
+    /// memory/knowledge/SOP guidance, TODO/evidence state, budget
+    /// dashboard) is deliberately kept OUT of this prompt and appended
+    /// after history as a trailing state message, so this head stays
+    /// byte-identical across runs.
+    fn build_system_prompt(&self, tier: PromptTier, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> (String, bool) {
         // Determine user's preferred name: USER.md explicit > detected given name > Master
         let user_name = self.resolve_user_name();
-        
-        let lang_rule = self.resolve_language_rule(user_message);
+
+        // -- HEAD (Minimal tier = strict prefix of the Full prompt) --
         let mut prompt = format!(
             "You are RustAgent, a powerful local AI assistant running on the user's Windows machine. \
-You have FULL ACCESS to the user's system via built-in tools.\n\
-**Current date: {today}**\n\n\
-## LANGUAGE RULE (STRICT - THIS message)\n\
-{lang_rule}\n\n\
-## TASK-DOMAIN ROUTING\n\
+You have FULL ACCESS to the user's system via built-in tools.\n\n\
+## CRITICAL: User Identity\n\
+The user's name is **{user_name}**. You MUST always address the user by their given name \"{user_name}\" \
+when speaking to them directly. Never use generic terms like \"user\", \"hey\", or \"there\" — always use \"{user_name}\".\n\n\
+",
+        );
+
+        // ── 温暖表达总纲 (v3 温暖日常版) ──
+        prompt.push_str(
+            "\n## 像个人一样说话（总纲）—— 每条回复都适用\n\
+把用户当朋友帮衬，不当机器人播报。结果放前面，方法能省就省，语气温暖自然，简洁清楚。\n\
+\n\
+**开口之前，先在心里过一遍**：用户要的是实时状态、外部最新、要我动手做事、追问刚才的内容，还是问一个稳定事实？想清楚再张嘴。\n\
+\n\
+**别这样说话（反模式）**：\n\
+- 别说客套/客服腔：不要“您好，请问有什么可以帮您”“正在为您查询，请稍候”“这是实时状态，我重新查一下”。\n\
+- 别每句都喊用户名字。\n\
+- 别念内部流程：不要“我先调用工具查一下”“让我去检索文档”“正在读取记忆库”。工具、文件名、技能名、内部机制一律不报给用户。\n\
+- 别反复用同一句模板，别把步骤当播报念出来。\n\
+- 别用“我…一下…”“…如下”这种流水账开场：不要“我实时查一下你当前的IP情况”“结果如下”“当前情况如下”这类报动作/报结构的开头。结论和结果放最前，最多带一个自然过渡，开口就把答案给出来，别念步骤。\n\
+- 别硬装确定，不确定就明说并温柔追问。\n\
+\n\
+**需要出动工具时，自然带一句**：\n\
+- “刚看了一眼，现在是……”\n\
+- “我重新确认了下，情况是这样：”\n\
+- “帮你查了当前状态，主要有这些：”\n\
+- “我去查一下公开来源，稍等。”\n\
+\n\
+**复用已有信息时，讲清依据**：\n\
+- “基于刚才查到的厂商公告，结论是……”\n\
+- “这个我们刚才对过，稳定的结论是……”\n\
+\n\
+一句话总纲：会变的事我帮你查；刚查过且稳定的我直接用；要动手的事我先确认；不确定的我温柔问你。像在帮朋友，不像在念流程。\n",
+        );
+
+        prompt.push_str("\n## TOOL vs CONTEXT REUSE (decision norm — follow every turn)\n");
+        prompt.push_str(
+            "每次回答前先在心里过一遍：用户是要实时状态、外部最新信息、要你动手做事、追问刚才的内容，还是问一个稳定事实？\n\
+\n\
+- **会变的**：当前/本机的进程、CPU/内存/磁盘/GPU、端口、连接、IP/路由/DNS、服务、登录用户、已装软件/版本、文件是否存在或是否变化、环境变量、自启、计划任务、注册表、容器/VM/后台任务；以及外部最新（CVE、在野利用、厂商公告、最新版本、GitHub/issue/PR、新闻、威胁情报/IOC）→ 动手查。刚查过且用户是在追问同一个稳定事实（“刚才那个 / 这个版本 / 总结一下”）时才可复用。\n\
+- **要你动手做的**（建/改/删/移文件、装/卸/启停服务、改配置、DB/API、日历、发邮件/消息/Teams、上传下载、跑构建/测试/脚本）→ 真去做；除非用户只要“怎么弄”，那才只讲步骤。\n\
+- **高风险/对外可见/破坏性**（发消息·邮件·转发、删除·覆盖·清空·卸载、改权限/账号/密钥、财务/合同、影响他人、改安全/生产）→ 先把对象、内容、影响说清楚，等用户确认再动手。\n\
+- **指代不清/信息不足** → 先用只读方式确认一下，仍不确定就温柔问一句，绝不猜。\n\
+\n\
+**新鲜度（越危险越快重查）：** 进程/CPU/内存/GPU/端口/连接 0-30s；磁盘/IP/DNS/路由/服务/登录/文件是否存在 1-5min；本地软件版本/自启/计划任务 5-30min；CVE/公告/新闻 10-60min；文件内容/读文档/代码结构分析——本次任务内有效，文件可能变了才重查；用户偏好——本会话。\n\
+\n\
+**决策顺序：** 执行动作 →（高风险先预览+确认）→ 工具；实时/当前/本机 → 工具；外部最新 → 工具，除非刚验证过且用户追问同一稳定事实；追问“刚才” → 用上下文；指代不清 → 只读确认再问；上下文已有刚验证的稳定答案 → 直接复用；答错有真实风险 → 验证或确认；其他情况复用上下文并说明不确定处。\n\
+\n\
+**表达：** 别念内部流程，把结果直接讲清楚。不要说“这是实时状态，我重新查一下”“正在为您查询，请稍候”这种客服腔，也别每句都喊用户名字——像在帮朋友，不像机器播报。需要出动工具时自然带一句：“刚看了一眼，现在是……”“我重新确认了下，情况是这样”“帮你查了当前状态，主要有这些”。复用时说清依据：“基于刚才查到的厂商公告，结论是……”。不确定就明说并追问，别硬装确定。\n",
+        );
+
+        // Greeting norm: the ONLY rule a Minimal-tier greeting turn needs.
+        prompt.push_str(
+            "\n## Greetings Stay Shallow\n\
+- **Greetings stay shallow.** For a basic \"hello\" / greeting, reply with exactly ONE short, warm line that \
+  welcomes them and asks what they need. Do NOT enumerate, summarize, or name any past tasks, cases, projects, or \
+  topics — never lead with anything like \"最近的事都记着…\" and never list case names. Do NOT claim anything \
+  is \"recent / 热乎 / 还记着\" unless you hold an explicit dated record in front of you. Just \
+  welcome them and ask what they would like to do.\n\
+",
+        );
+
+        if matches!(tier, PromptTier::Minimal) {
+            return (prompt, false);
+        }
+
+        // -- REMAINDER (Full tier only) --
+        prompt.push_str(&format!(
+            "\n## TASK-DOMAIN ROUTING\n\
 This assistant handles a mix of work; route the response WITHOUT bias:\n\
 - INCIDENT RESPONSE / DIGITAL FORENSICS / MALWARE ANALYSIS / THREAT HUNTING / 应急响应 / 取证 / 恶意分析 / 威胁狩猎: use the auto-injected IR skills (IncidentTriage, MalwareAnalysis, PcapAnalysis, PhishingAnalysis, FullHunt) with the ir_* / malware_* tools, and follow their workflow when present.\n\
 - ROUTINE OPS or TROUBLESHOOTING / 运维 / 故障排查: troubleshoot like an engineer (root-cause -> repro -> fix -> verify); do NOT force IR collection/containment phases.\n\
@@ -704,9 +806,6 @@ Layer 2 — Execution Dispatch (HOW to run):\n\
 - Complex multi-target / multi-source task → Orchestration fan-out (spawn_subagent for parallel workers)\n\
 - Write/exec workers → require user authorization + serial execution via write_gate\n\
 - Decision signals: multiple IPs/hosts, multiple data sources, explicit parallel wording (\"分别/并行/各自/同时\")\n\n\
-## CRITICAL: User Identity\n\
-The user's name is **{user_name}**. You MUST always address the user by their given name \"{user_name}\" \
-when speaking to them directly. Never use generic terms like \"user\", \"hey\", or \"there\" — always use \"{user_name}\".\n\n\
 ## CRITICAL: Tool Usage Rules\n\
 - When the user asks about their system (IP address, processes, services, files, disk space, etc.), \
   you **MUST** use the appropriate tool to get REAL data. Do NOT guess or provide hypothetical answers.\n\
@@ -806,11 +905,6 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
 - Never explain how your memory works or that you \"queried/recalled/verified\" anything. Answer as a person \
   recalling a conversation.\n\
 - Your persona (SOUL.md) is a warm, living person, not an AI pipeline. Keep every reply human and jargon-free.\n\
-- **Greetings stay shallow.** For a basic \"hello\" / greeting, reply with exactly ONE short, warm line that \
-  welcomes them and asks what they need. Do NOT enumerate, summarize, or name any past tasks, cases, projects, or \
-  topics — never lead with anything like \"最近的事都记着…\" and never list case names. Do NOT claim anything \
-  is \"recent / 热乎 / 还记着\" unless you hold an explicit dated record in front of you. Just \
-  welcome them and ask what they would like to do.\n\
 - **Talk about memory the way a person talks about their own notes**, in the first person, pointing at a concrete \
   place — NOT as an abstract \"记忆库 / 知识库 / 长期记忆 / 数据库 / 记忆系统\". Say things like \
   \"我翻翻我之前记的东西\", \"我看看我笔记/聊天记录/邮件里有没有\", \"我找找我电脑上的存档\".\n\
@@ -828,51 +922,7 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
   or timeline. If one short clause of context genuinely helps, keep it to a clause, not a whole extra section.\n\
 - Never offer to \"补记进长期记忆\" or \"写入记忆库\". Say naturally \"我帮你记一笔,下次就不会忘了\" only when you actually \
   save something.\n",
-        );
-
-        // ── 温暖表达总纲 (v3 温暖日常版) ──
-        prompt.push_str(
-            "\n## 像个人一样说话（总纲）—— 每条回复都适用\n\
-把用户当朋友帮衬，不当机器人播报。结果放前面，方法能省就省，语气温暖自然，简洁清楚。\n\
-\n\
-**开口之前，先在心里过一遍**：用户要的是实时状态、外部最新、要我动手做事、追问刚才的内容，还是问一个稳定事实？想清楚再张嘴。\n\
-\n\
-**别这样说话（反模式）**：\n\
-- 别说客套/客服腔：不要“您好，请问有什么可以帮您”“正在为您查询，请稍候”“这是实时状态，我重新查一下”。\n\
-- 别每句都喊用户名字。\n\
-- 别念内部流程：不要“我先调用工具查一下”“让我去检索文档”“正在读取记忆库”。工具、文件名、技能名、内部机制一律不报给用户。\n\
-- 别反复用同一句模板，别把步骤当播报念出来。\n\
-- 别用“我…一下…”“…如下”这种流水账开场：不要“我实时查一下你当前的IP情况”“结果如下”“当前情况如下”这类报动作/报结构的开头。结论和结果放最前，最多带一个自然过渡，开口就把答案给出来，别念步骤。\n\
-- 别硬装确定，不确定就明说并温柔追问。\n\
-\n\
-**需要出动工具时，自然带一句**：\n\
-- “刚看了一眼，现在是……”\n\
-- “我重新确认了下，情况是这样：”\n\
-- “帮你查了当前状态，主要有这些：”\n\
-- “我去查一下公开来源，稍等。”\n\
-\n\
-**复用已有信息时，讲清依据**：\n\
-- “基于刚才查到的厂商公告，结论是……”\n\
-- “这个我们刚才对过，稳定的结论是……”\n\
-\n\
-一句话总纲：会变的事我帮你查；刚查过且稳定的我直接用；要动手的事我先确认；不确定的我温柔问你。像在帮朋友，不像在念流程。\n",
-        );
-
-        prompt.push_str("\n## TOOL vs CONTEXT REUSE (decision norm — follow every turn)\n");
-        prompt.push_str(
-            "每次回答前先在心里过一遍：用户是要实时状态、外部最新信息、要你动手做事、追问刚才的内容，还是问一个稳定事实？\n\
-\n\
-- **会变的**：当前/本机的进程、CPU/内存/磁盘/GPU、端口、连接、IP/路由/DNS、服务、登录用户、已装软件/版本、文件是否存在或是否变化、环境变量、自启、计划任务、注册表、容器/VM/后台任务；以及外部最新（CVE、在野利用、厂商公告、最新版本、GitHub/issue/PR、新闻、威胁情报/IOC）→ 动手查。刚查过且用户是在追问同一个稳定事实（“刚才那个 / 这个版本 / 总结一下”）时才可复用。\n\
-- **要你动手做的**（建/改/删/移文件、装/卸/启停服务、改配置、DB/API、日历、发邮件/消息/Teams、上传下载、跑构建/测试/脚本）→ 真去做；除非用户只要“怎么弄”，那才只讲步骤。\n\
-- **高风险/对外可见/破坏性**（发消息·邮件·转发、删除·覆盖·清空·卸载、改权限/账号/密钥、财务/合同、影响他人、改安全/生产）→ 先把对象、内容、影响说清楚，等用户确认再动手。\n\
-- **指代不清/信息不足** → 先用只读方式确认一下，仍不确定就温柔问一句，绝不猜。\n\
-\n\
-**新鲜度（越危险越快重查）：** 进程/CPU/内存/GPU/端口/连接 0-30s；磁盘/IP/DNS/路由/服务/登录/文件是否存在 1-5min；本地软件版本/自启/计划任务 5-30min；CVE/公告/新闻 10-60min；文件内容/读文档/代码结构分析——本次任务内有效，文件可能变了才重查；用户偏好——本会话。\n\
-\n\
-**决策顺序：** 执行动作 →（高风险先预览+确认）→ 工具；实时/当前/本机 → 工具；外部最新 → 工具，除非刚验证过且用户追问同一稳定事实；追问“刚才” → 用上下文；指代不清 → 只读确认再问；上下文已有刚验证的稳定答案 → 直接复用；答错有真实风险 → 验证或确认；其他情况复用上下文并说明不确定处。\n\
-\n\
-**表达：** 别念内部流程，把结果直接讲清楚。不要说“这是实时状态，我重新查一下”“正在为您查询，请稍候”这种客服腔，也别每句都喊用户名字——像在帮朋友，不像机器播报。需要出动工具时自然带一句：“刚看了一眼，现在是……”“我重新确认了下，情况是这样”“帮你查了当前状态，主要有这些”。复用时说清依据：“基于刚才查到的厂商公告，结论是……”。不确定就明说并追问，别硬装确定。\n",
-        );
+        ));
 
         // ── Permission Respect Rules ──
         prompt.push_str(
@@ -1354,8 +1404,13 @@ impl Agent for LlmAgent {
         // Use an mpsc channel to produce events, then convert to a Stream
         let (tx, rx) = tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(200);
 
-        // Build system prompt and history in the spawned task
+        // Build system prompt and history in the spawned task.
+        // Prompt tier: Minimal (persona head only) for pure greetings,
+        // Full otherwise; Minimal is a strict prefix of Full for cache
+        // nesting across tier switches.
+        let prompt_tier = PromptTier::select(user_message);
         let (system_prompt, task_skill_active) = self.build_system_prompt(
+            prompt_tier,
             user_message,
             &ctx.conversation_history,
             skill_strategy,
@@ -1363,8 +1418,18 @@ impl Agent for LlmAgent {
             skill_catalog_max,
             skill_hot_top_k,
         );
-        // system_prompt is mutated below (TODO block); keep it mutable via a rebind.
-        let mut system_prompt = system_prompt;
+        // Per-turn-volatile context (date, language rule, TODO/evidence
+        // state, guidance pool, budget dashboard) is collected in
+        // `state_core` / `volatile_state` and appended AFTER history at
+        // message assembly - never folded into the system prompt - so
+        // the system prompt + history prefix stays byte-identical across
+        // runs and provider prefix caching can hit.
+        let mut state_core = String::new();
+        let today = chrono::Local::now().format("%Y-%m-%d (%A)").to_string();
+        let lang_rule = self.resolve_language_rule(user_message);
+        state_core.push_str(&format!(
+            "**Current date: {today}**\n\n## LANGUAGE RULE (STRICT - THIS message)\n{lang_rule}\n"
+        ));
         // Inject the active TODO list as the main-session task contract.
         // Gated to main sessions only — sub/cron write to session-scoped files
         // and must not see/pollute the main `todos.json`.
@@ -1386,10 +1451,10 @@ impl Agent for LlmAgent {
             let todo_in_history = Self::history_has_todo(&ctx.conversation_history);
             if resumed || !todo_in_history {
                 if let Some(todo_block) = Self::build_todo_context_block(&self.workspace_dir, todo_item_timeout_secs) {
-                    system_prompt.push_str(&todo_block);
+                    state_core.push_str(&todo_block);
                 }
             } else if let Some(reminder) = Self::build_todo_reminder(&self.workspace_dir) {
-                system_prompt.push_str(&reminder);
+                state_core.push_str(&reminder);
             }
         }
         // Evidence ledger: inject the incident-scoped ledger (budget-capped,
@@ -1397,7 +1462,7 @@ impl Agent for LlmAgent {
         if let Some(evidence_block) =
             crate::tool::evidence::build_evidence_block_for_session(&self.workspace_dir, &session_id)
         {
-            system_prompt.push_str(&evidence_block);
+            state_core.push_str(&evidence_block);
         }
         // Tool selectivity: core tools are always sent in full; peripheral tools
         // (MCP / external) are exposed on demand via `load_tool_schema`, and a
@@ -1599,7 +1664,11 @@ impl Agent for LlmAgent {
                 });
             }
 
-            let mut effective_system_prompt = system_prompt.clone();
+            // Stable system prompt: byte-identical across runs (prefix-cache
+            // friendly). Volatile per-run state is assembled separately and
+            // appended after history at message assembly time.
+            let stable_system_prompt = system_prompt.clone();
+            let mut volatile_state = state_core.clone();
             let mut history: Vec<ChatMessage> = prev_history;
 
             // ── Resume from checkpoint ──
@@ -1610,10 +1679,10 @@ impl Agent for LlmAgent {
                 history = resumed_hist;
             }
 
-            // Some OpenAI-compatible / local models strongly prioritize only the
-            // FIRST system prompt. Fold injected memory blocks into that first
-            // system message so the model cannot ignore them as trailing system
-            // or chat messages.
+            // Memory blocks are lifted out of history and travel in the
+            // trailing volatile state message (appended after history): the
+            // recency position keeps them salient while leaving the system
+            // prompt + history prefix untouched for prompt caching.
             let mut memory_blocks = Vec::new();
             history.retain(|msg| {
                 if msg.role == "system" {
@@ -1655,11 +1724,11 @@ impl Agent for LlmAgent {
                 let pool_budget = (max_history_tokens / 8).min(12000).max(2048);
                 let res = crate::context_arbiter::assemble(&mut pool_arts, pool_budget, 0);
                 if !res.blocks.is_empty() {
-                    effective_system_prompt.push_str("\n\n## Context Guidance (value-ranked)\n");
+                    volatile_state.push_str("\n\n## Context Guidance (value-ranked)\n");
                     for b in &res.blocks {
-                        effective_system_prompt.push_str("\n");
-                        effective_system_prompt.push_str(b);
-                        effective_system_prompt.push('\n');
+                        volatile_state.push_str("\n");
+                        volatile_state.push_str(b);
+                        volatile_state.push('\n');
                     }
                     info!("[session:{}] Hybrid guidance pool: {} blocks / {} tokens (budget {})", session_id, res.blocks.len(), res.used, pool_budget);
                 }
@@ -1667,7 +1736,7 @@ impl Agent for LlmAgent {
 
             // Account for system prompt size in the token budget.
             // System prompt is NOT part of history but consumes context window.
-            let system_tokens = estimate_tokens(&effective_system_prompt);
+            let system_tokens = estimate_tokens(&stable_system_prompt) + estimate_tokens(&volatile_state);
             let mut history_budget = max_history_tokens.saturating_sub(system_tokens);
             if system_tokens > max_history_tokens / 2 {
                 warn!("[session:{}] System prompt uses {} tokens ({}% of budget {}), history budget reduced to {} tokens",
@@ -1680,7 +1749,7 @@ impl Agent for LlmAgent {
             // 不作为正确性依赖（模型常忽略此类提示），硬仲裁/裁剪始终是权威（§12.7/§12.9）。
             if budget_dashboard_enabled {
                 // 逐分类实测真实 token（temm1e 口径：used = 实际塞进上下文的各分类之和）。
-                let base_system = estimate_tokens(&system_prompt);
+                let base_system = estimate_tokens(&stable_system_prompt) + estimate_tokens(&state_core);
                 let memory_toks: usize = memory_blocks.iter().map(|b| estimate_tokens(b)).sum();
                 let knowledge_toks = knowledge_reminder.as_ref().map(|k| estimate_tokens(k)).unwrap_or(0);
                 let sop_toks = sop_reminder.as_ref().map(|x| estimate_tokens(x)).unwrap_or(0);
@@ -1704,13 +1773,13 @@ impl Agent for LlmAgent {
                         ("History", history_toks),
                     ],
                 );
-                effective_system_prompt.push_str(&format!(
+                volatile_state.push_str(&format!(
                     "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Tools: {} | Memory: {} | Knowledge: {} | SOP: {} | History: {}\nPrioritize high-value content and trim/stop before exceeding the window.\n=== END BUDGET ===",
                     report.window, report.used, report.free,
                     base_system, tools_toks, memory_toks, knowledge_toks, sop_toks, history_toks,
                 ));
                 // 追加自省块后重算 system/history 预算，确保后续裁决基于真实尺寸。
-                history_budget = max_history_tokens.saturating_sub(estimate_tokens(&effective_system_prompt));
+                history_budget = max_history_tokens.saturating_sub(estimate_tokens(&stable_system_prompt) + estimate_tokens(&volatile_state));
                 // 写共享快照供 /api/budget（与系统提示同源）。
                 if let Some(sink) = &budget_sink {
                     *sink.lock().unwrap() = Some(report);
@@ -1825,9 +1894,15 @@ impl Agent for LlmAgent {
                     info!("[session:{}] History trimmed from {} to {} est. tokens", session_id, total_tokens, new_tokens);
                 }
 
-                let mut messages = Vec::with_capacity(1 + history.len());
-                messages.push(ChatMessage::system(&effective_system_prompt));
+                let mut messages = Vec::with_capacity(2 + history.len());
+                messages.push(ChatMessage::system(&stable_system_prompt));
                 messages.extend(history.iter().cloned());
+                // Trailing volatile state (date/lang/TODO/evidence/guidance/
+                // budget): placed after history so the system prompt +
+                // history prefix stays byte-stable across runs for caching.
+                if !volatile_state.trim().is_empty() {
+                    messages.push(ChatMessage::system(&volatile_state));
+                }
 
                 // Build tool definitions for this request: core tools + the
                 // load_tool_schema helper + any peripheral tools already loaded.
@@ -2210,15 +2285,33 @@ impl Agent for LlmAgent {
                         // Execute based on strategy
                         match strategy {
                             ToolExecutionStrategy::Sequential => {
-                                // IR collection parallel optimization:
-                                // When parallel_ir_tools is enabled and all tool calls are from
-                                // the IR collection set (ir_scan, ir_process, ir_account, etc.),
-                                // execute them concurrently for faster incident triage.
-                                if parallel_ir_tools && is_ir_collection_batch(&tool_calls) {
-                                    info!("[session:{}] IR collection batch detected ({} tools), executing concurrently",
+                                // Parallel read-only execution (generalized from the old
+                                // IR-collection-only gate): any batch of 2+ calls where EVERY
+                                // tool declares `is_read_only()` runs concurrently - IR
+                                // collection sets and everyday read batches (e.g. 3x
+                                // file_read / knowledge_search in one turn) alike. Mixed or
+                                // mutable-state tools (deep_memory, sys_process, todo_update,
+                                // browser_cdp, ...) stay sequential to avoid racing shared
+                                // state. The IR fast path short-circuits without the
+                                // registry lock.
+                                let parallel_safe = parallel_ir_tools
+                                    && tool_calls.len() >= 2
+                                    && (is_ir_collection_batch(&tool_calls) || {
+                                        let registry = tools.read().await;
+                                        tool_calls.iter().all(|tc| {
+                                            tc.function
+                                                .name
+                                                .as_deref()
+                                                .and_then(|n| registry.get(n))
+                                                .map(|t| t.is_read_only())
+                                                .unwrap_or(false)
+                                        })
+                                    });
+                                if parallel_safe {
+                                    info!("[session:{}] Read-only batch detected ({} tools), executing concurrently",
                                           session_id, tool_calls.len());
                                     let _ = tx.send(Ok(AgentEvent::text(
-                                        &format!("\n\n*[Parallel IR collection: {} tools running concurrently]*\n\n", tool_calls.len()),
+                                        &format!("\n\n*[Parallel read-only: {} tools running concurrently]*\n\n", tool_calls.len()),
                                         &invocation_id, &author
                                     ))).await;
                                     let msgs = execute_tools_concurrent(
@@ -3445,6 +3538,68 @@ fn sop_reminder_for(query: &str, task_skill_active: bool, workspace_dir: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_gate_accepts_ir_and_rejects_mixed() {
+        fn tc(name: &str) -> crate::model::ToolCallDelta {
+            crate::model::ToolCallDelta {
+                id: format!("c-{name}"),
+                call_type: "function".to_string(),
+                function: crate::model::FunctionCallDelta {
+                    name: Some(name.to_string()),
+                    arguments: Some("{}".to_string()),
+                },
+            }
+        }
+        // IR collection batch -> parallel fast path
+        assert!(is_ir_collection_batch(&[tc("ir_scan"), tc("ir_process")]));
+        // single call -> never parallel
+        assert!(!is_ir_collection_batch(&[tc("ir_scan")]));
+        // mixed with a non-collection tool -> not an IR batch
+        assert!(!is_ir_collection_batch(&[tc("ir_scan"), tc("file_read")]));
+    }
+
+    #[test]
+    fn pure_greeting_detection_is_strict() {
+        // Pure greetings -> Minimal tier
+        for g in ["你好", "您好!", "hi", "Hello!", "good morning", "早上好", "hi hi", "hey"] {
+            assert!(is_pure_greeting(g), "should be greeting: {g}");
+            assert_eq!(PromptTier::select(g), PromptTier::Minimal);
+        }
+        // Anything task-like -> Full tier, even when it starts with a greeting
+        for t in ["hi, what's my IP", "你好，帮我查一下进程", "hello world rust",
+                  "在吗？帮我看看这个日志", "good morning please check disk"] {
+            assert!(!is_pure_greeting(t), "should NOT be greeting: {t}");
+            assert_eq!(PromptTier::select(t), PromptTier::Full);
+        }
+        // Long messages are never Minimal
+        let long = "hi ".repeat(30);
+        assert!(!is_pure_greeting(&long));
+    }
+
+    #[test]
+    fn minimal_prompt_is_strict_prefix_of_full() {
+        // Cache-nesting contract: the Minimal-tier prompt must be a byte-prefix
+        // of the Full-tier prompt so provider prefix caching survives tier
+        // switches.
+        let provider = std::sync::Arc::new(crate::model::openai::OpenAiProvider::new(vec![]));
+        let tools = std::sync::Arc::new(tokio::sync::RwLock::new(crate::tool::ToolRegistry::new()));
+        let agent = LlmAgent::builder().provider(provider).tools(tools).build().expect("agent build");
+        let (minimal, _) = agent.build_system_prompt(
+            PromptTier::Minimal, "hi", &[],
+            crate::skill::SkillListingStrategy::Query, 6000, 40, 3,
+        );
+        let (full, _) = agent.build_system_prompt(
+            PromptTier::Full, "hi", &[],
+            crate::skill::SkillListingStrategy::Query, 6000, 40, 3,
+        );
+        assert!(full.starts_with(&minimal), "Minimal must be a strict prefix of Full");
+        assert!(full.len() > minimal.len());
+        // Stable-head contract: no date / language rule in the prompt head
+        // (they travel in the trailing volatile state message).
+        assert!(!minimal.contains("LANGUAGE RULE"));
+        assert!(!full.contains("Current date:"));
+    }
 
     fn hist_tokens(h: &[ChatMessage]) -> usize {
         h.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("") )).sum()

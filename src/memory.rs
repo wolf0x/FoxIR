@@ -1540,7 +1540,9 @@ impl MemoryStore {
                 last_accessed INTEGER NOT NULL,
                 tags          TEXT NOT NULL DEFAULT '[]',
                 links         TEXT NOT NULL DEFAULT '[]',
-                archived      INTEGER NOT NULL DEFAULT 0
+                archived      INTEGER NOT NULL DEFAULT 0,
+                loaded        INTEGER NOT NULL DEFAULT 0,
+                referenced    INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_df_scope ON deep_facts(scope);
             CREATE INDEX IF NOT EXISTS idx_df_subject ON deep_facts(subject_key);
@@ -1560,6 +1562,22 @@ impl MemoryStore {
                     "ALTER TABLE deep_facts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
                 )
                 .map_err(|e| format!("Two-tier schema add archived: {e}"))?;
+            }
+            // KPI 连移：Loaded/Referenced 计数列（老库 ALTER 追加，默认 0）。
+            for col in ["loaded", "referenced"] {
+                let has_col: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('deep_facts') WHERE name = ?1",
+                        params![col],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has_col == 0 {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE deep_facts ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0;"
+                    ))
+                    .map_err(|e| format!("Two-tier schema add {col}: {e}"))?;
+                }
             }
         }
 
@@ -1599,6 +1617,28 @@ impl MemoryStore {
     /// 显式使用/召回与注入触达均走 deep_touch_batch，保持"用进废退"一致语义。
     pub fn deep_touch(&self, ids: &[String]) -> Result<usize, String> {
         self.deep_touch_batch(ids)
+    }
+
+    /// 记录一轮注入/引用 KPI：loaded += 1（被注入的事实），
+    /// referenced += 1（回复真正引用其关键词的事实）。只增不减；
+    /// 低 referenced/loaded 比率仅通过 effectiveness 降权，不删除。
+    pub fn deep_record_usage(&self, loaded_ids: &[String], referenced_ids: &[String]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        for (ids, col) in [(loaded_ids, "loaded"), (referenced_ids, "referenced")] {
+            if ids.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; ids.len()].join(",");
+            let sql = format!("UPDATE deep_facts SET {col} = {col} + 1 WHERE id IN ({placeholders})");
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("deep_record_usage prepare: {e}"))?;
+            let named: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            stmt.execute(rusqlite::params_from_iter(named))
+                .map_err(|e| format!("deep_record_usage: {e}"))?;
+        }
+        Ok(())
     }
 
     // ── Deep ────────────────────────────────────────────────
@@ -1953,6 +1993,8 @@ fn deep_row(r: &rusqlite::Row) -> rusqlite::Result<crate::deep_memory::DeepFact>
         tags: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
         links: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
         archived: r.get::<_, i64>(13)? != 0,
+        loaded: r.get::<_, i64>(14)? as u32,
+        referenced: r.get::<_, i64>(15)? as u32,
     })
 }
 
@@ -2055,7 +2097,7 @@ mod tests_two_tier {
             last_accessed: crate::deep_memory::now_secs(),
             tags: vec![],
             links: vec![],
-            archived: false,
+            archived: false, loaded: 0, referenced: 0,
         };
         s.deep_store(&f).unwrap();
         let list = s.deep_list("global").unwrap();
@@ -2123,7 +2165,7 @@ mod tests_two_tier {
                 last_accessed: last,
                 tags: vec![],
                 links: vec![],
-                archived: false,
+                archived: false, loaded: 0, referenced: 0,
             };
             store.deep_store(&fact).unwrap();
         };
@@ -2159,7 +2201,7 @@ mod tests_two_tier {
             id: "x".into(), content: content.into(), summary: String::new(), essence: String::new(),
             fact_type: crate::deep_memory::FactType::Reference, scope: crate::deep_memory::MemoryScope::Global,
             pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
-            importance: 4.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false,
+            importance: 4.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false, loaded: 0, referenced: 0,
         };
         let related = fact("Process count is 42, running svchost and explorer");
         let unrelated = fact("Oracle database backup completed at midnight");
@@ -2180,7 +2222,7 @@ mod tests_two_tier {
                     id: id.into(), content: content.into(), summary: String::new(), essence: String::new(),
                     fact_type: crate::deep_memory::FactType::Reference, scope: crate::deep_memory::MemoryScope::Global,
                     pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
-                    importance: imp, created_at: now, last_accessed: now, tags: vec![], links: vec![], archived: false,
+                    importance: imp, created_at: now, last_accessed: now, tags: vec![], links: vec![], archived: false, loaded: 0, referenced: 0,
                 })
                 .unwrap();
         };
@@ -2200,7 +2242,7 @@ mod tests_two_tier {
             id: id.into(), content: id.into(), summary: String::new(), essence: String::new(),
             fact_type: t, scope: crate::deep_memory::MemoryScope::Global,
             pinned_by: crate::deep_memory::PinnedBy::Agent, subject_key: None,
-            importance: 3.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false,
+            importance: 3.0, created_at: 1, last_accessed: 1, tags: vec![], links: vec![], archived: false, loaded: 0, referenced: 0,
         };
         let mut facts = Vec::new();
         for i in 0..10 {
@@ -2236,7 +2278,7 @@ fn deep_find_subject_any_includes_archived() {
             last_accessed: now - 100 * 86_400,
             tags: vec![],
             links: vec![],
-            archived: false,
+            archived: false, loaded: 0, referenced: 0,
         })
         .unwrap();
     // 真实软归档：importance<3 且久未访问 → archived=1。
