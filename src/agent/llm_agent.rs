@@ -852,6 +852,9 @@ when speaking to them directly. Never use generic terms like \"user\", \"hey\", 
         // Greeting norm: the ONLY rule a Minimal-tier greeting turn needs.
         prompt.push_str(
             "\n## Greetings Stay Shallow\n\
+Even if the context or memory mentions pending tasks, TODO lists, or past cases, NEVER bring \
+them up in a greeting reply — task status lives on the user's TASKS panel, not in your mouth.\n\
+
 - **Greetings stay shallow.** For a basic \"hello\" / greeting, reply with exactly ONE short, warm line that \
   welcomes them and asks what they need. Do NOT enumerate, summarize, or name any past tasks, cases, projects, or \
   topics — never lead with anything like \"最近的事都记着…\" and never list case names. Do NOT claim anything \
@@ -1483,6 +1486,11 @@ impl Agent for LlmAgent {
         // Full otherwise; Minimal is a strict prefix of Full for cache
         // nesting across tier switches.
         let prompt_tier = PromptTier::select(user_message);
+        // Minimal tier (pure greetings): suppress ALL recall/guidance channels
+        // (memory pool, knowledge pointers, SOP replay, evidence ledger). A
+        // greeting needs none of them, and their content (e.g. a paused IR
+        // case) tempts the model to comment on pending work unasked.
+        let minimal_tier = matches!(prompt_tier, PromptTier::Minimal);
         let (system_prompt, task_skill_active) = self.build_system_prompt(
             prompt_tier,
             user_message,
@@ -1514,15 +1522,16 @@ impl Agent for LlmAgent {
         }
         let todo_item_timeout_secs = ctx.todo_item_timeout_secs;
         let is_main_session = is_main_session(&session_id);
+        let task_continuation = is_main_session
+            && Self::is_task_continuation(&user_message)
+            && Self::todo_list_has_unfinished(&self.workspace_dir);
         if is_main_session {
             // TODO 上下文按需载入：只在崩溃恢复（checkpoint resume）或用户明确
             // 要求继续任务（"继续/接着/continue" 等短指令且确有未完成项）时注入。
             // 未完成任务状态由前端 TASKS 面板展示（/api/todos 轮询 todos.json），
             // 普通回复不与 TASKS 混杂，模型也不再每轮被催促"返回未完成清单"。
             let resumed = ctx.resume_history.is_some();
-            let continuation = Self::is_task_continuation(&user_message)
-                && Self::todo_list_has_unfinished(&self.workspace_dir);
-            if resumed || continuation {
+            if resumed || task_continuation {
                 if let Some(todo_block) = Self::build_todo_context_block(&self.workspace_dir, todo_item_timeout_secs) {
                     state_core.push_str(&todo_block);
                 }
@@ -1530,10 +1539,12 @@ impl Agent for LlmAgent {
         }
         // Evidence ledger: inject the incident-scoped ledger (budget-capped,
         // sensitive entries excluded) so the agent reuses, not re-runs, results.
-        if let Some(evidence_block) =
-            crate::tool::evidence::build_evidence_block_for_session(&self.workspace_dir, &session_id)
-        {
-            state_core.push_str(&evidence_block);
+        if !minimal_tier {
+            if let Some(evidence_block) =
+                crate::tool::evidence::build_evidence_block_for_session(&self.workspace_dir, &session_id)
+            {
+                state_core.push_str(&evidence_block);
+            }
         }
         // Tool selectivity: core tools are always sent in full; peripheral tools
         // (MCP / external) are exposed on demand via `load_tool_schema`, and a
@@ -1629,12 +1640,12 @@ impl Agent for LlmAgent {
         let knowledge_pre_retrieval = ctx.knowledge_pre_retrieval;
         let budget_dashboard_enabled = ctx.budget_dashboard;
         let budget_sink = ctx.budget_sink.clone();
-        let knowledge_reminder: Option<String> = if knowledge_pre_retrieval {
+        let knowledge_reminder: Option<String> = if knowledge_pre_retrieval && !minimal_tier {
             self.build_knowledge_reminder(&user_message)
         } else {
             None
         };
-        let (sop_reminder, active_sop_id): (Option<String>, Option<String>) = if ctx.sop_replay {
+        let (sop_reminder, active_sop_id): (Option<String>, Option<String>) = if ctx.sop_replay && !minimal_tier {
             self.build_sop_reminder(&user_message, task_skill_active)
         } else {
             (None, None)
@@ -1751,9 +1762,9 @@ impl Agent for LlmAgent {
             }
 
             // Memory blocks are lifted out of history and travel in the
-            // trailing volatile state message (appended after history): the
-            // recency position keeps them salient while leaving the system
-            // prompt + history prefix untouched for prompt caching.
+            // volatile state message (inserted before the latest user turn by
+            // assemble_messages), leaving the system prompt + history prefix
+            // untouched for prompt caching.
             let mut memory_blocks = Vec::new();
             history.retain(|msg| {
                 if msg.role == "system" {
@@ -1769,7 +1780,7 @@ impl Agent for LlmAgent {
             // ── 混合价值池（hybrid）：system/tools/deep/最近对话保底不进场；
             //    auto-memory(SQLite) + knowledge + SOP 在单一池内按价值排序、共享预算、降级不丢。
             let mut pool_arts: Vec<crate::context_arbiter::Artifact> = Vec::new();
-            if !memory_blocks.is_empty() {
+            if !memory_blocks.is_empty() && !minimal_tier {
                 let mem_text = memory_blocks.join("\n");
                 pool_arts.push(crate::context_arbiter::artifact_from_block(
                     crate::context_arbiter::ArtifactKind::DeepFact, "auto-memory",
@@ -1955,8 +1966,16 @@ impl Agent for LlmAgent {
                 // and tell the model to advance to the next item.
                 if is_main_session {
                     if let Some(note) = Self::apply_todo_timeout(&workspace_dir, todo_item_timeout_secs) {
-                        info!("[session:{}] {}", session_id, note);
-                        history.push(ChatMessage::system(&note));
+                        // Stale items are always marked 'skipped' (state hygiene), but the
+                        // "continue with the next item" note only enters the context on
+                        // explicit task-continuation runs — on an unrelated turn it would
+                        // be an unprompted nag.
+                        if task_continuation {
+                            info!("[session:{}] {}", session_id, note);
+                            history.push(ChatMessage::system(&note));
+                        } else {
+                            info!("[session:{}] {} (note suppressed: not a continuation run)", session_id, note);
+                        }
                     }
                 }
                 // Trim history if approaching context limit using token-based budget

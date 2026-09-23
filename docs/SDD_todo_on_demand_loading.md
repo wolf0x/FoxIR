@@ -78,7 +78,17 @@
    - 删除"RETURN to this unfinished list"、"tell the user you are detaching"；
    - 明确"此块因用户要求续作而载入"，逐项执行规则保留，加"永不向用户播报清单机制"。
 
-### 4.4 不变的既有机制
+### 4.4 问候回合的泄漏通道封堵（commit `后补` 修订）
+
+`hello` 仍播报"还有 IR 清单没做完"的复盘：TODO 块不再注入后，任务信息仍从三个通道渗入问候回合——
+
+| 通道 | 封堵 |
+|---|---|
+| 混合价值池（session recall / deep memory / knowledge / SOP） | Minimal tier（纯问候）整个跳过 guidance pool、证据台账；`state_core` 只剩日期 + 语言规则 |
+| TODO 看门狗注释（"Continue with the next unfinished item"） | 陈旧项仍照常标记 skipped（状态卫生），但注释只在续作 run 注入上下文 |
+| 问候规则不够硬 | "Greetings Stay Shallow" 增加：即使上下文/记忆提到未完成任务，问候回复也绝不提及——任务状态由面板展示 |
+
+### 4.5 不变的既有机制
 
 - `todo_update` 工具与 todos.json 存储：不变。
 - 逐项超时看门狗（`apply_todo_timeout`）：不变——它只在 run 内部有 in_progress 项时触发，不属于每轮提醒。
