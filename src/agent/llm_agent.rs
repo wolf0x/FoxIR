@@ -1076,6 +1076,12 @@ to create a TODO list BEFORE starting work. THEN process the items STRICTLY ONE 
 5. When the LAST item is completed (all terminal: completed/cancelled/skipped), call `todo_update` action='clear'.\n\
 NEVER work on several items or all items in a single turn and summarize at the end — the user expects \
 progress to be visible item-by-item, with state synced after EACH step.\n\n\
+### Intent-first (IMPORTANT):\n\
+- Take every new user message at face value and just do it. A new message IS the new task — never \
+  comment on how it relates to previous tasks or the TODO list (no \"this is a different/new task\", \
+  no \"I will return to the list later\").\n\
+- Never mention task-list mechanics to the user (TODO / task list / progress syncing). Task status \
+  is shown on the user's TASKS panel — you never need to announce it.\n\
 Example:\n\
 ```json\n{\"name\": \"todo_update\", \"arguments\": {\"action\": \"set\", \"items\": [\n  {\"description\": \"Check disk space\", \"status\": \"pending\"},\n  {\"description\": \"List large files\", \"status\": \"pending\"},\n  {\"description\": \"Generate cleanup report\", \"status\": \"pending\"}\n]}}\n```\n"
         );
@@ -1287,11 +1293,11 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
             total, done, total, total - done, lines
         );
         s.push_str(&format!("Rules:\n\
-1. The user's CURRENT message always has highest priority. If it clearly starts a new task (a different / much larger request, or an explicit 'stop TODO'/'new task'), treat the new message as the active task; handle it, then RETURN to this unfinished list unless you are told to detach.\n\
+1. This block is loaded because the user explicitly asked to continue the list — keep processing the unfinished items one at a time. If the current message clearly redirects elsewhere, do that instead. Never narrate list mechanics to the user; just do the work and report results.\n\
 2. Progress ONE item at a time, in list order: mark it 'in_progress' -> do its work -> mark it 'completed'. You MAY verify and mark a LATER item 'completed' if it is already fully done, but keep working on the current item in list order.\n\
 3. Start the next pending item only after the current one is 'completed'/'cancelled'/'skipped'; this allows marking an already-finished later step without skipping the current one.\n\
 4. Each item has a {}-second timeout. A still-'in_progress' item past that is auto-marked 'skipped' by the watchdog; if you deem an item blocked, mark it 'cancelled'. In both cases move on to the next item.\n\
-5. Before declaring the whole list finished, call `todo_update` action='list' and verify EVERY item actually delivered its intended output. If any is only partially done, set it back to 'pending'/'in_progress' and redo it. Only when all items are verified terminal (completed/cancelled/skipped) call `todo_update` action='clear' to close the contract. To permanently detach from the old list, 'clear' it or tell the user you are no longer following that TODO.\n", todo_item_timeout_secs));
+5. Before declaring the whole list finished, call `todo_update` action='list' and verify EVERY item actually delivered its intended output. If any is only partially done, set it back to 'pending'/'in_progress' and redo it. Only when all items are verified terminal (completed/cancelled/skipped) call `todo_update` action='clear' to close the contract.\n", todo_item_timeout_secs));
         if has_unfinished {
             s.push_str("\n*[Note: the previous task was not completed — continue following it (item-by-item) unless the user's current message clearly overrides it.]*\n");
         }
@@ -1353,53 +1359,40 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         ))
     }
 
-    /// True if the session history already contains a `todo_update` call/result
-    /// (assistant tool call or tool-result with that tool name). Used to avoid
-    /// re-injecting a full stale snapshot when the model already has live TODO
-    /// context, while still emitting a lightweight reminder on resume.
-    fn history_has_todo(history: &[ChatMessage]) -> bool {
-        history.iter().any(|m| {
-            if m.role == "tool" {
-                m.name.as_deref() == Some("todo_update")
-            } else if m.role == "assistant" {
-                m.tool_calls.as_ref().map_or(false, |calls| {
-                    calls.iter().any(|c| c.function.name.as_deref() == Some("todo_update"))
-                })
-            } else {
-                false
-            }
-        })
+    /// 任务续作判定：用户消息是简短的"继续任务"指令（继续/接着/continue…）。
+    /// 只有续作时才把 TODO 列表载入上下文；未完成任务的状态由前端 TASKS
+    /// 面板（/api/todos 轮询 todos.json）展示，不再每轮注入上下文。
+    fn is_task_continuation(msg: &str) -> bool {
+        const CUES: &[&str] = &[
+            "继续", "接着", "按任务", "任务列表", "上次",
+            "continue", "keep going", "resume", "carry on",
+        ];
+        let t = msg.trim();
+        // 长消息大概率是新任务描述，不当续作处理。
+        if t.is_empty() || t.chars().count() > 60 {
+            return false;
+        }
+        let l = t.to_lowercase();
+        CUES.iter().any(|c| l.contains(c))
     }
 
-    /// Build a lightweight one-line reminder (no full item dump) when the model
-    /// already has TODO context but the list is still active. Returns None if
-    /// `todos.json` is absent/empty. Pointer
-    fn build_todo_reminder(workspace_dir: &str) -> Option<String> {
+    /// 主会话 todos.json 是否存在未完成任务（pending / in_progress）。
+    fn todo_list_has_unfinished(workspace_dir: &str) -> bool {
         if workspace_dir.is_empty() {
-            return None;
+            return false;
         }
         let path = std::path::Path::new(workspace_dir).join("todos.json");
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let items = root.get("items")?.as_array()?;
-        if items.is_empty() {
-            return None;
-        }
-        let total = items.len();
-        let unfinished_count = items.iter().filter(|it| {
-            let s = it.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            s != "completed" && s != "cancelled" && s != "skipped"
-        }).count();
-        Some(format!(
-            "\n## Current TASKS (active)\nYou have an active TODO list ({} items, {} unfinished). Reload via `todo_update` action='list' and continue finishing it.\n\
-            Rules:\n\
-            - Progress ONE item at a time, in list order; you MAY mark a LATER item 'completed' if you verify it is already fully done, but keep working on the current item.\n\
-            - Before declaring the whole list done, call `todo_update` 'list' and verify EVERY item actually delivered its intended output. If any is only partially done, set it back to 'pending'/'in_progress' and redo it.\n\
-            - If your current message is a tangent or a new task, handle it, then RETURN to this unfinished list. To permanently abandon it, call `todo_update` 'clear' or tell the user you are detaching.\n",
-            total,
-            unfinished_count
-        ))
-
+        let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
+        root.get("items")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|it| {
+                    let s = it.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                    s != "completed" && s != "cancelled" && s != "skipped"
+                })
+            })
+            .unwrap_or(false)
     }
     fn read_workspace_file(workspace_dir: &str, filename: &str, max_chars: usize) -> Option<(String, bool)> {
         let path = std::path::Path::new(workspace_dir).join(filename);
@@ -1522,20 +1515,17 @@ impl Agent for LlmAgent {
         let todo_item_timeout_secs = ctx.todo_item_timeout_secs;
         let is_main_session = is_main_session(&session_id);
         if is_main_session {
-            // #3 (converged + resume-safe): always embed the full list/status
-            // dump on checkpoint resume (history may be stale/partial, the model
-            // needs the current truth from todos.json). For a fresh/normal run,
-            // embed the full block only when history carries no live `todo_update`
-            // results; otherwise inject a one-line reminder to reload instead of
-            // pasting a potentially stale snapshot.
+            // TODO 上下文按需载入：只在崩溃恢复（checkpoint resume）或用户明确
+            // 要求继续任务（"继续/接着/continue" 等短指令且确有未完成项）时注入。
+            // 未完成任务状态由前端 TASKS 面板展示（/api/todos 轮询 todos.json），
+            // 普通回复不与 TASKS 混杂，模型也不再每轮被催促"返回未完成清单"。
             let resumed = ctx.resume_history.is_some();
-            let todo_in_history = Self::history_has_todo(&ctx.conversation_history);
-            if resumed || !todo_in_history {
+            let continuation = Self::is_task_continuation(&user_message)
+                && Self::todo_list_has_unfinished(&self.workspace_dir);
+            if resumed || continuation {
                 if let Some(todo_block) = Self::build_todo_context_block(&self.workspace_dir, todo_item_timeout_secs) {
                     state_core.push_str(&todo_block);
                 }
-            } else if let Some(reminder) = Self::build_todo_reminder(&self.workspace_dir) {
-                state_core.push_str(&reminder);
             }
         }
         // Evidence ledger: inject the incident-scoped ledger (budget-capped,
@@ -3909,6 +3899,31 @@ mod tests {
     }
 
     #[test]
+    fn task_continuation_detection() {
+        assert!(LlmAgent::is_task_continuation("继续"));
+        assert!(LlmAgent::is_task_continuation("接着上次的做"));
+        assert!(LlmAgent::is_task_continuation("continue"));
+        assert!(LlmAgent::is_task_continuation("keep going"));
+        // 新任务描述不算续作
+        assert!(!LlmAgent::is_task_continuation("帮我分析一下这个日志文件里的异常登录"));
+        // 超长消息即使含“继续”也不算
+        let long = format!("继续{}", "x".repeat(100));
+        assert!(!LlmAgent::is_task_continuation(&long));
+        assert!(!LlmAgent::is_task_continuation(""));
+    }
+
+    #[test]
+    fn todo_unfinished_gate() {
+        let ws = tmp_ws("unfinished");
+        write_todos(&ws, vec![("a".into(), "pending".into()), ("b".into(), "completed".into())]);
+        assert!(LlmAgent::todo_list_has_unfinished(&ws));
+        write_todos(&ws, vec![("a".into(), "completed".into()), ("b".into(), "skipped".into())]);
+        assert!(!LlmAgent::todo_list_has_unfinished(&ws));
+        let _ = std::fs::remove_dir_all(&ws);
+        assert!(!LlmAgent::todo_list_has_unfinished(&ws));
+    }
+
+    #[test]
     fn todo_block_injected_with_items_and_rules() {
         let ws = tmp_ws("block");
         write_todos(&ws, vec![("a".into(), "pending".into()), ("b".into(), "completed".into())]);
@@ -3965,42 +3980,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    #[test]
-    fn history_has_todo_detects_tool_call_and_result() {
-        // result message
-        let res = ChatMessage::tool_result("id1", "todo_update", "ok");
-        assert!(LlmAgent::history_has_todo(&[res]));
-
-        // assistant tool call
-        let call = ChatMessage::assistant_with_tool_calls(vec![
-            crate::model::ToolCallDelta {
-                id: "t1".into(),
-                call_type: "function".into(),
-                function: crate::model::FunctionCallDelta {
-                    name: Some("todo_update".into()),
-                    arguments: Some("{}".into()),
-                },
-            },
-        ]);
-        assert!(LlmAgent::history_has_todo(&[call]));
-
-        // unrelated tool / text -> false
-        let other = ChatMessage::tool_result("id2", "shell_exec", "x");
-        let text = ChatMessage::user("hi");
-        assert!(!LlmAgent::history_has_todo(&[other, text]));
-    }
-
-    #[test]
-    fn todo_reminder_emitted_when_list_active_and_absent_when_empty() {
-        let ws = tmp_ws("remind");
-        write_todos(&ws, vec![("a".into(), "in_progress".into())]);
-        let rem = LlmAgent::build_todo_reminder(&ws).unwrap();
-        assert!(rem.contains("action='list'"));
-        // empty -> None
-        std::fs::write(std::path::Path::new(&ws).join("todos.json"), r#"{"items":[]}"#).unwrap();
-        assert!(LlmAgent::build_todo_reminder(&ws).is_none());
-        let _ = std::fs::remove_dir_all(&ws);
-    }
 
     #[test]
     fn sop_reminder_suppressed_when_skill_active() {
