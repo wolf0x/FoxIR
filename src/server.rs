@@ -1578,23 +1578,37 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     loop {
         // If a follow-up task is queued (sent while the previous task ran, no
         // "insert" click), dispatch it as the next sequential task BEFORE
-        // waiting for new user input.
+        // waiting for new user input - but ONLY when no run is in flight.
+        // Popping while a run is active just hits the session_is_running
+        // re-queue below, turning the loop into a busy-spin (pop -> push ->
+        // pop every few ms, re-running all memory injections each pass) until
+        // the in-flight run finishes.
         // Queued user interjections are always dispatched into the execution
         // queue (FIFO), even after a Stop. Stop only cancels the in-flight
         // task; already-queued user messages must still execute.
-        let user_msg = match crate::interject::pop_pending(&session_id) {
-            Some(next_content) => {
-                info!("[session:{}] Dispatching queued follow-up task", session_id);
-                // Tell the client this queued interjection is now entering the
-                // execution queue so it can render a user-side bubble. It must
-                // NOT be shown earlier (only once it actually starts running).
-                let run_content = next_content.clone();
-                let _ = ws_send_bounded(&ws_sink, json!(
-                    {"type":"queued_run","content":run_content,"session":session_id}).to_string()).await;
-                let msg_json = json!({ "type": "chat", "content": next_content });
-                Some(Message::Text(msg_json.to_string().into()))
+        let user_msg = if state.session_is_running(&session_id) {
+            // Run in flight: leave the follow-up queue untouched. Wait briefly
+            // for new client input (stop/interject/new chat) or a timeout,
+            // then re-check whether the run has finished.
+            match tokio::time::timeout(std::time::Duration::from_millis(100), ws_rx.recv()).await {
+                Ok(m) => m,
+                Err(_) => continue,
             }
-            _ => ws_rx.recv().await,
+        } else {
+            match crate::interject::pop_pending(&session_id) {
+                Some(next_content) => {
+                    info!("[session:{}] Dispatching queued follow-up task", session_id);
+                    // Tell the client this queued interjection is now entering the
+                    // execution queue so it can render a user-side bubble. It must
+                    // NOT be shown earlier (only once it actually starts running).
+                    let run_content = next_content.clone();
+                    let _ = ws_send_bounded(&ws_sink, json!(
+                        {"type":"queued_run","content":run_content,"session":session_id}).to_string()).await;
+                    let msg_json = json!({ "type": "chat", "content": next_content });
+                    Some(Message::Text(msg_json.to_string().into()))
+                }
+                _ => ws_rx.recv().await,
+            }
         };
         let user_msg = match user_msg {
             Some(msg) => msg,
