@@ -34,6 +34,7 @@ pub mod scheduler;
 pub mod server;
 pub mod session;
 pub mod skill;
+pub mod debrief;
 pub mod sop;
 pub mod security;
 pub mod tool;

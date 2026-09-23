@@ -173,6 +173,11 @@ pub struct AppState {
     pub skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// 深层记忆注入开关（默认开）。
     pub two_tier_memory: Arc<AtomicBool>,
+    /// 会话结束后 Debrief（案例/SOP 固化）开关。
+    pub debrief_enabled: Arc<AtomicBool>,
+    /// 每会话工具调用日志（权威口径：事件流 ToolResult），
+    /// 供 Debrief 门控与作者化使用。每会话上限 200 条。
+    pub session_tool_log: Arc<Mutex<std::collections::HashMap<String, Vec<(String, bool)>>>>,
     pub enable_context_scaling: Arc<AtomicBool>,
     pub max_inline_chars: Arc<AtomicUsize>,
     pub skill_listing_strategy: Arc<AtomicUsize>,
@@ -1397,6 +1402,16 @@ async fn drain_session_stream(
                         if let AgentEvent::TextDelta { content: c, .. } = &event {
                             assistant_text.push_str(c);
                         }
+                        // 权威工具计数：记录每个 ToolResult 的成败，供会话结束时
+                        // Debrief 门控使用（不再从 assistant 文本猜测）。
+                        if let AgentEvent::ToolResult { name, result, .. } = &event {
+                            let success = result.get("error").is_none();
+                            let mut log = state.session_tool_log.lock().await;
+                            let entries = log.entry(session_id.clone()).or_default();
+                            if entries.len() < 200 {
+                                entries.push((name.clone(), success));
+                            }
+                        }
                         if let AgentEvent::Usage { model: _, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
                             let ms = state.memory_store.clone();
                             let mdl = model.clone();
@@ -2421,25 +2436,34 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
     // bundled the procedure. Skip authoring for those.
     let skill_driven = state.skill_used_sessions.lock().unwrap().contains(&session_id);
     if skill_driven {
-        info!("Session {} was skill-driven; skipping SOP authoring", &session_id[..8.min(session_id.len())]);
+        info!("Session {} was skill-driven; skipping debrief", &session_id[..8.min(session_id.len())]);
     }
-    if history.len() >= 4 && !skill_driven {
+    // 结论固化（Debrief）：门控 = 问题明确 + 过程实质（权威工具计数）+ 结果收敛。
+    // 产物双轨：案例 writeup → knowledge/writeups/；可复用流程 → sops.json。
+    if history.len() >= 4 && !skill_driven && state.debrief_enabled.load(Ordering::SeqCst) {
         let provider = state.provider.clone();
         let model_name = state.model_configs.read().await.first().map(|m| m.name.clone()).unwrap_or_default();
         let workspace_dir = state.workspace_dir.clone();
         let sid = session_id.clone();
+        let tool_log = state
+            .session_tool_log
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
         tokio::spawn(async move {
-            match crate::sop::author_sop_from_session(&history, provider, &model_name, &workspace_dir).await {
-                Ok(Some(sop)) => {
-                    info!("Session {} authored SOP '{}' ({} phases)", &sid[..8.min(sid.len())], sop.name, sop.phases.len());
-                    // C2：作者化（低频事件）是天然 drain 点，作者化后即执行一次 GC。
-                    match crate::sop::gc_sops(&workspace_dir) {
-                        Ok(n) if n > 0 => info!("[sop] GC after authoring removed {} SOP(s)", n),
-                        _ => {}
-                    }
+            match crate::debrief::run(provider, &model_name, &workspace_dir, &history, &tool_log).await {
+                Ok(Some(out)) => {
+                    info!(
+                        "Session {} debrief: case_note={:?} sop={:?}",
+                        &sid[..8.min(sid.len())],
+                        out.case_note_path,
+                        out.sop_id
+                    );
                 }
-                Ok(None) => info!("Session {} no SOP-worthy procedure", &sid[..8.min(sid.len())]),
-                Err(e) => warn!("Session {} SOP authoring failed: {}", &sid[..8.min(sid.len())], e),
+                Ok(None) => info!("Session {} debrief: nothing worth solidifying", &sid[..8.min(sid.len())]),
+                Err(e) => warn!("Session {} debrief failed: {}", &sid[..8.min(sid.len())], e),
             }
         });
     }

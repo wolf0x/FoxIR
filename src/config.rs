@@ -40,6 +40,10 @@ pub struct AgentConfig {
     /// 独立 SOP 回放开关（默认开）。关闭 knowledge_pre_retrieval 不会连带关闭 SOP。
     #[serde(default = "default_sop_replay")]
     pub sop_replay: bool,
+    /// 会话结束后的结论固化（Debrief：案例 writeup 写入 knowledge/writeups/，
+    /// 可复用流程注册为 SOP）。默认开。
+    #[serde(default = "default_debrief_enabled")]
+    pub debrief_enabled: bool,
     /// 深层记忆注入开关。默认开。
     #[serde(default = "default_two_tier_memory")]
     pub two_tier_memory: bool,
@@ -453,6 +457,7 @@ impl Default for Config {
                 trim_redundant_tool_calls: default_trim_redundant_tool_calls(),
                 knowledge_pre_retrieval: default_knowledge_pre_retrieval(),
                 sop_replay: default_sop_replay(),
+                debrief_enabled: default_debrief_enabled(),
                 two_tier_memory: default_two_tier_memory(),
                 budget_dashboard: default_budget_dashboard(),
                 context_window_threshold: default_context_window_threshold(),
@@ -501,6 +506,7 @@ fn default_rabbit_hole_threshold() -> usize { 5 }
 fn default_trim_redundant_tool_calls() -> bool { false }
 fn default_knowledge_pre_retrieval() -> bool { true }
 fn default_sop_replay() -> bool { true }
+fn default_debrief_enabled() -> bool { true }
 fn default_two_tier_memory() -> bool { true }
 fn default_budget_dashboard() -> bool { true }
 fn default_context_window() -> usize { 128000 }

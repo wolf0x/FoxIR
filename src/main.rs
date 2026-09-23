@@ -34,6 +34,7 @@ mod scheduler;
 mod server;
 mod session;
 mod skill;
+mod debrief;
 mod sop;
 mod security;
 #[allow(dead_code)]
@@ -494,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
+    let debrief_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.debrief_enabled));
 
     // SDD v1.5 H2: main agent is always Instant; Expert mode is handled by
     // ManagedRunner (separate code path). orchestration_enabled only controls
@@ -691,6 +693,8 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         trim_redundant_tool_calls: trim_redundant_tool_calls.clone(),
         knowledge_pre_retrieval: knowledge_pre_retrieval.clone(),
         sop_replay: sop_replay.clone(),
+        debrief_enabled: debrief_enabled.clone(),
+        session_tool_log: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         skill_used_sessions: skill_used_sessions.clone(),
         two_tier_memory: two_tier_memory.clone(),
         budget_dashboard: budget_dashboard.clone(),
