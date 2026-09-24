@@ -472,7 +472,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build external tools manager (resolve tools dir from workspace)
     let tools_dir = std::path::Path::new(&workspace_dir).join("tools");
-    let external_tools = Arc::new(Mutex::new(ExternalToolsManager::new(tools_dir.clone())));
+    let external_tools =
+        Arc::new(Mutex::new(ExternalToolsManager::new(tools_dir.clone(), workspace_dir.clone())));
     info!("External tools dir: {}", tools_dir.display());
 
     // Register external tools into registry (LLM-visible at startup)
@@ -492,8 +493,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrap registry in Arc<RwLock> for dynamic MCP tool registration
     let shared_tools = Arc::new(tokio::sync::RwLock::new(registry));
 
+    // browser_cdp 的两个热更开关：Settings 直接写这两个共享值，下一次启动浏览器
+    // 即生效，不需要重启进程。
+    let browser_headless =
+        Arc::new(std::sync::atomic::AtomicBool::new(config.agent.browser_headless));
+    let browser_executable =
+        Arc::new(std::sync::RwLock::new(config.agent.browser_executable.clone()));
+    // Web Browser 能力开关（Tools 页）。关掉 = 真注销 browser_cdp，
+    // 同时系统提示里那段浏览器说明也不再拼进去。
+    let browser_enabled =
+        Arc::new(std::sync::atomic::AtomicBool::new(config.agent.browser_enabled));
     // Create browser session early so it can be shared between agent (cleanup) and tool (use)
-    let browser_session = crate::tool::browser_cdp::BrowserSession::new(workspace_dir.clone());
+    let browser_session = crate::tool::browser_cdp::BrowserSession::new(
+        workspace_dir.clone(),
+        browser_headless.clone(),
+        browser_executable.clone(),
+    );
 
     // Build agent using builder pattern (ADK-RUST style)
     // Per-session skill-usage tracking (shared with AppState so SOP authoring can skip
@@ -501,6 +516,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let sop_replay = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.sop_replay));
+    // Linux 取证工具族全量载入开关（Settings，默认关 = 降为按需载入）。
+    // 与 agent / AppState 共享同一原子，切换无需重启。
+    let linux_ir_tools = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.linux_ir_tools));
     let debrief_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.debrief_enabled));
 
     // SDD v1.5 H2: main agent is always Instant; Expert mode is handled by
@@ -522,6 +540,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .two_tier_memory(config.agent.two_tier_memory)
         .skill_used_sessions(skill_used_sessions.clone())
         .sop_replay(sop_replay.clone())
+        .linux_ir_tools(linux_ir_tools.clone())
+        .browser_enabled(browser_enabled.clone())
         .cleanup_session(browser_session.clone())
         .memory_store(memory_store.clone())
         .build()
@@ -658,7 +678,17 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         reg.register(Arc::new(crate::tool::evidence::EvidenceTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_ingest::KnowledgeIngestTool::new(workspace_dir.clone())));
-        reg.register(Arc::new(crate::tool::browser_cdp::BrowserCdpTool::new(browser_session)));
+        // Web Browser 开关：关掉就不注册 browser_cdp（真注销，模型看不见）。
+        // 会话本体仍要建好并交给 AppState：ir_report 出 PDF 要用它，Tools 页
+        // 重新启用时也要拿同一个会话（同一份持久 profile）。
+        if config.agent.browser_enabled {
+            reg.register(Arc::new(crate::tool::browser_cdp::BrowserCdpTool::new(browser_session.clone())));
+        } else {
+            info!("browser_cdp disabled in config (Tools page): tool not registered");
+        }
+        // 报告导出复用同一个浏览器实例（覆盖 build_default 里不带会话的那份注册）：
+        // 再起一个实例会跟它抢同一个 user-data-dir，后起的会直接失败。
+        reg.register(Arc::new(crate::tool::ir_report::IrReportTool::new(Some(browser_session.clone()))));
 
     }
     info!("Registered cron_manage + memory_md + todo_update + browser_cdp tools");
@@ -675,8 +705,9 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
     }
     
     
-    // Human intervention simulation switch (default: false)
-    let human_intervention_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Human intervention simulation switch（现在从 config 读，以前硬编码 false）
+    let human_intervention_enabled =
+        Arc::new(std::sync::atomic::AtomicBool::new(config.agent.human_intervention));
 
 
     // Build app state
@@ -704,6 +735,11 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         skill_used_sessions: skill_used_sessions.clone(),
         two_tier_memory: two_tier_memory.clone(),
         budget_dashboard: budget_dashboard.clone(),
+        linux_ir_tools: linux_ir_tools.clone(),
+        browser_headless: browser_headless.clone(),
+        browser_executable: browser_executable.clone(),
+        browser_enabled: browser_enabled.clone(),
+        browser_session: browser_session.clone(),
         context_budget: context_budget.clone(),
         enable_context_scaling: enable_context_scaling.clone(),
         max_inline_chars: max_inline_chars.clone(),

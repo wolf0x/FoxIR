@@ -104,6 +104,85 @@ fn estimate_tokens(text: &str) -> usize {
     crate::deep_memory::estimate_tokens(text)
 }
 
+/// Total estimated token cost of a tool-definition set as it goes on the wire
+/// (the provider receives the serialized JSON of every definition). This is the
+/// authoritative measure of the "Tools" slice of the context budget.
+pub(crate) fn tool_defs_tokens(defs: &[crate::model::ToolDefinition]) -> usize {
+    defs.iter()
+        .map(|d| estimate_tokens(&serde_json::to_string(d).unwrap_or_default()))
+        .sum()
+}
+
+/// One-line summary of a tool description for the on-demand schema catalog: the
+/// first sentence, hard-bounded. Catalog entries are deliberately short — the
+/// full description (including usage guidance) only arrives with the schema.
+fn catalog_summary(description: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let head = description
+        .split(|c| c == '\n' || c == '.')
+        .find(|p| !p.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut s: String = head.chars().take(MAX_CHARS).collect();
+    if head.chars().count() > MAX_CHARS {
+        s.push('…');
+    }
+    s
+}
+
+/// Total fixed cost of a request: everything that rides along before a single
+/// byte of conversation. This is the one authority behind `history_budget` and
+/// the hard gate — display and adjudication must read the same number, or the
+/// dashboard lies while the request silently overflows the window.
+pub(crate) fn fixed_cost_tokens(
+    stable: &str,
+    volatile: &str,
+    tool_defs: &[crate::model::ToolDefinition],
+) -> usize {
+    estimate_tokens(stable) + estimate_tokens(volatile) + tool_defs_tokens(tool_defs)
+}
+
+/// The one place that turns a fixed cost into a history line — and into a
+/// go/no-go decision.
+///
+/// `Some(space)`: the conversation may use `space` tokens. `None`: the fixed
+/// cost alone already fills the budget, so no amount of trimming can make the
+/// request fit. Sending it anyway means the provider truncates the prompt
+/// silently (a corrupted run, a 200 OK, zero trace in our logs) — the caller
+/// must fail loudly instead.
+pub(crate) fn history_space(max_history_tokens: usize, fixed: usize) -> Option<usize> {
+    if fixed >= max_history_tokens {
+        None
+    } else {
+        Some(max_history_tokens - fixed)
+    }
+}
+
+/// Settings gate for the Linux forensics family (aggregator + category tools).
+///
+/// When the switch is off they are NOT unregistered — they stay executable and
+/// gain a one-line catalog entry so the model still knows they exist — but their
+/// full schemas leave the per-request payload until pulled via
+/// `load_tool_schema`. `linux_ssh` is not part of the family, so a Linux host
+/// stays directly reachable either way. Returns (delivered defs, catalog, demoted).
+pub(crate) fn apply_linux_ir_gate(
+    defs: Vec<crate::model::ToolDefinition>,
+    mut catalog: Vec<(String, String)>,
+    full_load: bool,
+) -> (Vec<crate::model::ToolDefinition>, Vec<(String, String)>, usize) {
+    if full_load {
+        return (defs, catalog, 0);
+    }
+    let (kept, demoted): (Vec<_>, Vec<_>) = defs
+        .into_iter()
+        .partition(|d| !crate::tool::ir_linux::is_linux_ir_tool(&d.function.name));
+    let n = demoted.len();
+    for d in &demoted {
+        catalog.push((d.function.name.clone(), catalog_summary(&d.function.description)));
+    }
+    (kept, catalog, n)
+}
+
 /// System-prompt tier (nested prefixes: Minimal is a strict byte-prefix of
 /// Full). Selected per user message; Minimal serves pure greetings with the
 /// persona head only, skipping the full tool/rulebook sections (~80% smaller
@@ -459,6 +538,13 @@ pub struct LlmAgent {
     skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Independent SOP replay switch (default on; independent of knowledge_pre_retrieval).
     sop_replay: Arc<std::sync::atomic::AtomicBool>,
+    /// Settings switch: when false (default) the Linux IR tool family is kept out
+    /// of the per-request tool payload and exposed through the on-demand schema
+    /// catalog instead. Hot-reloadable; shared with AppState.
+    linux_ir_tools: Arc<std::sync::atomic::AtomicBool>,
+    /// Web Browser 能力开关（Tools 页）。false 时 browser_cdp 已从注册表注销，
+    /// 系统提示里那段浏览器说明也必须消失。
+    browser_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Sessions to clean up after the agent loop completes.
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
     /// Optional memory store for persisting sub-agent results (SDD v1.5 2.4).
@@ -488,6 +574,8 @@ pub struct LlmAgentBuilder {
     two_tier_memory: bool,
     skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     sop_replay: Arc<std::sync::atomic::AtomicBool>,
+    linux_ir_tools: Arc<std::sync::atomic::AtomicBool>,
+    browser_enabled: Arc<std::sync::atomic::AtomicBool>,
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
     memory_store: Option<Arc<crate::memory::MemoryStore>>,
     orchestration_limits: crate::config::OrchestrationLimits,
@@ -515,6 +603,8 @@ impl LlmAgentBuilder {
             two_tier_memory: true,
             skill_used_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             sop_replay: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            linux_ir_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            browser_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cleanup_sessions: Vec::new(),
             memory_store: None,
             orchestration_limits: crate::config::OrchestrationLimits::default(),
@@ -551,6 +641,10 @@ impl LlmAgentBuilder {
     pub fn two_tier_memory(mut self, enabled: bool) -> Self { self.two_tier_memory = enabled; self }
     pub fn skill_used_sessions(mut self, v: Arc<std::sync::Mutex<std::collections::HashSet<String>>>) -> Self { self.skill_used_sessions = v; self }
     pub fn sop_replay(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.sop_replay = v; self }
+    /// Set the Linux IR tool-set switch (shared with AppState for hot reload).
+    pub fn linux_ir_tools(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.linux_ir_tools = v; self }
+    /// Set the Web Browser capability switch (shared with AppState for hot reload).
+    pub fn browser_enabled(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.browser_enabled = v; self }
     pub fn cleanup_session(mut self, session: Arc<crate::tool::browser_cdp::BrowserSession>) -> Self {
         self.cleanup_sessions.push(session); self
     }
@@ -587,6 +681,8 @@ impl LlmAgentBuilder {
             two_tier_memory: self.two_tier_memory,
             skill_used_sessions: self.skill_used_sessions,
             sop_replay: self.sop_replay,
+            linux_ir_tools: self.linux_ir_tools,
+            browser_enabled: self.browser_enabled,
             cleanup_sessions: self.cleanup_sessions,
             memory_store: self.memory_store,
             orchestration_limits: self.orchestration_limits,
@@ -820,11 +916,11 @@ when speaking to them directly. Never use generic terms like \"user\", \"hey\", 
 - 别用“我…一下…”“…如下”这种流水账开场：不要“我实时查一下你当前的IP情况”“结果如下”“当前情况如下”这类报动作/报结构的开头。结论和结果放最前，最多带一个自然过渡，开口就把答案给出来，别念步骤。\n\
 - 别硬装确定，不确定就明说并温柔追问。\n\
 \n\
-**需要出动工具时，自然带一句**：\n\
+**拿到工具结果后，自然带一句依据**（只能在结果之后说，不得用来预告动作）：\n\
 - “刚看了一眼，现在是……”\n\
 - “我重新确认了下，情况是这样：”\n\
 - “帮你查了当前状态，主要有这些：”\n\
-- “我去查一下公开来源，稍等。”\n\
+- 动手前不需要开场白：直接调用工具，拿到结果再说。“我去查一下，稍等。”、“让我…”这种只预告不调用的收场方式是错的。\n\
 \n\
 **复用已有信息时，讲清依据**：\n\
 - “基于刚才查到的厂商公告，结论是……”\n\
@@ -846,7 +942,7 @@ when speaking to them directly. Never use generic terms like \"user\", \"hey\", 
 \n\
 **决策顺序：** 执行动作 →（高风险先预览+确认）→ 工具；实时/当前/本机 → 工具；外部最新 → 工具，除非刚验证过且用户追问同一稳定事实；追问“刚才” → 用上下文；指代不清 → 只读确认再问；上下文已有刚验证的稳定答案 → 直接复用；答错有真实风险 → 验证或确认；其他情况复用上下文并说明不确定处。\n\
 \n\
-**表达：** 别念内部流程，把结果直接讲清楚。不要说“这是实时状态，我重新查一下”“正在为您查询，请稍候”这种客服腔，也别每句都喊用户名字——像在帮朋友，不像机器播报。需要出动工具时自然带一句：“刚看了一眼，现在是……”“我重新确认了下，情况是这样”“帮你查了当前状态，主要有这些”。复用时说清依据：“基于刚才查到的厂商公告，结论是……”。不确定就明说并追问，别硬装确定。\n",
+**表达：** 别念内部流程，把结果直接讲清楚。不要说“这是实时状态，我重新查一下”“正在为您查询，请稍候”这种客服腔，也别每句都喊用户名字——像在帮朋友，不像机器播报。拿到工具结果后再带一句依据：“刚看了一眼，现在是……”“我重新确认了下，情况是这样”“帮你查了当前状态，主要有这些”。动手前不预告：要说“我去查一下”，就必须同一条回复里真的把调用发出去。不确定就明说并追问，别硬装确定。\n",
         );
 
         // Greeting norm: the ONLY rule a Minimal-tier greeting turn needs.
@@ -868,6 +964,20 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
         }
 
         // -- REMAINDER (Full tier only) --
+        // Web Browser 关掉时这一段必须整段消失：工具已从注册表拿掉，提示词里留着它
+        // 只会让模型去调一个不存在的工具，白烧轮次还会给用户编出“浏览器坏了”的理由。
+        let browser_line = if self.browser_enabled.load(std::sync::atomic::Ordering::SeqCst) {
+            "  - `browser_cdp` — Browser automation via CDP: navigate, screenshot, get text/HTML, execute JS, \
+             plus `probe` (reports which browser executable was detected and the session state, without launching). \
+             Runs hidden by default; Settings can enable a visible window for a one-time interactive login. \
+             It drives its own persistent browser profile stored under the workspace, so a site signed into once \
+             stays signed in for later sessions; using it needs no extra authorization or confirmation. \
+             If a page fails to load or a launch error mentions the profile, call `probe` first and pass its \
+             findings to the user instead of retrying blindly. \
+             For screenshots: use the returned `url` field (e.g. `/workspace/output/xxx.png`) in markdown image syntax `![desc](url)` to display. NEVER use local file paths.\n".to_string()
+        } else {
+            String::new()
+        };
         prompt.push_str(&format!(
             "\n## TASK-DOMAIN ROUTING\n\
 This assistant handles a mix of work; route the response WITHOUT bias:\n\
@@ -908,9 +1018,7 @@ Layer 2 — Execution Dispatch (HOW to run):\n\
   - `remove_skill` — Delete a skill\n\
   - `memory_md` — Manage long-term curated memory: read/write MEMORY.md\n\
   - `todo_update` — Track multi-step task progress with a TODO list\n\
-  - `browser_cdp` — Headless browser automation: navigate, screenshot, get text/HTML, execute JS. \
-    Runs headless (no visible window). Use for quick automated tasks: screenshots, web scraping, checking URLs. \
-    For screenshots: use the returned `url` field (e.g. `/workspace/output/xxx.png`) in markdown image syntax `![desc](url)` to display. NEVER use local file paths. This built-in browser has NO user login state (safe/isolated); if a task requires the user's own logged-in sessions (dashboards, portals, SSO), prefer the separately-installed `browser_skill` ExternalSkill (bsk) instead of browser_cdp, or tell the user you need their auth.\n\
+{}\
 - If the user asks 'what is my IP' or similar, call `shell_exec` with `ipconfig` or `Get-NetIPAddress`.\n\
 - Always call tools FIRST, then explain the results to the user.\n\
 - Never say 'I can't check' or 'I don't have access' — you DO have access via tools!\n\n\
@@ -924,6 +1032,9 @@ saying \"let me check\" without the actual JSON block does nothing.\n\n\
 **CRITICAL: When emitting a tool call, output ONLY the JSON code block — nothing else.** \
 Do NOT write narrative text like \"let me open the calculator\" before or alongside the tool call. \
 Do NOT repeat yourself. The tool call IS your action — explain the result AFTER you receive it, not before.\n\
+**Atomicity rule (hard)**: an intention sentence and its tool call must never be separated. If you write that \
+you will do something, the tool call MUST be in the very same message. A reply that ends with \"let me check\" \
+or \"我这就调：\" and no tool call is a failed turn, not a partial answer.\n\
 Wrong: \"Let me open the calculator for you! ```json ... ```\"\n\
 Right: ```json\n{{\"name\": \"app_launch\", ...}}\n```\n\
 (Then after the tool result comes back, say \"Calculator has been opened.\")\n\n\
@@ -955,7 +1066,8 @@ Right: ```json\n{{\"name\": \"app_launch\", ...}}\n```\n\
 - **Do NOT repeat yourself.** Once you have answered a question or completed an action, stop. \
   Do not add follow-up narration like \"now let me verify\" or \"let me double-check\" unless the user asks.\n\
 - **Do NOT announce what you are about to do.** Just do it. If you need to call a tool, emit the tool call \
-  directly. Explain results AFTER the tool returns, not before.\n\n\
+  directly. Explain results AFTER the tool returns, not before. Announcing an action and then stopping is \
+  the single most common failure mode here — never separate the promise from the call.\n\n\
 ## CRITICAL: You Have Long-Term Memory\n\
 This assistant is connected to a LOCAL MEMORY STORE (SQLite). Past conversations with this user are persisted and \
 injected into your context as SYSTEM messages labeled **[Memory Context]** or **[Memory Recall]**.\n\
@@ -1006,6 +1118,7 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
   or timeline. If one short clause of context genuinely helps, keep it to a clause, not a whole extra section.\n\
 - Never offer to \"补记进长期记忆\" or \"写入记忆库\". Say naturally \"我帮你记一笔,下次就不会忘了\" only when you actually \
   save something.\n",
+            browser_line,
         ));
 
         // ── Permission Respect Rules ──
@@ -1257,15 +1370,20 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         context
     }
 
-    /// Build the injected "Current TASKS" context block from `todos.json`.
-    /// Returns `None` when the workspace has no list, so nothing is injected.
-    /// The block makes the TODO list the main session's task contract and
-    /// embeds the three fuses (priority / continue-after-stop / auto-clear).
-    fn build_todo_context_block(workspace_dir: &str, todo_item_timeout_secs: u64) -> Option<String> {
+    /// Build the injected "Current TASKS" context block from this session's
+    /// TODO file. Returns `None` when the session has no list, so nothing is
+    /// injected. The block makes the TODO list the main session's task contract
+    /// and embeds the three fuses (priority / continue-after-stop / auto-clear).
+    ///
+    /// The path MUST be resolved through `todos_file_path` — the exact key the
+    /// `todo_update` tool writes under. Hardcoding `todos.json` here once made
+    /// the whole main-session TASKS machinery (injection, continuation gate,
+    /// timeout watchdog) read a file nobody writes anymore.
+    fn build_todo_context_block(workspace_dir: &str, session_id: &str, todo_item_timeout_secs: u64) -> Option<String> {
         if workspace_dir.is_empty() {
             return None;
         }
-        let path = std::path::Path::new(workspace_dir).join("todos.json");
+        let path = crate::tool::todo_update::todos_file_path(workspace_dir, session_id);
         let raw = std::fs::read_to_string(&path).ok()?;
         let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let items = root.get("items")?.as_array()?;
@@ -1308,15 +1426,16 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
     }
 
 
-    /// Per-item timeout watchdog. For the main session, scans `todos.json`
-    /// and marks the first still-'in_progress' item 'skipped' once it has been
-    /// running longer than `timeout_secs` (using its `started_at` stamp), then
-    /// returns a short note to inject into the next model turn so it advances.
-    fn apply_todo_timeout(workspace_dir: &str, timeout_secs: u64) -> Option<String> {
+    /// Per-item timeout watchdog. Scans this session's TODO file (same key the
+    /// `todo_update` tool writes) and marks the first still-'in_progress' item
+    /// 'skipped' once it has been running longer than `timeout_secs` (using its
+    /// `started_at` stamp), then returns a short note to inject into the next
+    /// model turn so it advances.
+    fn apply_todo_timeout(workspace_dir: &str, session_id: &str, timeout_secs: u64) -> Option<String> {
         if workspace_dir.is_empty() {
             return None;
         }
-        let path = std::path::Path::new(workspace_dir).join("todos.json");
+        let path = crate::tool::todo_update::todos_file_path(workspace_dir, session_id);
         let raw = std::fs::read_to_string(&path).ok()?;
         let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let items = root.get("items")?.as_array()?;
@@ -1379,12 +1498,12 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         CUES.iter().any(|c| l.contains(c))
     }
 
-    /// 主会话 todos.json 是否存在未完成任务（pending / in_progress）。
-    fn todo_list_has_unfinished(workspace_dir: &str) -> bool {
+    /// Whether this session's TODO list has unfinished items (pending / in_progress).
+    fn todo_list_has_unfinished(workspace_dir: &str, session_id: &str) -> bool {
         if workspace_dir.is_empty() {
             return false;
         }
-        let path = std::path::Path::new(workspace_dir).join("todos.json");
+        let path = crate::tool::todo_update::todos_file_path(workspace_dir, session_id);
         let Ok(raw) = std::fs::read_to_string(&path) else { return false };
         let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
         root.get("items")
@@ -1524,7 +1643,7 @@ impl Agent for LlmAgent {
         let is_main_session = is_main_session(&session_id);
         let task_continuation = is_main_session
             && Self::is_task_continuation(&user_message)
-            && Self::todo_list_has_unfinished(&self.workspace_dir);
+            && Self::todo_list_has_unfinished(&self.workspace_dir, &session_id);
         if is_main_session {
             // TODO 上下文按需载入：只在崩溃恢复（checkpoint resume）或用户明确
             // 要求继续任务（"继续/接着/continue" 等短指令且确有未完成项）时注入。
@@ -1532,7 +1651,7 @@ impl Agent for LlmAgent {
             // 普通回复不与 TASKS 混杂，模型也不再每轮被催促"返回未完成清单"。
             let resumed = ctx.resume_history.is_some();
             if resumed || task_continuation {
-                if let Some(todo_block) = Self::build_todo_context_block(&self.workspace_dir, todo_item_timeout_secs) {
+                if let Some(todo_block) = Self::build_todo_context_block(&self.workspace_dir, &session_id, todo_item_timeout_secs) {
                     state_core.push_str(&todo_block);
                 }
             }
@@ -1580,6 +1699,10 @@ impl Agent for LlmAgent {
             // opens them (SDD §7.3 / D10). Zero overhead when prefilter misses.
             let orch_allowset = orchestration_delivered_for(ctx.mode, ctx.depth, orch_candidate);
             defs.retain(|d| orchestration_delivered(&d.function.name, &orch_allowset));
+            // Settings gate: the Linux IR family is a block of schemas that only
+            // pays off against a Linux target; off ⇒ on-demand only.
+            let linux_ir_full = self.linux_ir_tools.load(std::sync::atomic::Ordering::SeqCst);
+            let (defs, periph, demoted) = apply_linux_ir_gate(defs, periph, linux_ir_full);
             let ls = if periph.is_empty() {
                 None
             } else {
@@ -1606,12 +1729,12 @@ impl Agent for LlmAgent {
                     },
                 })
             };
+            info!(
+                "[session:{}] Core tool set: {} tool(s), +{} on demand (linux_ir_full={} demoted={})",
+                session_id, defs.len(), periph.len(), linux_ir_full, demoted
+            );
             (defs, ls)
         };
-        info!("[session:{}] Core tool set: {} tool(s), +{} peripheral on demand", session_id, core_tool_defs.len(), {
-            let reg = self.tools.read().await;
-            reg.peripheral_tools().len()
-        });
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let working_dir = self.working_dir.clone();
@@ -1686,6 +1809,8 @@ impl Agent for LlmAgent {
                 user_given_name: self.user_given_name.clone(),
                 two_tier_memory: self.two_tier_memory,
                 sop_replay: self.sop_replay.clone(),
+                linux_ir_tools: self.linux_ir_tools.clone(),
+                browser_enabled: self.browser_enabled.clone(),
                 parent_model: ctx.model_name.clone(),
                 permissions: ctx.permissions.clone(),
                 permission_pending: ctx.permission_pending.clone(),
@@ -1816,53 +1941,72 @@ impl Agent for LlmAgent {
                 }
             }
 
-            // Account for system prompt size in the token budget.
-            // System prompt is NOT part of history but consumes context window.
-            let system_tokens = estimate_tokens(&stable_system_prompt) + estimate_tokens(&volatile_state);
-            let mut history_budget = max_history_tokens.saturating_sub(system_tokens);
-            if system_tokens > max_history_tokens / 2 {
-                warn!("[session:{}] System prompt uses {} tokens ({}% of budget {}), history budget reduced to {} tokens",
-                      session_id, system_tokens, system_tokens * 100 / max_history_tokens, max_history_tokens, history_budget);
+            // ── 单一权威账本（有限脑 §12.7）──
+            // 一次请求的固定成本 = 稳定前缀 + 易变状态 + 真正上网的工具定义。
+            // 旧实现只把前两项计入 history_budget，而 Dashboard 与模型自省块却把
+            // Tools 当独立一行展示：两本账、两个总数。小窗口模型上真实请求因此
+            // 静默越窗，由 provider 截掉对话中段（日志零痕迹）。现在显示层与裁决
+            // 层读同一组数字。
+            let base_tool_defs = {
+                let mut v = core_tool_defs.clone();
+                if let Some(ls) = &load_schema_def {
+                    v.push(ls.clone());
+                }
+                v
+            };
+            // 预留 = 输出预留（skull/10）+ 安全守卫（skull/50）。
+            let output_reserve = context_window / 10 + context_window / 50;
+            let stable_toks = estimate_tokens(&stable_system_prompt);
+            let volatile_toks = estimate_tokens(&volatile_state);
+            let tools_toks = tool_defs_tokens(&base_tool_defs);
+            let system_tokens = stable_toks + volatile_toks;
+            let fixed_tokens = fixed_cost_tokens(&stable_system_prompt, &volatile_state, &base_tool_defs);
+            debug_assert_eq!(fixed_tokens, system_tokens + tools_toks);
+            // 开局值只用于日志与首屏快照；真正的裁剪线每轮按实际携带的 tool_defs
+            // 重算（见循环内 turn_fixed），因为按需展开的工具会让固定成本自增长。
+            let mut history_budget = history_space(max_history_tokens, fixed_tokens).unwrap_or(0);
+            if fixed_tokens >= max_history_tokens {
+                // 即使清空对话也装不下：裁剪救不了这种情形，每轮硬门会显式失败。
+                warn!("[session:{}] Fixed cost (system {} + tools {}) exceeds the {}-token budget — trimming history cannot restore feasibility",
+                      session_id, system_tokens, tools_toks, max_history_tokens);
+            } else if fixed_tokens > max_history_tokens / 2 {
+                warn!("[session:{}] Fixed cost {} tokens ({}% of budget {}), history budget reduced to {} tokens",
+                      session_id, fixed_tokens, fixed_tokens * 100 / max_history_tokens, max_history_tokens, history_budget);
             }
-            info!("[session:{}] Context budget: system={} tokens, history_budget={} tokens (model={} tokens @ {}%)",
-                  session_id, system_tokens, history_budget, context_window, context_window_threshold);
+            info!("[session:{}] Context budget: system={} + tools({})={} fixed={} -> history_budget={} (model={} @ {}%)",
+                  session_id, system_tokens, base_tool_defs.len(), tools_toks, fixed_tokens,
+                  history_budget, context_window, context_window_threshold);
 
             // ── 有限脑预算自省（CONTEXT BUDGET）：让模型「知道自己的颅骨」以自我调节。 ──
             // 不作为正确性依赖（模型常忽略此类提示），硬仲裁/裁剪始终是权威（§12.7/§12.9）。
-            if budget_dashboard_enabled {
-                // 逐分类实测真实 token（temm1e 口径：used = 实际塞进上下文的各分类之和）。
-                let base_system = estimate_tokens(&stable_system_prompt) + estimate_tokens(&state_core);
-                let memory_toks: usize = memory_blocks.iter().map(|b| estimate_tokens(b)).sum();
-                let knowledge_toks = knowledge_reminder.as_ref().map(|k| estimate_tokens(k)).unwrap_or(0);
-                let sop_toks = sop_reminder.as_ref().map(|x| estimate_tokens(x)).unwrap_or(0);
-                let tools_toks: usize = core_tool_defs.iter()
-                    .map(|d| estimate_tokens(&serde_json::to_string(d).unwrap_or_default()))
-                    .sum();
-                let history_toks: usize = history.iter()
-                    .map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("")))
-                    .sum();
-                // 预留 = 输出预留（skull/10）+ 安全守卫（skull/50）。
-                let output_reserve = context_window / 10 + context_window / 50;
-                let report = crate::context_arbiter::budget_report(
+            // 展示切片必须互斥且求和等于真实携带量：旧列表把 Memory/Knowledge/SOP 单列，
+            // 而它们本就活在易变状态里，于是 used 被重复计数、free 比真实剩余更小。
+            let history_toks: usize = history.iter()
+                .map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("")))
+                .sum();
+            let make_report = |stable: usize, volatile: usize, tools: usize, hist: usize| {
+                crate::context_arbiter::budget_report(
                     context_window,
                     output_reserve,
                     &[
-                        ("System", base_system),
-                        ("Tools", tools_toks),
-                        ("Memory", memory_toks),
-                        ("Knowledge", knowledge_toks),
-                        ("SOP", sop_toks),
-                        ("History", history_toks),
+                        ("System", stable),
+                        ("Volatile", volatile),
+                        ("Tools", tools),
+                        ("History", hist),
                     ],
-                );
+                )
+            };
+            if budget_dashboard_enabled {
+                let report = make_report(stable_toks, volatile_toks, tools_toks, history_toks);
+                // 易变状态内部的细分给模型做参考（约值，不参与求和）。
+                let memory_toks: usize = memory_blocks.iter().map(|b| estimate_tokens(b)).sum();
+                let knowledge_toks = knowledge_reminder.as_ref().map(|k| estimate_tokens(k)).unwrap_or(0);
+                let sop_toks = sop_reminder.as_ref().map(|x| estimate_tokens(x)).unwrap_or(0);
                 volatile_state.push_str(&format!(
-                    "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Tools: {} | Memory: {} | Knowledge: {} | SOP: {} | History: {}\nPrioritize high-value content; hard limits are enforced by the system.\n=== END BUDGET ===",
+                    "\n\n=== CONTEXT BUDGET ===\nLimit: {} tokens | Used: {} | Available: {}\n  System: {} | Volatile: {} (~Memory: {} ~Knowledge: {} ~SOP: {}) | Tools: {} | History: {}\nPrioritize high-value content; hard limits are enforced by the system.\n=== END BUDGET ===",
                     report.window, report.used, report.free,
-                    base_system, tools_toks, memory_toks, knowledge_toks, sop_toks, history_toks,
+                    stable_toks, volatile_toks, memory_toks, knowledge_toks, sop_toks, tools_toks, history_toks,
                 ));
-                // 追加自省块后重算 system/history 预算，确保后续裁决基于真实尺寸。
-                history_budget = max_history_tokens.saturating_sub(estimate_tokens(&stable_system_prompt) + estimate_tokens(&volatile_state));
-                // 写共享快照供 /api/budget（与系统提示同源）。
                 if let Some(sink) = &budget_sink {
                     *sink.lock().unwrap() = Some(report);
                 }
@@ -1915,6 +2059,8 @@ impl Agent for LlmAgent {
             let mut used_fallback = false;
             let mut has_executed_tools = false;
             let mut reprompt_count = 0u32;
+            // pending-action 补发计数（模式 B：宣告动作却收场）。全 run 上限 1 次，最坏多花一轮。
+            let mut nudge_count = 0u32;
             // 传输层截断补救计数器。流被传输错误切断时把已流出的残文并入历史，并要求模型从中断处继续。
             // 上限为 1，避免同一次故障反复触发、堆叠出不可控的额外轮次。
             const MAX_STREAM_RECOVERIES: u32 = 1;
@@ -1965,7 +2111,7 @@ impl Agent for LlmAgent {
                 // active item stalled past its timeout, auto-mark it 'skipped'
                 // and tell the model to advance to the next item.
                 if is_main_session {
-                    if let Some(note) = Self::apply_todo_timeout(&workspace_dir, todo_item_timeout_secs) {
+                    if let Some(note) = Self::apply_todo_timeout(&workspace_dir, &session_id, todo_item_timeout_secs) {
                         // Stale items are always marked 'skipped' (state hygiene), but the
                         // "continue with the next item" note only enters the context on
                         // explicit task-continuation runs — on an unrelated turn it would
@@ -1978,23 +2124,11 @@ impl Agent for LlmAgent {
                         }
                     }
                 }
-                // Trim history if approaching context limit using token-based budget
-                let total_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
-                if total_tokens > history_budget {
-                    warn!("[session:{}] History too large ({} est. tokens, budget: {} tokens), trimming with value-oriented strategy",
-                          session_id, total_tokens, history_budget);
-                    trim_history_by_value(&mut history, history_budget);
-                    let new_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
-                    info!("[session:{}] History trimmed from {} to {} est. tokens", session_id, total_tokens, new_tokens);
-                }
-
-                // Volatile state (date/lang/TODO/evidence/guidance/budget) is
-                // inserted before the latest user message — never appended as
-                // the trailing message (see assemble_messages).
-                let messages = assemble_messages(&stable_system_prompt, &history, &volatile_state);
-
                 // Build tool definitions for this request: core tools + the
                 // load_tool_schema helper + any peripheral tools already loaded.
+                // This happens BEFORE budget adjudication on purpose: peripheral
+                // tools revealed in earlier turns are part of THIS request's fixed
+                // cost, and the old start-of-run snapshot ignored them entirely.
                 let tool_defs = {
                     let mut defs = core_tool_defs.clone();
                     if let Some(ls) = &load_schema_def {
@@ -2008,6 +2142,61 @@ impl Agent for LlmAgent {
                     }
                     defs
                 };
+
+                // Per-turn authoritative budget. The run-start figure is only a
+                // seed: volatile state (TODO/evidence/guidance) and the revealed
+                // tool set both grow during a long run, so a start-of-run line
+                // must not stay the trimming line forever.
+                let turn_fixed = fixed_cost_tokens(&stable_system_prompt, &volatile_state, &tool_defs);
+                let turn_space = match history_space(max_history_tokens, turn_fixed) {
+                    Some(n) => n,
+                    None => {
+                        // Mathematically infeasible even with an empty conversation.
+                        let msg = format!(
+                            "上下文预算不足：系统提示 + 工具定义已占 {} tokens，超出模型可用预算 {} tokens（窗口 {} @ {}%）。请换用更大上下文窗口的模型，或降低已载入的工具集（如关闭 Linux 取证工具全量载入）。",
+                            turn_fixed, max_history_tokens, context_window, context_window_threshold
+                        );
+                        error!("[session:{}] Hard budget gate: fixed={} >= budget={} (tools={} over {} defs) — run aborted instead of sending an over-window request",
+                               session_id, turn_fixed, max_history_tokens,
+                               tool_defs_tokens(&tool_defs), tool_defs.len());
+                        let _ = tx.send(Ok(AgentEvent::error(&msg, &invocation_id, &author))).await;
+                        let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
+                        for s in &cleanup_sessions { let _ = s.close().await; }
+                        return;
+                    }
+                };
+                history_budget = turn_space;
+                if budget_dashboard_enabled {
+                    // Refresh the shared snapshot every turn so the Dashboard and
+                    // the operator see the last request that was really sent.
+                    // Display only — it never feeds the adjudication above.
+                    let hist_toks: usize = history.iter()
+                        .map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or("")))
+                        .sum();
+                    if let Some(sink) = &budget_sink {
+                        *sink.lock().unwrap() = Some(make_report(
+                            stable_toks,
+                            estimate_tokens(&volatile_state),
+                            tool_defs_tokens(&tool_defs),
+                            hist_toks,
+                        ));
+                    }
+                }
+
+                // Trim history against the turn's real free space.
+                let total_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
+                if total_tokens > history_budget {
+                    warn!("[session:{}] History too large ({} est. tokens, budget: {} tokens), trimming with value-oriented strategy",
+                          session_id, total_tokens, history_budget);
+                    trim_history_by_value(&mut history, history_budget);
+                    let new_tokens: usize = history.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum();
+                    info!("[session:{}] History trimmed from {} to {} est. tokens", session_id, total_tokens, new_tokens);
+                }
+
+                // Volatile state (date/lang/TODO/evidence/guidance/budget) is
+                // inserted before the latest user message — never appended as
+                // the trailing message (see assemble_messages).
+                let messages = assemble_messages(&stable_system_prompt, &history, &volatile_state);
 
                 // Call LLM via legacy chat_stream (uses mpsc for text deltas).
                 // During re-prompt iterations, suppress text streaming to the UI
@@ -2062,7 +2251,14 @@ impl Agent for LlmAgent {
                             let prompt_t = u.prompt_tokens.unwrap_or(0);
                             let completion_t = u.completion_tokens.unwrap_or(0);
                             let total_t = u.total_tokens.unwrap_or(prompt_t + completion_t);
-                            let _ = tx.send(Ok(AgentEvent::usage(&active_model, prompt_t, completion_t, total_t, &invocation_id, &author))).await;
+                            // None = provider silent about cache accounting; Some(0) = a real miss.
+                            let cached_t = u.cached_prompt_tokens;
+                            if let Some(c) = cached_t {
+                                tracing::debug!("[session:{}] prompt cache: {}/{} input tokens hit ({:.1}%)",
+                                    session_id, c, prompt_t,
+                                    if prompt_t > 0 { c as f64 * 100.0 / prompt_t as f64 } else { 0.0 });
+                            }
+                            let _ = tx.send(Ok(AgentEvent::usage(&active_model, prompt_t, completion_t, total_t, cached_t, &invocation_id, &author))).await;
                         }
                         // If the consumer disappeared mid-stream, don't continue
                         // executing tools or making further LLM calls — unless
@@ -2118,7 +2314,7 @@ impl Agent for LlmAgent {
                         // stream_timed_out: a cut round is handled by the dedicated transport
                         // recovery below, not by the malformed-envelope re-prompt (which would
                         // re-ask with a correction unrelated to the real cause).
-                        if tool_calls.is_empty() && !stream_timed_out && !tool_defs.is_empty() && !has_executed_tools && reprompt_count < 2 && !combined.trim().is_empty() {
+                        if tool_calls.is_empty() && !stream_timed_out && !tool_defs.is_empty() && !combined.trim().is_empty() && (reprompt_count < 2 || nudge_count < 1) {
                             // D3 根治：是否重提示改由结构化 decide_turn 决定；散文信号
                             // （工具名子串 / 意图词 / 长度阈值）全部删除，不再参与决策。
                             // 一段实质文本回答永远被接受为 Answer（治愈“复述含 browser_cdp 的记忆”误触）。
@@ -2126,23 +2322,30 @@ impl Agent for LlmAgent {
                             let malformed_env = tool_calls.is_empty()
                                 && crate::turn_decision::looks_like_tool_envelope(combined);
                             if malformed_env {
-                                warn!("[session:{}] detected tool-call envelope but parsed empty (iter {}): potentially lost tool call; Stage B observes only, no retry", session_id, iteration);
+                                warn!("[session:{}] detected tool-call envelope but parsed empty (iter {}): potentially lost tool call; extraction already ran, this is observability only", session_id, iteration);
                             }
                             let turn_signals = crate::turn_decision::TurnSignals {
                                 tool_calls: tool_calls.len(),
                                 finish_reason: crate::turn_decision::FinishReason::normalize(finish_reason.as_deref()),
                                 has_visible_text: !combined.trim().is_empty(),
-                                // 查漏1：malformed_envelope 现由 looks_like_tool_envelope 真实置位（信号保真）；
-                                // 但 native_tool_calling 仍硬编码 true → decide_turn 不会选 RetryMalformed（重试行为不变，仅 warn! 观测）。
                                 malformed_envelope: malformed_env,
+                                // This deployment always drives tools through the native
+                                // OpenAI-compatible protocol (tool_defs are sent every round), so the
+                                // prompt-contract RetryMalformed arm is intentionally unreachable here.
                                 native_tool_calling: true,
                                 ran_tools: has_executed_tools,
                                 malformed_retry_done: reprompt_count > 0,
+                                // Pending-action gate: tail-shape only (no body scan, no tool names),
+                                // and it must never fire on a cut round.
+                                pending_action: crate::turn_decision::announces_pending_action(combined),
+                                nudge_done: nudge_count > 0,
                             };
                             let turn_decision = crate::turn_decision::decide_turn(&turn_signals);
-                            info!("[session:{}] turn decision={:?} tool_calls={} finish={:?} visible_text={} ran_tools={}",
-                                  session_id, turn_decision, turn_signals.tool_calls, turn_signals.finish_reason, turn_signals.has_visible_text, has_executed_tools);
-                            if matches!(turn_decision, crate::turn_decision::TurnDecision::RetryMalformed) {
+                            info!("[session:{}] turn decision={:?} tool_calls={} finish={:?} visible_text={} ran_tools={} pending_action={}",
+                                  session_id, turn_decision, turn_signals.tool_calls, turn_signals.finish_reason, turn_signals.has_visible_text, has_executed_tools, turn_signals.pending_action);
+                            match turn_decision {
+                                crate::turn_decision::TurnDecision::RetryMalformed
+                                    if !has_executed_tools && reprompt_count < 2 => {
 
                                 reprompt_count += 1;
                                 info!("[session:{}] Re-prompting model to emit well-formed tool call JSON (iter {}, attempt {}, reason: malformed tool envelope)", session_id, iteration, reprompt_count);
@@ -2172,6 +2375,32 @@ impl Agent for LlmAgent {
                                 );
                                 history.push(ChatMessage::user(&correction));
                                 continue;
+                            }
+                            // Model announced an action ("Let me check it." / "我这就调：") and then
+                            // ended the turn with finish=stop and no tool call. This gate is NOT limited
+                            // by has_executed_tools: the shape appears mid-run too, and the old
+                            // pre-tools re-prompt could never reach it. One nudge per run.
+                            crate::turn_decision::TurnDecision::NudgePendingAction => {
+                                nudge_count += 1;
+                                let all: Vec<char> = combined.trim().chars().collect();
+                                let tail: String = all[all.len().saturating_sub(48)..].iter().collect();
+                                warn!("[session:{}] PENDING_ACTION_NUDGE (iter {}): turn announced an action but emitted no tool call; tail={:?}",
+                                      session_id, iteration, tail);
+                                let _ = tx.send(Ok(AgentEvent::thinking(
+                                    "[检测到未发出的工具调用，正在要求模型补发...]",
+                                    &invocation_id, &author
+                                ))).await;
+                                history.push(ChatMessage::assistant(combined));
+                                history.push(ChatMessage::user(&format!(
+                                    "You ended your turn by announcing an action — \"{tail}\" — but you did NOT emit any tool call, so nothing happened.\n\n\
+                                     Do exactly ONE of these now, inside this single message:\n\
+                                     1. Emit the tool call(s) you just promised (no narration text, no \"let me\"), or\n\
+                                     2. Answer directly and completely if no tool is actually needed.\n\n\
+                                     Never write an intention sentence and then stop. If you say you will do something, the tool call must be in the very same message.",
+                                )));
+                                continue;
+                            }
+                            _ => {}
                             }
                         }
                         // ── Transport-cut recovery ──
@@ -2232,8 +2461,8 @@ impl Agent for LlmAgent {
                                       session_id, content.chars().count());
                                 run_has_error = true;
                             }
-                            info!("[session:{}] COMPLETE_PROBE finish_reason={:?} content={}chars reasoning={}chars stub={} has_executed_tools={} reprompt_count={}",
-                                  session_id, finish_reason, _probe_clen, _probe_rlen, _probe_stub, has_executed_tools, reprompt_count);
+                            info!("[session:{}] COMPLETE_PROBE finish_reason={:?} content={}chars reasoning={}chars stub={} has_executed_tools={} reprompt_count={} nudge_count={}",
+                                  session_id, finish_reason, _probe_clen, _probe_rlen, _probe_stub, has_executed_tools, reprompt_count, nudge_count);
                             info!("[session:{}] Agent completed with text response ({} chars, {} tool calls)", session_id, content.len(), tool_calls.len());
                             // 记录 SOP 执行结果（A1）：若本次自动加载了 SOP，则将结局写回
                             // times_executed/succeeded/failed，驱动 Q/R/U 学习与周期 GC。
@@ -3935,18 +4164,41 @@ mod tests {
     fn todo_unfinished_gate() {
         let ws = tmp_ws("unfinished");
         write_todos(&ws, vec![("a".into(), "pending".into()), ("b".into(), "completed".into())]);
-        assert!(LlmAgent::todo_list_has_unfinished(&ws));
+        assert!(LlmAgent::todo_list_has_unfinished(&ws, ""));
         write_todos(&ws, vec![("a".into(), "completed".into()), ("b".into(), "skipped".into())]);
-        assert!(!LlmAgent::todo_list_has_unfinished(&ws));
+        assert!(!LlmAgent::todo_list_has_unfinished(&ws, ""));
         let _ = std::fs::remove_dir_all(&ws);
-        assert!(!LlmAgent::todo_list_has_unfinished(&ws));
+        assert!(!LlmAgent::todo_list_has_unfinished(&ws, ""));
+    }
+
+    /// Regression guard for the read/write key split: the injected TASKS block,
+    /// the continuation gate and the timeout watchdog must resolve the SAME file
+    /// the `todo_update` tool writes (`todos-<session>.json`), not the legacy
+    /// shared `todos.json`. When they diverged, the whole main-session TASKS
+    /// machinery silently read a file nobody wrote.
+    #[test]
+    fn todo_readers_use_session_scoped_key() {
+        let ws = tmp_ws("keyalign");
+        let sid = "main-uuid-1";
+        let items = serde_json::json!({ "items": [
+            { "description": "a", "status": "pending", "started_at": serde_json::Value::Null }
+        ]});
+        let path = crate::tool::todo_update::todos_file_path(&ws, sid);
+        std::fs::write(&path, serde_json::to_string_pretty(&items).unwrap()).unwrap();
+        // Legacy shared file deliberately absent -> readers must still see the list.
+        assert!(LlmAgent::todo_list_has_unfinished(&ws, sid));
+        assert!(LlmAgent::build_todo_context_block(&ws, sid, 600).is_some());
+        // And a different session's key must not be visible to this one.
+        assert!(!LlmAgent::todo_list_has_unfinished(&ws, "other-session"));
+        assert!(LlmAgent::build_todo_context_block(&ws, "other-session", 600).is_none());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn todo_block_injected_with_items_and_rules() {
         let ws = tmp_ws("block");
         write_todos(&ws, vec![("a".into(), "pending".into()), ("b".into(), "completed".into())]);
-        let block = LlmAgent::build_todo_context_block(&ws, 600).unwrap();
+        let block = LlmAgent::build_todo_context_block(&ws, "", 600).unwrap();
         assert!(block.contains("0. [pending] a"));
         assert!(block.contains("1. [completed] b"));
         assert!(block.contains("600-second timeout"));
@@ -3958,9 +4210,9 @@ mod tests {
     #[test]
     fn todo_block_none_when_empty() {
         let ws = tmp_ws("empty");
-        assert!(LlmAgent::build_todo_context_block(&ws, 600).is_none());
+        assert!(LlmAgent::build_todo_context_block(&ws, "", 600).is_none());
         std::fs::write(std::path::Path::new(&ws).join("todos.json"), r#"{"items":[]}"#).unwrap();
-        assert!(LlmAgent::build_todo_context_block(&ws, 600).is_none());
+        assert!(LlmAgent::build_todo_context_block(&ws, "", 600).is_none());
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -3973,7 +4225,7 @@ mod tests {
         ]});
         let p = std::path::Path::new(&ws).join("todos.json");
         std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
-        let note = LlmAgent::apply_todo_timeout(&ws, 600).unwrap();
+        let note = LlmAgent::apply_todo_timeout(&ws, "", 600).unwrap();
         assert!(note.contains("auto-marked 'skipped'"));
         let raw = std::fs::read_to_string(&p).unwrap();
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -3991,7 +4243,7 @@ mod tests {
         ]});
         let p = std::path::Path::new(&ws).join("todos.json");
         std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
-        assert!(LlmAgent::apply_todo_timeout(&ws, 600).is_none());
+        assert!(LlmAgent::apply_todo_timeout(&ws, "", 600).is_none());
         // still in_progress
         let raw = std::fs::read_to_string(&p).unwrap();
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -4271,5 +4523,165 @@ mod tests {
         let got = collect_tool_results_args(&[r1, r2]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].1, got[1].1, "unresolvable args use the same fallback digest");
+    }
+
+    // ── Linux 取证工具载入开关 + 单一权威预算账本 ─────────────────────────
+
+    fn fake_def(name: &str, desc: &str) -> crate::model::ToolDefinition {
+        crate::model::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::model::FunctionDefinition {
+                name: name.to_string(),
+                description: desc.to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    /// 名单由实际工具对象派生：成员自检、排序去重，且 linux_ssh 永不入族
+    /// （否则开关一关就连不上 Linux 主机了）。
+    #[test]
+    fn linux_family_list_is_derived_sorted_and_excludes_ssh() {
+        let names = crate::tool::ir_linux::linux_ir_tool_names();
+        assert!(names.len() >= 5, "family should cover aggregator + categories, got {}", names.len());
+        assert!(names.windows(2).all(|w| w[0] <= w[1]), "list must be sorted (derived, not hand-copied)");
+        let uniq: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(uniq.len(), names.len(), "no duplicates in the family list");
+        assert!(names.iter().any(|n| n == "ir_linux"), "the aggregator must be gated too");
+        assert!(!crate::tool::ir_linux::is_linux_ir_tool("linux_ssh"), "linux_ssh is never part of the family");
+        assert!(!crate::tool::ir_linux::is_linux_ir_tool("file_read"));
+        for t in crate::tool::ir_linux::linux_ir_category_tools() {
+            assert!(crate::tool::ir_linux::is_linux_ir_tool(t.name()), "{} escaped the list", t.name());
+        }
+    }
+
+    /// 开关 OFF：整个 Linux 族离开每轮请求，改为目录里的名字+一行描述（仍注册、
+    /// 仍可执行）；核心集的体积必须真的下降。
+    #[test]
+    fn linux_gate_off_demotes_family_and_shrinks_payload() {
+        let names: Vec<String> = crate::tool::ir_linux::linux_ir_tool_names().to_vec();
+        let body = "Detect suspicious entries and cross-check them against known patterns. More guidance follows. ".repeat(8);
+        let mut defs: Vec<_> = names.iter().map(|n| fake_def(n, &body)).collect();
+        defs.push(fake_def("linux_ssh", "Run a command on the Linux host over SSH."));
+        defs.push(fake_def("file_read", "Read a file."));
+        let before = tool_defs_tokens(&defs);
+
+        let (kept, catalog, demoted) = apply_linux_ir_gate(defs, Vec::new(), false);
+
+        assert_eq!(demoted, names.len(), "every family member must be demoted");
+        assert!(kept.iter().all(|d| !crate::tool::ir_linux::is_linux_ir_tool(&d.function.name)));
+        assert_eq!(kept.len(), 2, "only the non-family tools stay on the wire");
+        assert!(kept.iter().any(|d| d.function.name == "linux_ssh"), "a Linux host must stay directly reachable");
+        assert_eq!(catalog.len(), names.len(), "each demoted tool gains a catalog entry");
+        for (n, sum) in &catalog {
+            assert!(names.iter().any(|x| x == n), "catalog must only list family tools");
+            assert!(sum.chars().count() <= 161, "catalog entry must stay one short line: {}", sum);
+            assert!(!sum.contains("More guidance"), "only the first sentence is cataloged");
+        }
+        let after = tool_defs_tokens(&kept);
+        assert!(after < before, "off must shrink the per-request tool payload ({} -> {})", before, after);
+        assert!(before - after > before / 3, "the family is a material share of the payload");
+    }
+
+    /// 开关 ON：核心集原样交付，不额外写目录。
+    #[test]
+    fn linux_gate_on_delivers_everything_untouched() {
+        let defs = vec![fake_def("linux_ir_process", "Analyze Linux processes."), fake_def("file_read", "Read a file.")];
+        let (kept, catalog, demoted) = apply_linux_ir_gate(defs, Vec::new(), true);
+        assert_eq!(demoted, 0);
+        assert!(catalog.is_empty());
+        assert_eq!(kept.len(), 2, "full load keeps every schema");
+    }
+
+    #[test]
+    fn catalog_summary_takes_first_sentence_and_bounds_length() {
+        assert_eq!(
+            catalog_summary("Analyze Linux processes: mining detected. Hidden binaries."),
+            "Analyze Linux processes: mining detected");
+        assert_eq!(catalog_summary("   \n  \n"), "");
+        assert_eq!(catalog_summary("short one"), "short one");
+        let bounded = catalog_summary(&"x".repeat(400));
+        assert_eq!(bounded.chars().count(), 161, "160 chars + ellipsis");
+        assert!(bounded.ends_with('…'));
+    }
+
+    /// 预算公式只有一个出口：可用空间 + 固定成本 == 预算。旧实现把工具定义漏记，
+    /// 这条不变式根本不成立；None 只在「数学不可能」时出现。
+    #[test]
+    fn history_space_is_conservative_and_exact() {
+        assert_eq!(history_space(1000, 400), Some(600));
+        assert_eq!(history_space(1000, 400).unwrap() + 400, 1000);
+        assert_eq!(history_space(1000, 999), Some(1), "one token of slack is still feasible");
+        assert_eq!(history_space(1000, 1000), None, "zero slack cannot hold any history");
+        assert_eq!(history_space(1000, 1001), None);
+        assert_eq!(history_space(1000, 0), Some(1000));
+    }
+
+    /// 真实测量（非夹具）：关掉开关时离开每轮请求的到底是多少 tokens。
+    #[test]
+    fn linux_family_real_schema_cost_is_material() {
+        use crate::tool::Tool;
+        let mut defs: Vec<_> = crate::tool::ir_linux::linux_ir_category_tools()
+            .iter()
+            .map(|t| t.to_definition())
+            .collect();
+        defs.push((&crate::tool::ir_linux::IrLinuxTool).to_definition());
+        assert_eq!(
+            defs.len(),
+            crate::tool::ir_linux::linux_ir_tool_names().len(),
+            "delivered defs must match the gated name list exactly"
+        );
+        let cost = tool_defs_tokens(&defs);
+        let catalog_cost: usize = defs
+            .iter()
+            .map(|d| estimate_tokens(&d.function.name) + estimate_tokens(&catalog_summary(&d.function.description)))
+            .sum();
+        println!(
+            "MEASURED linux_ir family: {} members, full schemas = {} tokens, catalog form = {} tokens, saved = {} tokens ({:.0}% off)",
+            defs.len(), cost, catalog_cost, cost - catalog_cost,
+            (cost - catalog_cost) as f64 * 100.0 / cost as f64
+        );
+        assert!(cost > 1_000, "expected a material block, measured {}", cost);
+        assert!(catalog_cost * 4 < cost, "catalog form must be far smaller ({} vs {})", catalog_cost, cost);
+    }
+
+    /// 小窗口下可证伪的端列不变式：硬门不误杀「有点紧」，而一旦裁 history，
+    /// 固定成本 + 剩余对话必须仍在预算内。256k 测试机上看不出这一步。
+    #[test]
+    fn small_window_ledger_keeps_the_request_inside_the_budget() {
+        let context_window = 8_000usize;
+        let max_history_tokens = context_window * 80 / 100;
+        let stable = "system prompt body ".repeat(400);
+        let volatile = "volatile state block ".repeat(200);
+        let names: Vec<String> = crate::tool::ir_linux::linux_ir_tool_names().to_vec();
+        let body = "parameter schema description ".repeat(20);
+        let all: Vec<_> = names.iter().map(|n| fake_def(n, &body)).collect();
+        let fixed_on = fixed_cost_tokens(&stable, &volatile, &all);
+        let (kept, _, demoted) = apply_linux_ir_gate(all, Vec::new(), false);
+        assert_eq!(demoted, names.len());
+
+        let fixed_off = fixed_cost_tokens(&stable, &volatile, &kept);
+        assert!(fixed_off < fixed_on, "the switch must measurably reduce fixed cost");
+        // 两种设置下都不该误杀：固定成本仍小于预算，但关闭后留给对话的空间更大。
+        let space = history_space(max_history_tokens, fixed_off).expect("fixture must be feasible");
+        let space_on = history_space(max_history_tokens, fixed_on).expect("full load must still fit at 8k");
+        assert!(space > space_on, "turning the family off must free history space ({} vs {})", space, space_on);
+        assert!(fixed_off + space <= max_history_tokens, "ledger must never over-commit");
+
+        // 旧工具结果很大、最近 6 条很小时，裁剪必须把对话压回线内。
+        let mut history: Vec<ChatMessage> = (0..34)
+            .map(|i| ChatMessage::tool_result(&format!("c{}", i), "linux_ir_process", &format!("evidence blob {}", "z".repeat(2000))))
+            .chain((0..6).map(|i| ChatMessage::tool_result(&format!("r{}", i), "file_read", "ok")))
+            .collect();
+        let calc = |h: &[ChatMessage]| -> usize {
+            h.iter().map(|m| estimate_tokens(m.content_as_text().as_deref().unwrap_or(""))).sum()
+        };
+        let before = calc(&history);
+        assert!(before > space, "fixture must actually overflow the line: {} vs {}", before, space);
+        trim_history_by_value(&mut history, space);
+        let after = calc(&history);
+        assert!(after <= space, "trimmed history {} must fit the {}-token line", after, space);
+        assert!(fixed_off + after <= max_history_tokens, "the carried request must stay inside the budget");
+        assert_eq!(history.len(), 40, "trimming degrades, never drops");
     }
 }

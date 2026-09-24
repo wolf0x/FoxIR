@@ -2,31 +2,40 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::fs;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use chrono::Utc;
 
+use super::browser_cdp::BrowserSession;
 use super::Tool;
 use crate::context::ToolContext;
 use crate::error::AgentResult;
 
-/// Convert HTML content to PDF using chromiumoxide (headless Chrome).
-async fn html_to_pdf(html_content: &str) -> AgentResult<Vec<u8>> {
-    use chromiumoxide::browser::{Browser, BrowserConfig};
+/// Convert HTML content to PDF.
+///
+/// 有共享的 browser_cdp 会话时复用它（在同一实例上开一个临时 tab）：同一台机器上
+/// 另起一个实例会跟它抢同一个 user-data-dir（Chromium 的单实例语义按用户数据目录
+/// 划分，不是按机器划分），后起的那个直接失败——这正是原实现那条隐性的崩溃路径。
+async fn html_to_pdf(html_content: &str, session: Option<&BrowserSession>) -> AgentResult<Vec<u8>> {
+    match session {
+        Some(s) => {
+            let page = s
+                .scratch_page()
+                .await
+                .map_err(|e| -> crate::error::AgentError { e.into() })?;
+            let result = render_to_pdf(&page, html_content).await;
+            if result.is_ok() {
+                // 只关自己开的 tab，绝不碰 browser——那会关掉整个会话
+                let _ = page.close().await;
+            }
+            result
+        }
+        None => render_to_pdf_standalone(html_content).await,
+    }
+}
+
+/// 在给定 tab 上渲染 HTML 并导出 PDF（共享实例与自起实例共用）。
+async fn render_to_pdf(page: &chromiumoxide::page::Page, html_content: &str) -> AgentResult<Vec<u8>> {
     use chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams;
-    use futures::StreamExt;
-
-    let (mut browser, mut handler) = Browser::launch(
-        BrowserConfig::builder()
-            .build()
-            .map_err(|e| format!("Failed to build browser config: {}", e))?
-    ).await.map_err(|e| format!("Failed to launch browser: {}", e))?;
-
-    // Spawn handler to process browser events
-    tokio::spawn(async move {
-        while let Some(_event) = handler.next().await {}
-    });
-
-    let page = browser.new_page("about:blank").await
-        .map_err(|e| format!("Failed to create page: {}", e))?;
 
     // Set HTML content
     page.set_content(html_content).await
@@ -53,12 +62,69 @@ async fn html_to_pdf(html_content: &str) -> AgentResult<Vec<u8>> {
         ..Default::default()
     }).await.map_err(|e| format!("Failed to generate PDF: {}", e))?;
 
-    browser.close().await.ok();
-
     Ok(pdf_bytes)
 }
 
-pub struct IrReportTool;
+/// 兜底：只有在拿不到共享会话时才自己起一个一次性实例（例如未接线 browser_cdp 的部署）。
+/// 可执行文件仍走我们自己的发现逻辑，并且补上了原实现缺的 no_sandbox 与独立
+/// user-data_dir：前者在无沙箱可用的 Windows 配置上会以 exit code 21 失败，后者会
+/// 直接拿用户默认 profile 去渲染。
+async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
+    use chromiumoxide::browser::{Browser, BrowserConfig};
+    use futures::StreamExt;
+
+    let profile_dir = std::env::temp_dir().join("foxir_report_profile");
+    let discovery = super::browser_launch::discover("");
+    let chosen = match discovery.chosen {
+        Some(c) => c,
+        None => {
+            let summary = format!("No browser executable found: {}", discovery.summary());
+            let ctx = super::browser_launch::LaunchContext {
+                chosen: None,
+                tried: discovery.tried,
+                profile_dir,
+                headless: true,
+            };
+            return Err(super::browser_launch::describe_failure(&ctx, &summary, 0).into());
+        }
+    };
+    let _ = std::fs::create_dir_all(&profile_dir);
+
+    let (mut browser, mut handler) = Browser::launch(
+        BrowserConfig::builder()
+            .no_sandbox()
+            .chrome_executable(&chosen.path)
+            .user_data_dir(&profile_dir)
+            .launch_timeout(std::time::Duration::from_secs(
+                super::browser_launch::LAUNCH_WAIT_SECS,
+            ))
+            .build()
+            .map_err(|e| format!("Failed to build browser config: {}", e))?
+    ).await.map_err(|e| format!("Failed to launch browser: {}", e))?;
+
+    // Spawn handler to process browser events
+    tokio::spawn(async move {
+        while let Some(_event) = handler.next().await {}
+    });
+
+    let page = browser.new_page("about:blank").await
+        .map_err(|e| format!("Failed to create page: {}", e))?;
+
+    let result = render_to_pdf(&page, html_content).await;
+    let _ = browser.close().await;
+    result
+}
+
+pub struct IrReportTool {
+    /// 与 browser_cdp 共享的会话；None = 未接线，导出时自起一个临时实例。
+    session: Option<Arc<BrowserSession>>,
+}
+
+impl IrReportTool {
+    pub fn new(session: Option<Arc<BrowserSession>>) -> Self {
+        Self { session }
+    }
+}
 
 #[async_trait]
 impl Tool for IrReportTool {
@@ -469,7 +535,7 @@ function filterFindings() {{
         // Generate PDF if requested
         let mut pdf_output = None;
         if format == "pdf" || format == "both" {
-            match html_to_pdf(&html).await {
+            match html_to_pdf(&html, self.session.as_deref()).await {
                 Ok(pdf_bytes) => {
                     fs::write(&pdf_path, &pdf_bytes)
                         .map_err(|e| format!("Failed to write PDF report: {}", e))?;
@@ -584,4 +650,40 @@ fn build_ioc_sections(ips: &BTreeSet<String>, hashes: &BTreeSet<String>,
 
     sections.push_str("</div></div>");
     sections
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// 真机验证：报告导出复用 browser_cdp 的共享实例，而且不得关掉整个会话
+    /// （旧实现自己另起一个实例，既跟会话抢 user-data-dir，又把浏览器直接关掉）。
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn pdf_export_reuses_the_shared_session() {
+        let tmp = std::env::temp_dir().join(format!("foxir_rep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = BrowserSession::new(
+            tmp.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(std::sync::RwLock::new(String::new())),
+        );
+
+        let html = "<html><body><h1>Incident report</h1></body></html>";
+        let pdf = html_to_pdf(html, Some(&s))
+            .await
+            .expect("shared-session PDF export must work");
+        assert!(pdf.starts_with(b"%PDF"), "not a PDF ({} bytes)", pdf.len());
+        assert_eq!(
+            s.status().await["running"],
+            json!(true),
+            "exporting a report must not tear down the browser session"
+        );
+
+        // 导出后会话还能继续用
+        let _ = s.scratch_page().await.expect("session still usable");
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -16,24 +16,31 @@ pub struct ExternalTool {
     pub enabled: bool,
     /// File extension (.exe, .bat, .ps1, .cmd)
     pub extension: String,
+    /// true = 描述是用户在 GUI 里改的（该写进 config.toml）；
+    /// false = 来同目录 sidecar 或文件名推出来的（不写死，保持 Tools 目录可拷走即用）。
+    pub desc_pinned: bool,
 }
 
 /// Manages discovery and state of external tools in the Tools directory.
 pub struct ExternalToolsManager {
     tools_dir: PathBuf,
     tools: Vec<ExternalTool>,
-    state_path: PathBuf,
+    /// 配置归属workspace（config.toml 所在）：External Tools 的启用状态现在跟其它
+    /// GUI 设置一起存在那里，不再单独一个 json。
+    workspace_dir: String,
+    /// 旧格式文件，只用来读（迁移用），不再写。
+    legacy_state_path: PathBuf,
 }
 
-/// Persisted state for external tools (enabled/disabled, custom descriptions).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ToolsState {
+/// 旧版 `tools/tools_state.json` 的形状，仅用于一次性导入。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LegacyToolsState {
     #[serde(default)]
-    tools: HashMap<String, ToolStateEntry>,
+    tools: HashMap<String, LegacyToolState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ToolStateEntry {
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyToolState {
     #[serde(default = "default_true")]
     enabled: bool,
     #[serde(default)]
@@ -43,12 +50,14 @@ struct ToolStateEntry {
 fn default_true() -> bool { true }
 
 impl ExternalToolsManager {
-    pub fn new(tools_dir: PathBuf) -> Self {
-        let state_path = tools_dir.join("tools_state.json");
+    /// `workspace_dir` 是 config.toml 所在目录（Tools 状态就存在那里）。
+    pub fn new(tools_dir: PathBuf, workspace_dir: String) -> Self {
+        let legacy_state_path = tools_dir.join("tools_state.json");
         let mut mgr = Self {
             tools_dir,
             tools: Vec::new(),
-            state_path,
+            workspace_dir,
+            legacy_state_path,
         };
         // Ensure tools directory exists
         if !mgr.tools_dir.exists() {
@@ -97,37 +106,35 @@ impl ExternalToolsManager {
 
             // Check for sidecar .json file
             let sidecar_path = path.with_extension("json");
-            let (description, custom_desc) = if sidecar_path.exists() {
+            let description = if sidecar_path.exists() {
                 match std::fs::read_to_string(&sidecar_path) {
                     Ok(content) => {
                         if let Ok(sidecar) = serde_json::from_str::<serde_json::Value>(&content) {
-                            let desc = sidecar["description"].as_str()
+                            sidecar["description"].as_str()
                                 .or_else(|| sidecar["name"].as_str())
                                 .unwrap_or("")
-                                .to_string();
-                            (desc, true)
+                                .to_string()
                         } else {
-                            (Self::auto_description(&name, &ext), false)
+                            Self::auto_description(&name, &ext)
                         }
                     }
-                    Err(_) => (Self::auto_description(&name, &ext), false),
+                    Err(_) => Self::auto_description(&name, &ext),
                 }
             } else {
-                (Self::auto_description(&name, &ext), false)
+                Self::auto_description(&name, &ext)
             };
 
             // Apply state overrides
-            let (enabled, description) = if let Some(entry) = state.tools.get(&name) {
-                let desc = if let Some(ref d) = entry.description {
-                    d.clone()
-                } else if custom_desc {
-                    description
-                } else {
-                    Self::auto_description(&name, &ext)
-                };
-                (entry.enabled, desc)
-            } else {
-                (true, description)
+            let (enabled, description, desc_pinned) = match state.get(&name) {
+                // config 里有条目：enabled 以它为准；description 只有被显式记下来过才赢。
+                Some(entry) => {
+                    let desc = entry
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| description.clone());
+                    (entry.enabled, desc, entry.description.is_some())
+                }
+                None => (true, description, false),
             };
 
             info!("Discovered tool: {} ({}) enabled={}", name, path.display(), enabled);
@@ -137,6 +144,7 @@ impl ExternalToolsManager {
                 description,
                 enabled,
                 extension: ext,
+                desc_pinned,
             });
         }
     }
@@ -176,6 +184,7 @@ impl ExternalToolsManager {
     pub fn update_description(&mut self, name: &str, description: &str) -> bool {
         if let Some(tool) = self.tools.iter_mut().find(|t| t.name == name) {
             tool.description = description.to_string();
+            tool.desc_pinned = true;
             true
         } else {
             false
@@ -187,33 +196,63 @@ impl ExternalToolsManager {
         &self.tools_dir
     }
 
-    /// Load persisted state.
-    fn load_state(&self) -> ToolsState {
-        if !self.state_path.exists() {
-            return ToolsState::default();
+    /// 读持久状态：以 config.toml 为准；那里还是空时（旧部署升级上来），
+    /// 一次性从 `tools/tools_state.json` 导入。导入不会删旧文件（不动用户文件），
+    /// 但下次保存只写 config，旧文件从此不会再被读进配置非空的工作区。
+    fn load_state(&self) -> HashMap<String, crate::config::ExternalToolState> {
+        let from_config = crate::config::Config::load(&self.workspace_dir)
+            .map(|c| c.agent.external_tools)
+            .unwrap_or_default();
+        if !from_config.is_empty() {
+            return from_config;
         }
-        match std::fs::read_to_string(&self.state_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => ToolsState::default(),
+        if !self.legacy_state_path.exists() {
+            return HashMap::new();
+        }
+        match std::fs::read_to_string(&self.legacy_state_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<LegacyToolsState>(&content).ok())
+        {
+            Some(legacy) if !legacy.tools.is_empty() => {
+                info!(
+                    "Importing {} external tool state entry(ies) from {} into config.toml",
+                    legacy.tools.len(),
+                    self.legacy_state_path.display()
+                );
+                legacy
+                    .tools
+                    .into_iter()
+                    .map(|(name, e)| {
+                        (
+                            name,
+                            crate::config::ExternalToolState {
+                                enabled: e.enabled,
+                                description: e.description,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+            _ => HashMap::new(),
         }
     }
 
-    /// Save current state to disk.
+    /// 保存全量状态到 config.toml。失败只记日志（与旧行为一致）：一个工具开关存不上
+    /// 不该让整次 toggle 报错返回给用户，但必须能在日志里看出来。
     pub fn save_state(&self) {
-        let mut state = ToolsState::default();
-        for tool in &self.tools {
-            state.tools.insert(tool.name.clone(), ToolStateEntry {
-                enabled: tool.enabled,
-                description: Some(tool.description.clone()),
-            });
-        }
-        match serde_json::to_string_pretty(&state) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.state_path, json) {
-                    warn!("Failed to save tools state: {}", e);
-                }
-            }
-            Err(e) => warn!("Failed to serialize tools state: {}", e),
+        let entries: Vec<(String, bool, Option<String>)> = self
+            .tools
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.enabled,
+                    if t.desc_pinned { Some(t.description.clone()) } else { None },
+                )
+            })
+            .collect();
+        if let Err(e) = crate::config::Config::save_external_tools(&self.workspace_dir, entries) {
+            warn!("Failed to save tools state to config.toml: {}", e);
         }
     }
 

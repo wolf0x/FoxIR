@@ -555,11 +555,13 @@ input:checked+.slider:before{transform:translateX(20px)}
 .posture-card.input{background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1px solid #bbf7d0}
 .posture-card.output{background:linear-gradient(135deg,#fff7ed,#ffedd5);border:1px solid #fed7aa}
 .posture-card.calls{background:linear-gradient(135deg,#faf5ff,#f3e8ff);border:1px solid #e9d5ff}
+.posture-card.cache{background:linear-gradient(135deg,#ecfeff,#cffafe);border:1px solid #a5f3fc}
 .posture-number{font-size:36px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
 .posture-card.total .posture-number{color:#2563eb}
 .posture-card.input .posture-number{color:#16a34a}
 .posture-card.output .posture-number{color:#ea580c}
 .posture-card.calls .posture-number{color:#9333ea}
+.posture-card.cache .posture-number{color:#0891b2}
 .posture-label{font-size:11px;color:#64748b;margin-top:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:500}
 .quick-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
 .action-btn{display:flex;flex-direction:column;align-items:center;gap:10px;padding:24px 16px;border:2px solid #e2e8f0;border-radius:12px;background:linear-gradient(180deg,#fff 0%,#f8fafc 100%);cursor:pointer;transition:all .25s cubic-bezier(.4,0,.2,1);font-family:inherit}
@@ -806,11 +808,13 @@ input:checked+.slider:before{transform:translateX(20px)}
 .posture-card.input{background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1px solid #bbf7d0}
 .posture-card.output{background:linear-gradient(135deg,#fff7ed,#ffedd5);border:1px solid #fed7aa}
 .posture-card.calls{background:linear-gradient(135deg,#faf5ff,#f3e8ff);border:1px solid #e9d5ff}
+.posture-card.cache{background:linear-gradient(135deg,#ecfeff,#cffafe);border:1px solid #a5f3fc}
 .posture-number{font-size:36px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
 .posture-card.total .posture-number{color:#2563eb}
 .posture-card.input .posture-number{color:#16a34a}
 .posture-card.output .posture-number{color:#ea580c}
 .posture-card.calls .posture-number{color:#9333ea}
+.posture-card.cache .posture-number{color:#0891b2}
 .posture-label{font-size:11px;color:#64748b;margin-top:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:500}
 .quick-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
 .action-btn{display:flex;flex-direction:column;align-items:center;gap:10px;padding:24px 16px;border:2px solid #e2e8f0;border-radius:12px;background:linear-gradient(180deg,#fff 0%,#f8fafc 100%);cursor:pointer;transition:all .25s cubic-bezier(.4,0,.2,1);font-family:inherit}
@@ -1130,6 +1134,21 @@ input:checked+.slider:before{transform:translateX(20px)}
               <span class="slider"></span>
             </label>
           </div>
+          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <label style="margin-bottom:0">Browser: Visible Window</label>
+              <small style="color:var(--t3)">Off (default): browser_cdp runs hidden and cannot be closed by accident. Turn it on to complete a login that needs a password, 2FA or a QR scan. The login lives in the workspace browser profile and later hidden runs inherit it. Enabling/disabling the browser itself is on the Tools page</small>
+            </div>
+            <label class="perm-toggle">
+              <input type="checkbox" id="browserVisibleInput" onchange="saveAgentSettings()">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label>Browser Executable (optional)</label>
+            <input type="text" id="browserExeInput" placeholder="Leave empty to auto-detect" onchange="saveAgentSettings()">
+            <small style="color:var(--t3)">Set this only if auto-detect picks the wrong binary or finds none. This machine: <span id="browserProbeInfo">detecting...</span></small>
+          </div>
           <div class="form-group">
             <label>Tool Timeout (seconds)</label>
             <input type="number" id="toolTimeoutInput" value="300" min="10" max="3600" onchange="saveAgentSettings()">
@@ -1313,6 +1332,11 @@ input:checked+.slider:before{transform:translateX(20px)}
     <div id="tools" class="page">
       <div class="settings-scroll modern-page">
         <div class="settings-section">
+          <h3>&#128295; Built-in Capabilities</h3>
+          <small style="color:var(--t3);display:block;margin-bottom:10px">Disabling a row takes that tool away from the model; every change is written to config.toml at once and survives a restart. A row labelled &quot;On-demand&quot; is still callable - only its schema leaves the request.</small>
+          <div id="builtinsList" style="font-size:13px;color:var(--t2)">Loading...</div>
+        </div>
+        <div class="settings-section">
           <h3>&#128295; External Tools</h3>
           <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-s" onclick="loadTools()">&#128260; Refresh</button>
@@ -1459,6 +1483,11 @@ input:checked+.slider:before{transform:translateX(20px)}
             <div class="posture-card input">
               <div class="posture-number" id="todayInputTokens">-</div>
               <div class="posture-label">Input Tokens</div>
+            </div>
+            <div class="posture-card cache">
+              <div class="posture-number" id="todayCacheHit">-</div>
+              <div class="posture-label">Cache Hit</div>
+              <div id="todayCacheCov" style="font-size:10px;color:#94a3b8;margin-top:4px">-</div>
             </div>
             <div class="posture-card output">
               <div class="posture-number" id="todayOutputTokens">-</div>
@@ -1642,12 +1671,29 @@ const sessionSnapshots={};   // sessionId -> {msgHist, logHist, html}
 const runningSessions=new Set(); // session ids currently executing a task
 let bgBuffer={};             // sessionId -> {text} buffered while that session is not the active view
 let taskSessionId=null;      // session id that started the currently running task
+let knownSessionIds=[];      // every session id this client can render (attach handshake)
 function currentSessionTitle(){return 'Session';}
 
 function markSessionRunning(sid,running){
   if(running){runningSessions.add(sid);}else{runningSessions.delete(sid);}
   const item=document.querySelector('.sessions-item[data-sid="'+sid+'"]');
   if(item)item.classList.toggle('running',runningSessions.has(sid));
+}
+
+// Re-attach handshake. A dropped connection no longer cancels a running task on
+// the server: the run detaches and keeps executing in the background. After a
+// reconnect (or a page refresh) we announce every session we can render, and the
+// server answers `run_attached` for each one that is still live so the UI can
+// resume showing it as running and pick up the remaining event stream.
+function sendAttach(){
+  if(!ws||!connected||ws.readyState!==1)return;
+  const ids=[];
+  const add=function(x){if(x&&ids.indexOf(x)<0)ids.push(x);};
+  add(SESSION_ID);add(mainSessionId);
+  knownSessionIds.forEach(add);
+  Array.from(runningSessions).forEach(add);
+  if(!ids.length)return;
+  try{ws.send(JSON.stringify({type:'attach',sessions:ids}))}catch(e){}
 }
 
 function snapshotCurrentSession(){
@@ -1694,6 +1740,7 @@ async function loadSessions(){
     const r=await fetch('/api/sessions');
     const d=await r.json();
     const list=(d&&d.sessions)||[];
+    knownSessionIds=list.filter(s=>s&&s.id).map(s=>s.id);
     mainSessionId=(list.find(s=>s&&s.main)||{}).id||null; // server-designated main Chat session
     // Startup defaults to the main Chat session + chat page (one-time).
     if(!bootMainApplied&&mainSessionId){
@@ -1714,6 +1761,7 @@ async function loadSessions(){
         +'<button title="Delete" data-del="'+s.id+'" onclick="event.stopPropagation();deleteSession(this)">\u2715</button>'
         +'</span></div>';
     }).join('');
+    sendAttach(); // sidebar refreshed -> refresh the server's view of what we can render
   }catch(err){}
 }
 
@@ -2105,8 +2153,19 @@ function handleMsg(msg){
   if(managedMode&&msg.invocation_id&&lastInvId&&msg.invocation_id!==lastInvId){if(textAccum&&textAccum.trim()){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}finalizeTextBlock();}
   if(msg.invocation_id){lastInvId=msg.invocation_id;}
   switch(msg.type){
-    case 'auth_ok':connected=true;reconnectAttempts=0;updateStatus();addLog('Authenticated','info');loadModels();sendPerms();renderPerms();break;
+    case 'auth_ok':connected=true;reconnectAttempts=0;updateStatus();addLog('Authenticated','info');loadModels();sendPerms();renderPerms();sendAttach();break;
     case 'auth_fail':addLog('Auth failed: '+(msg.message||'bad password'),'error');intentionalDisconnect=true;reconnectAttempts=0;break;
+    case 'run_attached':{
+      // The server confirms a background run is still alive for this session and
+      // has re-pointed its event stream at us: restore the running UI and keep
+      // streaming. Only the viewed session drives the typing indicator.
+      const rs=msg.session||'';
+      if(!rs)break;
+      markSessionRunning(rs,true);
+      addLog('Task still running in '+(rs===SESSION_ID?'this ':'that ')+'session \u2014 re-attached','info');
+      if(rs===SESSION_ID){taskSessionId=rs;setAgentRunning(true);showTyping();}
+      break;
+    }
     case 'thinking':
       hideTyping();finalizeTextBlock();
       if(msg.content&&msg.content.trim()){
@@ -2990,6 +3049,9 @@ async function loadModels(){
     if(d.rabbit_hole_threshold) document.getElementById('rabbitHoleInput').value = d.rabbit_hole_threshold;
     if(d.tool_timeout_secs) document.getElementById('toolTimeoutInput').value = d.tool_timeout_secs;
     if(typeof d.enable_context_scaling==='boolean') document.getElementById('inlineScalingInput').checked=d.enable_context_scaling;
+    if(typeof d.browser_headless==='boolean'){var bvEl=document.getElementById('browserVisibleInput');if(bvEl)bvEl.checked=!d.browser_headless;}
+    if(d.browser_executable!==undefined){var beEl=document.getElementById('browserExeInput');if(beEl)beEl.value=d.browser_executable;}
+    if(d.browser_probe){var bpEl=document.getElementById('browserProbeInfo');if(bpEl){var bp=d.browser_probe;bpEl.textContent=(bp.path||('none ('+(bp.source||'?')+')'))+(bp.version&&bp.version!=='unknown'?' v'+bp.version:'')+' ['+(bp.source||'')+']';}}
     if(d.max_inline_chars !== undefined) document.getElementById('maxInlineCharsInput').value = d.max_inline_chars;
     if(d.max_tool_retries !== undefined) document.getElementById('toolMaxRetriesInput').value = d.max_tool_retries;
     // Load timezone offset from config
@@ -3352,6 +3414,17 @@ async function deleteMcp(name){
 
 async function loadTools(){
   try{const r=await fetch('/api/tools');const d=await r.json();
+    const bel=document.getElementById('builtinsList');
+    const builtins=d.builtins||[];
+    if(builtins.length){
+      bel.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="text-align:left;border-bottom:2px solid var(--border)"><th style="padding:8px 4px">Capability</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+builtins.map(b=>{
+        const statusColor=b.enabled?'var(--green)':'var(--t3)';
+        const detail=b.detail?'<br><span style="font-size:11px;color:var(--t3)">'+esc(b.detail)+'</span>':'';
+        return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 4px"><strong>'+esc(b.name)+'</strong><br><span style="font-size:11px;color:var(--t3)">'+esc(b.key)+'</span></td><td style="color:var(--t3);font-size:12px">'+esc(b.description||'')+detail+'</td><td><span style="color:'+statusColor+'">&#9679; '+esc(b.enabled?b.on_label:b.off_label)+'</span></td><td><button class="btn btn-s" style="padding:4px 8px;font-size:11px" onclick="toggleBuiltin(\''+esc(b.key)+'\')">'+(b.enabled?'Disable':'Enable')+'</button></td></tr>';
+      }).join('')+'</tbody></table>';
+    }else{
+      bel.innerHTML='<span style="color:var(--t3)">No built-in capabilities reported.</span>';
+    }
     const el=document.getElementById('toolsList');
     const pathEl=document.getElementById('toolsPath');
     if(d.tools_dir)pathEl.textContent='?? '+d.tools_dir;
@@ -3368,6 +3441,16 @@ async function loadTools(){
 }
 async function toggleTool(name){
   try{await fetch('/api/tools/'+encodeURIComponent(name)+'/toggle',{method:'POST'});loadTools()}catch(e){alert('Failed')}
+}
+// 内置能力开关。存不上时必须报警：否则用户以为重启后还在，实际只活了这一次运行。
+async function toggleBuiltin(key){
+  try{
+    const r=await fetch('/api/tools/builtin/'+encodeURIComponent(key)+'/toggle',{method:'POST'});
+    const d=await r.json();
+    if(!d.success){alert(d.error||'Failed');return;}
+    if(d.persisted===false)alert('Changed for this run, but could not be saved to config.toml:\n'+(d.persist_error||''));
+    loadTools();
+  }catch(e){alert('Failed')}
 }
 
 // 閳光偓閳光偓 CRON Tasks 閳光偓閳光偓
@@ -3949,6 +4032,8 @@ function saveAgentSettings(){
   const toolTimeout=parseInt(document.getElementById('toolTimeoutInput').value)||300;
   const toolMaxRetries=parseInt(document.getElementById('toolMaxRetriesInput').value)||2;
   const enableContextScaling=document.getElementById('inlineScalingInput').checked;
+  const browserVisible=document.getElementById('browserVisibleInput')?document.getElementById('browserVisibleInput').checked:false;
+  const browserExecutable=document.getElementById('browserExeInput')?document.getElementById('browserExeInput').value.trim():'';
   const maxInlineChars=parseInt(document.getElementById('maxInlineCharsInput').value)||120000;
   fetch('/api/settings/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
     max_iterations:maxIter,
@@ -3957,6 +4042,8 @@ function saveAgentSettings(){
     tool_timeout_secs:toolTimeout,
     max_tool_retries:toolMaxRetries,
     enable_context_scaling:enableContextScaling,
+    browser_headless:!browserVisible,
+    browser_executable:browserExecutable,
     max_inline_chars:maxInlineChars
   })})
     .then(r=>r.json())
@@ -4284,6 +4371,21 @@ async function loadSystemStatus(){
   document.getElementById('dashSession').textContent=connected?'Active':'Inactive';
 }
 
+// ── Prompt-cache rollup ──
+// Hit rate is over the INPUT TOKENS OF CALLS THAT REPORTED CACHE ACCOUNTING
+// (`cache_input_tokens`), never over all input tokens: an endpoint that stays
+// silent about its cache must show 'n/a', not a 0% that looks like a broken
+// cache. `cached_tokens` null in a bucket = not one call reported anything.
+function cacheRate(cached,cacheInput){
+  cacheInput=Number(cacheInput)||0;
+  if(cacheInput<=0) return null;
+  return (Number(cached)||0)/cacheInput;
+}
+function fmtCacheRate(rate){
+  if(rate===null||rate===undefined||isNaN(rate)) return 'n/a';
+  return (rate*100).toFixed(1)+'%';
+}
+
 async function loadTodayUsage(){
   try{
     const r=await fetch('/api/usage?days=1&tz='+getTzOffset());
@@ -4293,6 +4395,10 @@ async function loadTodayUsage(){
     document.getElementById('todayInputTokens').textContent=fmtNum(s.total_prompt_tokens||0);
     document.getElementById('todayOutputTokens').textContent=fmtNum(s.total_completion_tokens||0);
     document.getElementById('todayApiCalls').textContent=fmtNum(s.total_calls||0);
+    const rate=cacheRate(s.total_cached_tokens,s.total_cache_input_tokens);
+    document.getElementById('todayCacheHit').textContent=fmtCacheRate(rate);
+    // Coverage tells the operator whether the number above is even measurable.
+    document.getElementById('todayCacheCov').textContent=(s.cache_reported_calls||0)+'/'+(s.total_calls||0)+' calls reported';
     document.getElementById('dashTodayDate').textContent='Today';
   }catch(e){}
 }
@@ -4419,9 +4525,12 @@ async function loadTokenUsage(){
     const s=d.summary||{};
     const rows=d.data||[];
     const rangeLabel=days==='0'?'All-time':days==='1'?'Today':days==='3'?'Last 3 days':'Last '+days+' days';
+    const cacheRateSummary=cacheRate(s.total_cached_tokens,s.total_cache_input_tokens);
     const cards=[
       {label:'Total Tokens',value:fmtNum(s.total_tokens||0),color:'#3498db'},
       {label:'Input Tokens',value:fmtNum(s.total_prompt_tokens||0),color:'#2ecc71'},
+      {label:'Cache Hit',value:fmtCacheRate(cacheRateSummary),color:'#0891b2',
+       sub:(s.cache_reported_calls||0)+'/'+(s.total_calls||0)+' calls reported'},
       {label:'Output Tokens',value:fmtNum(s.total_completion_tokens||0),color:'#e67e22'},
       {label:'API Calls',value:fmtNum(s.total_calls||0),color:'#9b59b6'},
     ];
@@ -4429,23 +4538,29 @@ async function loadTokenUsage(){
       '<div class="token-card" style="border-left-color:'+c.color+'">'+
       '<div class="token-card-label">'+c.label+'</div>'+
       '<div class="token-card-value" style="color:'+c.color+'">'+c.value+'</div>'+
-      '<div style="font-size:11px;color:#94a3b8;margin-top:4px">'+rangeLabel+'</div></div>'
+      '<div style="font-size:11px;color:#94a3b8;margin-top:4px">'+(c.sub||rangeLabel)+'</div></div>'
     ).join('');
     // By-model breakdown
     const modelMap={};
     rows.forEach(r=>{
       const k=r.model;
-      if(!modelMap[k])modelMap[k]={model:k,calls:0,prompt_tokens:0,completion_tokens:0,total_tokens:0};
+      if(!modelMap[k])modelMap[k]={model:k,calls:0,prompt_tokens:0,completion_tokens:0,total_tokens:0,cached_tokens:0,cache_input_tokens:0,cache_calls:0};
       modelMap[k].calls+=r.calls;
       modelMap[k].prompt_tokens+=r.prompt_tokens;
       modelMap[k].completion_tokens+=r.completion_tokens;
       modelMap[k].total_tokens+=r.total_tokens;
+      modelMap[k].cached_tokens+=(r.cached_tokens||0);
+      modelMap[k].cache_input_tokens+=(r.cache_input_tokens||0);
+      modelMap[k].cache_calls+=(r.cache_reported_calls||0);
     });
     const byModel=Object.values(modelMap).sort((a,b)=>b.total_tokens-a.total_tokens);
     if(byModel.length>0){
-      let h='<table><tr><th>Model</th><th style="text-align:right">Calls</th><th style="text-align:right">Input</th><th style="text-align:right">Output</th><th style="text-align:right">Total</th></tr>';
+      let h='<table><tr><th>Model</th><th style="text-align:right">Calls</th><th style="text-align:right">Input</th><th style="text-align:right">Cached</th><th style="text-align:right">Hit</th><th style="text-align:right">Output</th><th style="text-align:right">Total</th></tr>';
       byModel.forEach(m=>{
-        h+='<tr><td style="font-weight:500">'+m.model+'</td><td style="text-align:right">'+fmtNum(m.calls)+'</td><td style="text-align:right">'+fmtNum(m.prompt_tokens)+'</td><td style="text-align:right">'+fmtNum(m.completion_tokens)+'</td><td style="text-align:right;font-weight:600">'+fmtNum(m.total_tokens)+'</td></tr>';
+        const mr=cacheRate(m.cached_tokens,m.cache_input_tokens);
+        const cachedCell=m.cache_calls>0?fmtNum(m.cached_tokens):'-';
+        const hitCell=m.cache_calls>0?'<span style="color:#0891b2;font-weight:600">'+fmtCacheRate(mr)+'</span>':'<span style="color:#94a3b8">n/a</span>';
+        h+='<tr><td style="font-weight:500">'+m.model+'</td><td style="text-align:right">'+fmtNum(m.calls)+'</td><td style="text-align:right">'+fmtNum(m.prompt_tokens)+'</td><td style="text-align:right">'+cachedCell+'</td><td style="text-align:right">'+hitCell+'</td><td style="text-align:right">'+fmtNum(m.completion_tokens)+'</td><td style="text-align:right;font-weight:600">'+fmtNum(m.total_tokens)+'</td></tr>';
       });
       h+='</table>';
       document.getElementById('dashTodayByModel').innerHTML=h;
@@ -4456,11 +4571,14 @@ async function loadTokenUsage(){
     if(rows.length===0){
       document.getElementById('dashHistoryTable').innerHTML='<div style="color:#94a3b8">No data.</div>';
     }else{
-      let h='<table><tr><th>Date</th><th>Model</th><th style="text-align:right">Calls</th><th style="text-align:right">Input</th><th style="text-align:right">Output</th><th style="text-align:right">Total</th></tr>';
+      let h='<table><tr><th>Date</th><th>Model</th><th style="text-align:right">Calls</th><th style="text-align:right">Input</th><th style="text-align:right">Cached</th><th style="text-align:right">Hit</th><th style="text-align:right">Output</th><th style="text-align:right">Total</th></tr>';
       rows.forEach(r=>{
-        h+='<tr><td>'+r.date+'</td><td style="font-weight:500">'+r.model+'</td><td style="text-align:right">'+fmtNum(r.calls)+'</td><td style="text-align:right">'+fmtNum(r.prompt_tokens)+'</td><td style="text-align:right">'+fmtNum(r.completion_tokens)+'</td><td style="text-align:right;font-weight:600">'+fmtNum(r.total_tokens)+'</td></tr>';
+        const dr=cacheRate(r.cached_tokens,r.cache_input_tokens);
+        const cachedCell=(r.cached_tokens===null||r.cached_tokens===undefined)?'-':fmtNum(r.cached_tokens);
+        const hitCell=(r.cached_tokens===null||r.cached_tokens===undefined)?'<span style="color:#94a3b8">n/a</span>':'<span style="color:#0891b2;font-weight:600">'+fmtCacheRate(dr)+'</span>';
+        h+='<tr><td>'+r.date+'</td><td style="font-weight:500">'+r.model+'</td><td style="text-align:right">'+fmtNum(r.calls)+'</td><td style="text-align:right">'+fmtNum(r.prompt_tokens)+'</td><td style="text-align:right">'+cachedCell+'</td><td style="text-align:right">'+hitCell+'</td><td style="text-align:right">'+fmtNum(r.completion_tokens)+'</td><td style="text-align:right;font-weight:600">'+fmtNum(r.total_tokens)+'</td></tr>';
       });
-      h+='<tr style="font-weight:700;background:#f1f5f9"><td colspan="2">Total &middot; '+rangeLabel+'</td><td style="text-align:right">'+fmtNum(s.total_calls||0)+'</td><td style="text-align:right">'+fmtNum(s.total_prompt_tokens||0)+'</td><td style="text-align:right">'+fmtNum(s.total_completion_tokens||0)+'</td><td style="text-align:right;color:#2563eb">'+fmtNum(s.total_tokens||0)+'</td></tr>';
+      h+='<tr style="font-weight:700;background:#f1f5f9"><td colspan="2">Total &middot; '+rangeLabel+'</td><td style="text-align:right">'+fmtNum(s.total_calls||0)+'</td><td style="text-align:right">'+fmtNum(s.total_prompt_tokens||0)+'</td><td style="text-align:right">'+fmtNum(s.total_cached_tokens||0)+'</td><td style="text-align:right;color:#0891b2">'+fmtCacheRate(cacheRateSummary)+'</td><td style="text-align:right">'+fmtNum(s.total_completion_tokens||0)+'</td><td style="text-align:right;color:#2563eb">'+fmtNum(s.total_tokens||0)+'</td></tr>';
       h+='</table>';
       document.getElementById('dashHistoryTable').innerHTML=h;
     }

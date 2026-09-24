@@ -62,6 +62,32 @@ pub fn linux_ir_category_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
+/// Names of the whole Linux IR tool family: the 13 per-category tools plus the
+/// `ir_linux` aggregator. `linux_ssh` is deliberately NOT part of this family —
+/// it is the raw command channel and stays always-on so a Linux host remains
+/// reachable even when the Linux IR tool set is demoted to on-demand loading.
+///
+/// Derived from the actual tool objects (single source of truth) and cached, so
+/// adding a category tool can never silently escape the delivery gate.
+pub fn linux_ir_tool_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<String> = linux_ir_category_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        names.push(IrLinuxTool.name().to_string());
+        names.sort();
+        names
+    })
+}
+
+/// Whether `name` belongs to the Linux IR tool family (checked by the agent's
+/// tool-delivery gate against the Settings switch).
+pub fn is_linux_ir_tool(name: &str) -> bool {
+    linux_ir_tool_names().iter().any(|n| n == name)
+}
+
 /// Individual Linux IR category tool — runs only one category's modules via SSH.
 /// Provides targeted investigation like Windows IR tools (ir_process, ir_network, etc.).
 pub struct LinuxIrCategoryTool {

@@ -18,6 +18,7 @@ pub mod recall_memory;
 pub mod knowledge_ingest;
 pub mod todo_update;
 pub mod browser_cdp;
+pub mod browser_launch;
 pub mod ir_scan;
 pub mod ir_process;
 pub mod ir_account;
@@ -448,7 +449,9 @@ impl ToolRegistry {
         registry.register(Arc::new(ir_artifacts::IrArtifactsTool));
         registry.register(Arc::new(ir_driver::IrDriverTool));
         registry.register(Arc::new(ir_analyzer::IrAnalyzerTool));
-        registry.register(Arc::new(ir_report::IrReportTool));
+        // 默认不带浏览器会话（导出时自起一个临时实例）；main.rs 会用带共享会话的
+        // 同名注册覆盖它（register_arc 是 insert，后注册者赢）。
+        registry.register(Arc::new(ir_report::IrReportTool::new(None)));
         // Investigation case tracker and attack path modeling
         registry.register(Arc::new(ir_case::IrCaseTool));
         registry.register(Arc::new(ir_attackpath::IrAttackPathTool));

@@ -135,6 +135,46 @@ fn compress_handoff_summary(handoff: &str) -> String {
 /// Type alias for the broadcast channel used to push notifications to all WS clients.
 pub type NotifyTx = tokio::sync::broadcast::Sender<String>;
 
+/// Shared WebSocket send half, cloneable handle for one connection.
+pub type WsSink = Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>;
+
+/// Swappable sink held by an in-flight run. The run writes through this slot
+/// instead of a concrete connection, so a browser refresh / sleep / network
+/// drop **detaches** the run (events are no longer forwarded) instead of
+/// cancelling it, and a reconnecting client can re-attach its new sink and
+/// watch the same run continue live. Cancellation stays an explicit user
+/// action (STOP -> per-session cancel flag), never a side effect of transport.
+pub type SinkSlot = Arc<std::sync::Mutex<Option<WsSink>>>;
+
+/// Outcome of forwarding one event through a [`SinkSlot`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Forward {
+    /// Delivered to the client.
+    Delivered,
+    /// Send stalled; the message was dropped but the connection is still usable.
+    Dropped,
+    /// The connection is gone. The slot is now empty: the run keeps executing,
+    /// detached, until a client re-attaches or the user presses STOP.
+    Detached,
+    /// No client attached (already detached).
+    NoClient,
+}
+
+/// Forward one serialized event through the session's current sink, if any.
+/// Never fails a run: every failure mode degrades to a dropped message.
+async fn slot_forward(slot: &SinkSlot, msg: String) -> Forward {
+    let sink = slot.lock().unwrap().clone();
+    let Some(sink) = sink else { return Forward::NoClient };
+    match ws_send_bounded(&sink, msg).await {
+        WsSendOutcome::Sent => Forward::Delivered,
+        WsSendOutcome::Dropped => Forward::Dropped,
+        WsSendOutcome::Closed => {
+            *slot.lock().unwrap() = None;
+            Forward::Detached
+        }
+    }
+}
+
 /// Per-session running state for parallel multi-session execution (形态 B).
 /// Each active session gets its own cancel flag so stopping/starting one session
 /// never touches another. Registered while a session's task is in flight and
@@ -143,6 +183,8 @@ pub type NotifyTx = tokio::sync::broadcast::Sender<String>;
 pub struct SessionRunState {
     pub cancel: Arc<AtomicBool>,
     pub running: bool,
+    /// Current WS sink for this in-flight run (empty while detached).
+    pub sink: SinkSlot,
 }
 
 pub struct AppState {
@@ -167,6 +209,18 @@ pub struct AppState {
     pub sop_replay: Arc<AtomicBool>,
     /// 统一上下文预算仪表盘（有限脑）开关（默认开）。
     pub budget_dashboard: Arc<AtomicBool>,
+    /// Linux 取证工具族全量载入开关（默认关 = 降为按需载入）。与 agent 共享同一原子。
+    pub linux_ir_tools: Arc<AtomicBool>,
+    /// browser_cdp 无头开关（默认开）。关掉后浏览器可见，用于完成一次登录。
+    /// 与 BrowserSession 共享同一原子，切换不需重启。
+    pub browser_headless: Arc<AtomicBool>,
+    /// browser_cdp 显式指定的浏览器路径，空串 = 自动探测。与 BrowserSession 共享。
+    pub browser_executable: Arc<std::sync::RwLock<String>>,
+    /// Web Browser 能力开关（Tools 页）。false = browser_cdp 已从注册表注销。
+    pub browser_enabled: Arc<AtomicBool>,
+    /// 浏览器会话本体：Tools 页重新启用时要拿回同一个会话（同一份持久 profile），
+    /// 不能另建一个。ir_report 也已经持有同一个。
+    pub browser_session: Arc<crate::tool::browser_cdp::BrowserSession>,
     /// 有限脑实测预算快照：agent 每次组装上下文时写入，`/api/budget` 读取。
     pub context_budget: Arc<std::sync::Mutex<Option<crate::context_arbiter::BudgetReport>>>,
     /// 发生过 task-matched SKILL 驱动的会话集合（SOP 蒸馏门控）。
@@ -259,6 +313,7 @@ impl AppState {
                 if !st.running {
                     st.running = true;
                     st.cancel.store(false, Ordering::SeqCst);
+                    debrief_forget(session_id);
                 }
                 return Some(st.cancel.clone());
             }
@@ -270,7 +325,8 @@ impl AppState {
             return None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        runs.insert(session_id.to_string(), SessionRunState { cancel: cancel.clone(), running: true });
+        debrief_forget(session_id);
+        runs.insert(session_id.to_string(), SessionRunState { cancel: cancel.clone(), running: true, sink: SinkSlot::default() });
         Some(cancel)
     }
 
@@ -308,6 +364,38 @@ impl AppState {
             .lock()
             .map(|r| r.get(session_id).map(|s| s.running).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// Install a fresh slot bound to `sink` for a run that is about to start
+    /// (`session_slot_acquire` has already registered it). Idempotent: reuses the
+    /// existing slot so a re-attached client and the spawned drain share it.
+    pub fn session_install_sink(&self, session_id: &str, sink: &WsSink) -> SinkSlot {
+        let runs = self.session_runs.lock().unwrap();
+        if let Some(st) = runs.get(session_id) {
+            *st.sink.lock().unwrap() = Some(sink.clone());
+            return st.sink.clone();
+        }
+        // No registry entry (concurrency cap reached, connection-level fallback):
+        // the run still gets a private slot, it just cannot be re-attached.
+        Arc::new(std::sync::Mutex::new(Some(sink.clone())))
+    }
+
+    /// List in-flight sessions whose `wanted` set contains their id, and attach
+    /// `sink` to each. Used on (re)connect: the client announces the session ids
+    /// it can render, and every run still executing for one of them resumes
+    /// streaming into this connection instead of finishing unheard.
+    pub fn session_attach_sinks(&self, wanted: &[String], sink: &WsSink) -> Vec<String> {
+        let mut attached = Vec::new();
+        let runs = self.session_runs.lock().unwrap();
+        for id in wanted {
+            if let Some(st) = runs.get(id) {
+                if st.running {
+                    *st.sink.lock().unwrap() = Some(sink.clone());
+                    attached.push(id.clone());
+                }
+            }
+        }
+        attached
     }
 }
 
@@ -371,6 +459,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sop/stats", get(sop_stats_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/tools/{name}/toggle", post(tools_toggle_handler))
+        .route("/api/tools/builtin/{key}/toggle", post(builtin_tool_toggle_handler))
         .route("/api/tools/{name}/description", post(tools_desc_handler))
         .route("/api/config/files", get(config_files_handler))
         .route("/api/config/files/{name}", put(config_file_save_handler))
@@ -816,6 +905,25 @@ async fn health_handler() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
+/// 只读探测：当前这台机器上实际会选哪个浏览器（不会启动任何东西）。
+/// Settings 与 Tools 页都要显示这一行，同一口径不能各算各的。
+fn browser_probe_value(state: &AppState) -> Value {
+    let configured = state
+        .browser_executable
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let discovery = crate::tool::browser_launch::discover(&configured);
+    match discovery.chosen {
+        Some(c) => json!({
+            "path": c.path.to_string_lossy().to_string(),
+            "source": c.source.label(),
+            "version": crate::tool::browser_launch::version_from_layout(&c.path),
+        }),
+        None => json!({ "path": Value::Null, "source": "not found", "version": Value::Null }),
+    }
+}
+
 async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let models = state.model_configs.read().await;
     let list: Vec<Value> = models.iter().map(|m| {
@@ -828,6 +936,10 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         .map(|c| serde_json::to_value(&c.agent.tool_permissions).unwrap_or(json!({})))
         .unwrap_or(json!({}));
 
+    // 当前机器上实际会选用的浏览器：自动探测选错时这一行就能看出来，
+    // 不用先跑一次任务拿不到结果才知道。
+    let browser_probe = browser_probe_value(&state);
+
     Json(json!({
         "models": list,
         "context_window_threshold": state.context_window_threshold.load(Ordering::SeqCst),
@@ -837,6 +949,11 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "knowledge_pre_retrieval": state.knowledge_pre_retrieval.load(Ordering::SeqCst),
         "sop_replay": state.sop_replay.load(Ordering::SeqCst),
         "budget_dashboard": state.budget_dashboard.load(Ordering::SeqCst),
+        "linux_ir_tools": state.linux_ir_tools.load(Ordering::SeqCst),
+        "browser_headless": state.browser_headless.load(Ordering::SeqCst),
+        "browser_executable": state.browser_executable.read().map(|g| g.clone()).unwrap_or_default(),
+        "browser_enabled": state.browser_enabled.load(Ordering::SeqCst),
+        "browser_probe": browser_probe,
         "two_tier_memory": state.two_tier_memory.load(Ordering::SeqCst),
         "enable_context_scaling": state.enable_context_scaling.load(Ordering::SeqCst),
         "max_inline_chars": state.max_inline_chars.load(Ordering::SeqCst),
@@ -1365,18 +1482,107 @@ fn ws_msg_for_session(msg: String, session_id: &str) -> String {
     }
 }
 
-/// Drain a single session agent event stream and persist its outcome.
+/// Sessions whose end-of-session distillation already ran for the current task
+/// generation. A new run clears the mark (see `debrief_forget`), so a long-lived
+/// session stays debriefable again after fresh work.
+static DEBRIEF_DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>
+    = std::sync::OnceLock::new();
 
-/// Slice-2 (parallel multi-session): each Instant run is drained by its own
-/// spawned task that ONLY consumes the agent event stream. It no longer reads
-/// the shared client `ws_rx` — that is owned exclusively by the demux in
+fn debrief_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    DEBRIEF_DONE.get_or_init(Default::default)
+}
+
+fn debrief_forget(session_id: &str) {
+    if let Ok(mut s) = debrief_registry().lock() {
+        s.remove(session_id);
+    }
+}
+
+/// End-of-session conclusion solidification (case writeup + optional SOP).
+///
+/// `history.len() >= 4` gate keeps a greeting-only session from authoring noise.
+/// Fires from whoever observes the session's LAST run finish:
+/// * the drain task, when the client was already gone (a refresh only detaches a
+///   run now, so `handle_ws` has long since returned for that session);
+/// * the WebSocket teardown path, when nothing was in flight.
+///
+/// [`DEBRIEF_DONE`] dedups the two, so a mid-run refresh can neither distill a
+/// half-finished conversation nor let a detached run finish unheard-and-undistilled.
+async fn maybe_debrief(state: &Arc<AppState>, session_id: &str, trigger: &str) {
+    let short = &session_id[..8.min(session_id.len())];
+    if !state.debrief_enabled.load(Ordering::SeqCst) {
+        return;
+    }
+    if state.session_is_running(session_id) {
+        info!("[session:{}] debrief skipped on {}: run still in flight", short, trigger);
+        return;
+    }
+    if state.skill_used_sessions.lock().unwrap().contains(&session_id.to_string()) {
+        info!("Session {} was skill-driven; skipping debrief", short);
+        return;
+    }
+    if debrief_registry().lock().map(|s| s.contains(session_id)).unwrap_or(false) {
+        return;
+    }
+    let history = state.sessions.lock().await.get(session_id).cloned().unwrap_or_default();
+    if history.len() < 4 {
+        return;
+    }
+    let tool_log = state
+        .session_tool_log
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(mut s) = debrief_registry().lock() {
+        s.insert(session_id.to_string());
+    }
+    let provider = state.provider.clone();
+    let model_name = state
+        .model_configs
+        .read()
+        .await
+        .first()
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    let workspace_dir = state.workspace_dir.clone();
+    let sid = session_id.to_string();
+    info!("[session:{}] Solidifying session conclusions ({})", short, trigger);
+    tokio::spawn(async move {
+        match crate::debrief::run(provider, &model_name, &workspace_dir, &history, &tool_log).await {
+            Ok(Some(out)) => {
+                info!(
+                    "Session {} debrief: case_note={:?} sop={:?}",
+                    &sid[..8.min(sid.len())],
+                    out.case_note_path,
+                    out.sop_id
+                );
+            }
+            Ok(None) => info!("Session {} debrief: nothing worth solidifying", &sid[..8.min(sid.len())]),
+            Err(e) => warn!("Session {} debrief failed: {}", &sid[..8.min(sid.len())], e),
+        }
+    });
+}
+
+/// Drain a single session agent event stream and persist its outcome.
+///
+/// Slice-2 (parallel multi-session): each run (Instant AND Expert) is drained by
+/// its own spawned task that ONLY consumes the agent event stream. It no longer
+/// reads the shared client `ws_rx` — that is owned exclusively by the demux in
 /// `handle_ws`, which routes stop / interject / permission responses into
-/// per-session flags and the static interject queues. Instant cancellation is
-/// detected by polling the per-session cancel flag; Expert (managed) runs
-/// observe the connection-level `cancelled` flag and are drained inline.
+/// per-session flags and the static interject queues. Cancellation is detected
+/// by polling the per-session cancel flag (or the connection-level one).
+///
+/// Transport is NOT cancellation: events go through a [`SinkSlot`], so a dead
+/// connection detaches the drain (it keeps consuming the stream, keeps the agent
+/// loop alive, and still persists the final answer) instead of dropping the
+/// stream — which used to close the agent's event channel and abort a running
+/// task mid-flight. Only an explicit STOP breaks here, and it drops the stream
+/// on purpose so the agent loop observes a closed channel and unwinds.
 async fn drain_session_stream(
     state: Arc<AppState>,
-    ws_sink: Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
+    slot: SinkSlot,
     model: String,
     session_id: String,
     content: String,
@@ -1389,6 +1595,7 @@ async fn drain_session_stream(
     let mut assistant_text = String::new();
     let mut srv_events: u64 = 0;
     let mut srv_last = std::time::Instant::now();
+    let mut detached = false;
     loop {
         tokio::select! {
             result = event_stream.next() => {
@@ -1412,20 +1619,31 @@ async fn drain_session_stream(
                                 entries.push((name.clone(), success));
                             }
                         }
-                        if let AgentEvent::Usage { model: _, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
+                        if let AgentEvent::Usage { model: _, prompt_tokens, completion_tokens, total_tokens, cached_tokens, .. } = &event {
                             let ms = state.memory_store.clone();
                             let mdl = model.clone();
                             let pt = *prompt_tokens;
                             let ct = *completion_tokens;
                             let tt = *total_tokens;
+                            let cst = *cached_tokens;
                             let sid = session_id.clone();
                             tokio::task::spawn_blocking(move || {
-                                let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
+                                let _ = ms.record_usage(&mdl, pt, ct, tt, cst, &sid);
                             });
                         }
                         let msg_str = ws_msg_for_session(event.to_ws_message(), &session_id);
-                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
-                            break;
+                        match slot_forward(&slot, msg_str).await {
+                            Forward::Detached | Forward::NoClient if !detached => {
+                                detached = true;
+                                info!("[session:{}] Client gone; run continues in background (will persist the answer, re-attach on reconnect)", session_id);
+                            }
+                            Forward::Detached | Forward::NoClient => {}
+                            _ => {
+                                if detached {
+                                    detached = false;
+                                    info!("[session:{}] Client re-attached; resuming live streaming", session_id);
+                                }
+                            }
                         }
                         if event.is_done() {
                             break;
@@ -1434,7 +1652,7 @@ async fn drain_session_stream(
                     Some(Err(e)) => {
                         let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                         let msg_str = ws_msg_for_session(err_event.to_ws_message(), &session_id);
-                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
+                        let _ = slot_forward(&slot, msg_str).await;
                         break;
                     }
                     None => break,
@@ -1460,10 +1678,10 @@ async fn drain_session_stream(
             }
             let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
             let msg_str = ws_msg_for_session(stop_event.to_ws_message(), &session_id);
-            let _ = ws_send_bounded(&ws_sink, msg_str).await;
+            let _ = slot_forward(&slot, msg_str).await;
             let done_event = AgentEvent::done(&session_id, "system");
             let msg_str = ws_msg_for_session(done_event.to_ws_message(), &session_id);
-            let _ = ws_send_bounded(&ws_sink, msg_str).await;
+            let _ = slot_forward(&slot, msg_str).await;
             spawn_deep_curator(state.clone(), &model, &session_id, &content, &assistant_text);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             break;
@@ -1472,7 +1690,12 @@ async fn drain_session_stream(
 
     // 记忆 KPI：loaded = 本轮注入的深层事实；referenced = 回复文本真正命中
     // 其关键词的事实。只降权、不删除（自然选择，不是清除）。
-    if !deep_injected.is_empty() {
+    //
+    // Gate on visible text: a tool-only round, a stopped round and a round that
+    // died before producing a body can never score a `referenced` hit, so
+    // recording `loaded` for those would silently down-weight facts the model
+    // never actually had a chance to use.
+    if !deep_injected.is_empty() && !assistant_text.trim().is_empty() {
         let loaded: Vec<String> = deep_injected.iter().map(|(id, _)| id.clone()).collect();
         let referenced: Vec<String> = deep_injected
             .iter()
@@ -1503,6 +1726,20 @@ async fn drain_session_stream(
     // Release the parallel-execution slot (Instant runs only; managed had none).
     if session_cancel.is_some() {
         state.session_slot_release(&session_id);
+    }
+    // Nobody is listening: this drain is the last observer of the session, so it
+    // owns end-of-session solidification (the WebSocket path already returned).
+    if detached {
+        maybe_debrief(&state, &session_id, "run-end, no client").await;
+        // Queued follow-ups are dispatched by the per-connection loop, which is
+        // gone. They survive in the global queue and flush on the next connect;
+        // log it so an orphaned queue is never silent.
+        if crate::interject::has_pending(&session_id) {
+            warn!(
+                "[session:{}] Run finished with no client attached and queued follow-ups pending; they will dispatch on the next connect",
+                &session_id[..8.min(session_id.len())]
+            );
+        }
     }
 }
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
@@ -2122,7 +2359,9 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         // other sessions (true parallelism across Instant sessions). Expert
                                         // (managed) runs stay inline and are awaited directly.
                                         let st = state.clone();
-                                        let w = ws_sink.clone();
+                                        // Route events through the session's swappable slot (not this
+                                        // connection's sink) so a refresh detaches instead of killing.
+                                        let w = state.session_install_sink(&session_id, &ws_sink);
                                         let s2 = session_id.clone();
                                         let m2 = model.clone();
                                         let c2 = content.clone();
@@ -2137,7 +2376,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         // reaches the per-session cancel flag) and other
                                         // sessions keep working while this task audits.
                                         let st = state.clone();
-                                        let w = ws_sink.clone();
+                                        let w = state.session_install_sink(&session_id, &ws_sink);
                                         let s2 = session_id.clone();
                                         let m2 = model.clone();
                                         let c2 = content.clone();
@@ -2267,6 +2506,11 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                     let mut assistant_text = String::new();
                                     let mut srv_events: u64 = 0;
                                     let mut srv_last = std::time::Instant::now();
+                                    // Same detach-not-cancel semantics as `drain_session_stream`:
+                                    // events go through the session slot, and the socket dying only
+                                    // stops the forwarding (and the ws_rx polling), never the run.
+                                    let rslot = state.session_install_sink(&session_id, &ws_sink);
+                                    let mut rdetached = false;
                                     loop {
                                         tokio::select! {
                                             result = event_stream.next() => {
@@ -2281,7 +2525,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                             assistant_text.push_str(c);
                                                         }
                                                         // Persist token usage to database
-                                                        if let AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, .. } = &event {
+                                                        if let AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, .. } = &event {
                                                             {
                                                         // record_usage is a synchronous SQLite write guarded by a
                                                         // std::sync::Mutex inside the async event loop. Called inline it
@@ -2293,15 +2537,17 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                         let pt = *prompt_tokens;
                                                         let ct = *completion_tokens;
                                                         let tt = *total_tokens;
+                                                        let cst = *cached_tokens;
                                                         let sid = session_id.clone();
                                                         tokio::task::spawn_blocking(move || {
-                                                            let _ = ms.record_usage(&mdl, pt, ct, tt, &sid);
+                                                            let _ = ms.record_usage(&mdl, pt, ct, tt, cst, &sid);
                                                         });
                                                     }
                                                         }
                                                         let msg_str = event.to_ws_message();
-                                                        if matches!(ws_send_bounded(&ws_sink, msg_str).await, WsSendOutcome::Closed) {
-                                                            break;
+                                                        match slot_forward(&rslot, msg_str).await {
+                                                            Forward::Detached | Forward::NoClient => rdetached = true,
+                                                            _ => rdetached = false,
                                                         }
                                                         if event.is_done() {
                                                             break;
@@ -2310,13 +2556,13 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                     Some(Err(e)) => {
                                                         let err_event = AgentEvent::error(&e.to_string(), &session_id, "system");
                                                         let msg_str = err_event.to_ws_message();
-                                                        let _ = ws_send_bounded(&ws_sink, msg_str).await;
+                                                        let _ = slot_forward(&rslot, msg_str).await;
                                                         break;
                                                     }
                                                     None => break,
                                                 }
                                             }
-                                            msg = ws_rx.recv() => {
+                                            msg = ws_rx.recv(), if !rdetached => {
                                                 match msg {
                                                     Some(Message::Text(ref t)) => {
                                                         if let Ok(p) = serde_json::from_str::<Value>(t) {
@@ -2330,11 +2576,13 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                                             }
                                                         }
                                                     }
-                                                    Some(Message::Close(_)) => {
-                                                        cancelled.store(true, Ordering::SeqCst);
-                                                        break;
+                                                    // Connection loss is NOT a user stop: detach the sink
+                                                    // (the `if !rdetached` guard stops polling ws_rx) and
+                                                    // let the resumed run finish and persist its answer.
+                                                    Some(Message::Close(_)) | None => {
+                                                        rdetached = true;
+                                                        *rslot.lock().unwrap() = None;
                                                     }
-                                                    None => break,
                                                     _ => {}
                                                 }
                                             }
@@ -2382,6 +2630,37 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             let req_id = parsed["request_id"].as_str().unwrap_or("");
                             let allowed = parsed["allowed"].as_bool().unwrap_or(false);
                             state.permission_resolver.resolve(req_id, allowed).await;
+                        }
+                        "attach" => {
+                            // (Re)connect handshake: the client announces every session id it can
+                            // render. Any run still in flight for one of them is re-pointed at this
+                            // connection (it kept executing while detached), and the client is told
+                            // which sessions are live again so it can restore the running UI state.
+                            let mut wanted: Vec<String> = parsed["sessions"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if let Some(s) = parsed["session"].as_str() {
+                                if !s.is_empty() && !wanted.iter().any(|w| w == s) {
+                                    wanted.push(s.to_string());
+                                }
+                            }
+                            if wanted.is_empty() {
+                                wanted.push(session_id.clone());
+                            }
+                            let attached = state.session_attach_sinks(&wanted, &ws_sink);
+                            for sid in attached {
+                                info!("[session:{}] Client re-attached to running task", &sid[..8.min(sid.len())]);
+                                let _ = ws_send_bounded(
+                                    &ws_sink,
+                                    json!({ "type": "run_attached", "session": sid }).to_string(),
+                                )
+                                .await;
+                            }
                         }
                         "stop" => {
                         	// Session-scoped stop received while the main loop is idle
@@ -2431,42 +2710,10 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
     // experience 由“蒸馏经验条目”改为“动态 SOP”：会话若含可复用的多步骤过程，
     // 经 LLM 作者判定后固化为可回放、可评分、可自动迭代的 SOP（sops.json）。
     // 用户手动挂接的 knowledge 不变。
-    let history = state.sessions.lock().await.get(&session_id).cloned().unwrap_or_default();
-    // Skill-driven sessions must NOT spawn a redundant SOP — the skill already
-    // bundled the procedure. Skip authoring for those.
-    let skill_driven = state.skill_used_sessions.lock().unwrap().contains(&session_id);
-    if skill_driven {
-        info!("Session {} was skill-driven; skipping debrief", &session_id[..8.min(session_id.len())]);
-    }
-    // 结论固化（Debrief）：门控 = 问题明确 + 过程实质（权威工具计数）+ 结果收敛。
-    // 产物双轨：案例 writeup → knowledge/writeups/；可复用流程 → sops.json。
-    if history.len() >= 4 && !skill_driven && state.debrief_enabled.load(Ordering::SeqCst) {
-        let provider = state.provider.clone();
-        let model_name = state.model_configs.read().await.first().map(|m| m.name.clone()).unwrap_or_default();
-        let workspace_dir = state.workspace_dir.clone();
-        let sid = session_id.clone();
-        let tool_log = state
-            .session_tool_log
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_default();
-        tokio::spawn(async move {
-            match crate::debrief::run(provider, &model_name, &workspace_dir, &history, &tool_log).await {
-                Ok(Some(out)) => {
-                    info!(
-                        "Session {} debrief: case_note={:?} sop={:?}",
-                        &sid[..8.min(sid.len())],
-                        out.case_note_path,
-                        out.sop_id
-                    );
-                }
-                Ok(None) => info!("Session {} debrief: nothing worth solidifying", &sid[..8.min(sid.len())]),
-                Err(e) => warn!("Session {} debrief failed: {}", &sid[..8.min(sid.len())], e),
-            }
-        });
-    }
+    // A refresh mid-run only DETACHES the run, so this teardown must not distill
+    // a conversation that is still being written; `maybe_debrief` re-checks that
+    // (and dedups against the drain-side trigger) internally.
+    maybe_debrief(&state, &session_id, "connection-close").await;
 }
 
 // ============================================================
@@ -3124,7 +3371,138 @@ async fn tools_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     drop(registry);
 
     info!("External tools synced to registry: {} tool(s)", registered_count);
-    Json(json!({ "tools": tools, "tools_dir": tools_dir, "count": tools.len(), "registered": registered_count }))
+
+    // 内置能力。这一列故意不只装 External Tools：用户要的是“浏览器、Linux 取证工具族
+    // 这些能力能逐个开关”。但它们的“关”不是同一个语义，所以每行自己带标签，
+    // 不要把“降为按需载入”写成“已停用”。
+    let browser_probe = browser_probe_value(&state);
+    // Value 的 Display 会连 JSON 引号一起打出来，取字符串再拼。
+    let probe_path = browser_probe["path"].as_str().unwrap_or("");
+    let probe_source = browser_probe["source"].as_str().unwrap_or("?");
+    let builtins = vec![
+        json!({
+            "key": "browser_cdp",
+            "name": "Web Browser",
+            "description": "browser_cdp: navigate, screenshot, extract page content, run JS. Uses its own persistent profile under the workspace.",
+            "enabled": state.browser_enabled.load(Ordering::SeqCst),
+            "on_label": "Enabled",
+            "off_label": "Disabled (unregistered)",
+            "detail": if probe_path.is_empty() {
+                format!("no browser detected ({})", probe_source)
+            } else {
+                format!("{} [{}]", probe_path, probe_source)
+            },
+        }),
+        json!({
+            "key": "computer_use",
+            "name": "Computer Use",
+            "description": "cu_* tools: screen capture, mouse and keyboard control of this desktop.",
+            "enabled": state.computer_use_enabled.load(Ordering::SeqCst),
+            "on_label": "Enabled",
+            "off_label": "Disabled (unregistered)",
+            "detail": "",
+        }),
+        json!({
+            "key": "linux_ir_tools",
+            "name": "Linux Forensics Tools",
+            "description": "Linux IR family (category scanners + aggregator). Off here does NOT mean unavailable: it moves to the on-demand schema catalog and stays callable via load_tool_schema, which saves fixed context.",
+            "enabled": state.linux_ir_tools.load(Ordering::SeqCst),
+            "on_label": "Full load (every request)",
+            "off_label": "On-demand (still callable)",
+            "detail": "linux_ssh always stays loaded",
+        }),
+        json!({
+            "key": "human_intervention",
+            "name": "Simulated Human Intervention",
+            "description": "Expert mode: when blocked, let the LLM play the human responder instead of stalling.",
+            "enabled": state.human_intervention_enabled.load(Ordering::SeqCst),
+            "on_label": "Enabled",
+            "off_label": "Disabled",
+            "detail": "",
+        }),
+    ];
+
+    Json(json!({
+        "tools": tools,
+        "tools_dir": tools_dir,
+        "count": tools.len(),
+        "registered": registered_count,
+        "builtins": builtins,
+    }))
+}
+
+/// Tools 页那一行的开关。四个 key 走同一条路：改运行期状态 → 落盘 config.toml。
+/// 落盘失败不会回滚运行期效果（用户已经看到切换了），但会把 persisted=false 带回去，
+/// 不假装存住了。
+async fn builtin_tool_toggle_handler(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Json<Value> {
+    let next = match key.as_str() {
+        "browser_cdp" => !state.browser_enabled.load(Ordering::SeqCst),
+        "computer_use" => !state.computer_use_enabled.load(Ordering::SeqCst),
+        "linux_ir_tools" => !state.linux_ir_tools.load(Ordering::SeqCst),
+        "human_intervention" => !state.human_intervention_enabled.load(Ordering::SeqCst),
+        other => {
+            return Json(json!({ "success": false, "error": format!("unknown tool switch: {}", other) }))
+        }
+    };
+
+    match key.as_str() {
+        "browser_cdp" => {
+            if next {
+                // 拿回同一个会话：另建一个会多一份持久 profile，登录态就对不上了。
+                let mut reg = state.tools.write().await;
+                reg.register(Arc::new(crate::tool::browser_cdp::BrowserCdpTool::new(
+                    state.browser_session.clone(),
+                )));
+                state.browser_enabled.store(true, Ordering::SeqCst);
+                info!("Web Browser ENABLED: browser_cdp registered");
+            } else {
+                // 先注销再关浏览器：反过来会有一个在跑的进程持着 user-data-dir，
+                // 下次启动撞上单实例互斥，表现成“启动失败”。
+                {
+                    let mut reg = state.tools.write().await;
+                    reg.unregister("browser_cdp");
+                }
+                state.browser_enabled.store(false, Ordering::SeqCst);
+                if let Err(e) = state.browser_session.close().await {
+                    warn!("Web Browser disabled but closing the browser failed: {}", e);
+                }
+                info!("Web Browser DISABLED: browser_cdp unregistered, session closed");
+            }
+        }
+        "computer_use" => {
+            let mut reg = state.tools.write().await;
+            if next {
+                crate::tool::computer_use::register_computer_use_tools(&mut reg);
+            } else {
+                crate::tool::computer_use::unregister_computer_use_tools(&mut reg);
+            }
+            drop(reg);
+            state.computer_use_enabled.store(next, Ordering::SeqCst);
+            info!("Computer Use tools {}", if next { "ENABLED" } else { "DISABLED" });
+        }
+        "linux_ir_tools" => {
+            state.linux_ir_tools.store(next, Ordering::SeqCst);
+            info!("Linux IR tools {}", if next { "full load" } else { "on-demand" });
+        }
+        _ => {
+            // human_intervention：没有工具表可改，只是一个运行期开关。
+            state.human_intervention_enabled.store(next, Ordering::SeqCst);
+            info!("Human Intervention Simulation {}", if next { "ENABLED" } else { "DISABLED" });
+        }
+    }
+
+    let mut response = json!({ "success": true, "key": key, "enabled": next });
+    if let Err(e) = crate::config::Config::set_builtin_tool_switch(&state.workspace_dir, &key, next) {
+        error!("Failed to persist tool switch {} = {}: {}", key, next, e);
+        response["persisted"] = json!(false);
+        response["persist_error"] = json!(format!("changed for this run, but not saved: {}", e));
+    } else {
+        response["persisted"] = json!(true);
+    }
+    Json(response)
 }
 
 async fn tools_toggle_handler(
@@ -3185,7 +3563,16 @@ async fn computer_use_toggle_handler(
         }
     }
 
-    Json(json!({ "success": true, "enabled": enabled }))
+    // 以前这里只改内存就返回，重启后开关又回到 config 里的旧值。跟 Tools 页一致落盘。
+    let mut response = json!({ "success": true, "enabled": enabled });
+    if let Err(e) = crate::config::Config::set_builtin_tool_switch(&state.workspace_dir, "computer_use", enabled) {
+        error!("Failed to persist computer_use={}: {}", enabled, e);
+        response["persisted"] = json!(false);
+        response["persist_error"] = json!(format!("changed for this run, but not saved: {}", e));
+    } else {
+        response["persisted"] = json!(true);
+    }
+    Json(response)
 }
 
 // ============================================================
@@ -3210,8 +3597,17 @@ async fn human_intervention_toggle_handler(
     if prev != enabled {
         info!("Human Intervention Simulation {}", if enabled { "ENABLED" } else { "DISABLED" });
     }
-    
-    Json(json!({ "success": true, "enabled": enabled }))
+
+    // 同上：不落盘的话这一勾只活到下一次重启。
+    let mut response = json!({ "success": true, "enabled": enabled });
+    if let Err(e) = crate::config::Config::set_builtin_tool_switch(&state.workspace_dir, "human_intervention", enabled) {
+        error!("Failed to persist human_intervention={}: {}", enabled, e);
+        response["persisted"] = json!(false);
+        response["persist_error"] = json!(format!("changed for this run, but not saved: {}", e));
+    } else {
+        response["persisted"] = json!(true);
+    }
+    Json(response)
 }
 
 // Heartbeat toggle
@@ -3312,6 +3708,16 @@ async fn agent_settings_save_handler(
     let budget_dashboard = body.get("budget_dashboard")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.budget_dashboard.load(Ordering::SeqCst));
+    let linux_ir_tools = body.get("linux_ir_tools")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.linux_ir_tools.load(Ordering::SeqCst));
+    let browser_headless = body.get("browser_headless")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.browser_headless.load(Ordering::SeqCst));
+    let browser_executable = body.get("browser_executable")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| state.browser_executable.read().map(|g| g.clone()).unwrap_or_default());
     let enable_context_scaling = body.get("enable_context_scaling")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.enable_context_scaling.load(Ordering::SeqCst));
@@ -3353,12 +3759,15 @@ async fn agent_settings_save_handler(
         knowledge_pre_retrieval,
         two_tier_memory,
         budget_dashboard,
+        linux_ir_tools,
         enable_context_scaling,
         max_inline_chars,
         skill_listing_strategy.as_str().to_string(),
         skill_max_inline_chars,
         skill_catalog_max,
         skill_hot_top_k,
+        browser_headless,
+        browser_executable.clone(),
     ) {
         Ok(()) => {
             // Hot-reload in-memory values so the next run picks them up immediately
@@ -3372,6 +3781,11 @@ async fn agent_settings_save_handler(
             state.sop_replay.store(sop_replay, Ordering::SeqCst);
         state.two_tier_memory.store(two_tier_memory, Ordering::SeqCst);
         state.budget_dashboard.store(budget_dashboard, Ordering::SeqCst);
+        state.linux_ir_tools.store(linux_ir_tools, Ordering::SeqCst);
+            state.browser_headless.store(browser_headless, Ordering::SeqCst);
+            if let Ok(mut g) = state.browser_executable.write() {
+                *g = browser_executable.clone();
+            }
             state.enable_context_scaling.store(enable_context_scaling, Ordering::SeqCst);
             state.max_inline_chars.store(max_inline_chars, Ordering::SeqCst);
             state.skill_listing_strategy.store(skill_listing_strategy.index(), Ordering::SeqCst);
@@ -3394,6 +3808,7 @@ async fn agent_settings_save_handler(
                 "sop_replay": sop_replay,
                 "two_tier_memory": two_tier_memory,
                 "budget_dashboard": budget_dashboard,
+                "linux_ir_tools": linux_ir_tools,
                 "enable_context_scaling": enable_context_scaling,
                 "max_inline_chars": max_inline_chars,
                 "skill_listing_strategy": skill_listing_strategy.as_str().to_string(),
@@ -3745,14 +4160,29 @@ async fn usage_handler(
             let mut total_prompt: i64 = 0;
             let mut total_completion: i64 = 0;
             let mut total_tokens: i64 = 0;
+            // Prompt-cache rollup. The denominator is input tokens of calls that
+            // actually reported cache accounting (`cache_input_tokens`), never all
+            // input tokens: a cache-blind endpoint must produce a null hit rate,
+            // not a misleading 0%.
+            let mut total_cached: i64 = 0;
+            let mut total_cache_input: i64 = 0;
+            let mut cache_reported_calls: i64 = 0;
             if let Some(arr) = data.as_array() {
                 for item in arr {
                     total_calls += item["calls"].as_i64().unwrap_or(0);
                     total_prompt += item["prompt_tokens"].as_i64().unwrap_or(0);
                     total_completion += item["completion_tokens"].as_i64().unwrap_or(0);
                     total_tokens += item["total_tokens"].as_i64().unwrap_or(0);
+                    total_cached += item["cached_tokens"].as_i64().unwrap_or(0);
+                    total_cache_input += item["cache_input_tokens"].as_i64().unwrap_or(0);
+                    cache_reported_calls += item["cache_reported_calls"].as_i64().unwrap_or(0);
                 }
             }
+            let cache_hit_rate = if total_cache_input > 0 {
+                json!(total_cached as f64 / total_cache_input as f64)
+            } else {
+                Value::Null
+            };
             Json(json!({
                 "days": days,
                 "data": data,
@@ -3761,6 +4191,10 @@ async fn usage_handler(
                     "total_prompt_tokens": total_prompt,
                     "total_completion_tokens": total_completion,
                     "total_tokens": total_tokens,
+                    "total_cached_tokens": total_cached,
+                    "total_cache_input_tokens": total_cache_input,
+                    "cache_reported_calls": cache_reported_calls,
+                    "cache_hit_rate": cache_hit_rate,
                 }
             }))
         },

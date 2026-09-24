@@ -15,6 +15,16 @@ pub struct ServerConfig {
     pub port: u16,
 }
 
+/// 单个 External Tool 的持久状态。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExternalToolState {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 用户在 GUI 里改过的描述。None = 用文件名/sidecar 推出来的那份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     #[serde(default = "default_working_dir")]
@@ -51,6 +61,28 @@ pub struct AgentConfig {
     /// 并在 Dashboard 页显示预算分配。默认开。
     #[serde(default = "default_budget_dashboard")]
     pub budget_dashboard: bool,
+    /// Linux 取证工具族（13 个分类工具 + 聚合扫描器）是否每轮全量载入。
+    /// 默认关：关闭时它们降为按需载入（仍注册、仍可执行，模型用
+    /// load_tool_schema 取回完整模式后调用），把这段固定开销移出请求前缀；
+    /// `linux_ssh` 不受本开关影响，始终载入。
+    #[serde(default = "default_linux_ir_tools")]
+    pub linux_ir_tools: bool,
+    /// browser_cdp 是否无头运行。默认 true（不弹窗口）。
+    /// 改为 false 后浏览器会显示出来，用于在一次需要密码/2FA/扫码的登录
+    /// 上完成后长期复用（登录态存在 workspace 的持久 profile 目录里）。
+    #[serde(default = "default_browser_headless")]
+    pub browser_headless: bool,
+    /// browser_cdp 使用的浏览器可执行文件路径。空串 = 自动探测
+    /// （环境变量 → PATH → 注册表 → 常见安装目录）。只有自动探测选错/选不到时才填。
+    #[serde(default = "default_browser_executable")]
+    pub browser_executable: String,
+    /// browser_cdp（Web Browser）是否作为工具提供给模型。默认开。
+    /// 关闭 = 真注销：模型的工具列表里没有它，系统提示里那段浏览器说明也一并撤掉，
+    /// 否则它会去调一个不存在的工具并白烧轮次。
+    /// 注意：报告导出（ir_report）出 PDF 仍会用同一个浏览器引擎渲染，那是内部实现，
+    /// 不属于本开关管的“给模型的能力”，缺省无头因此也不会弹窗口。
+    #[serde(default = "default_browser_enabled")]
+    pub browser_enabled: bool,
     /// Context window usage threshold percentage (default: 80 = trim at 80% of model context)
     #[serde(default = "default_context_window_threshold")]
     pub context_window_threshold: usize,
@@ -107,6 +139,10 @@ pub struct AgentConfig {
     /// Default: false (disabled). Can be toggled at runtime via Settings UI.
     #[serde(default)]
     pub computer_use: bool,
+    /// Expert 模式卡住时用 LLM 模拟人工介入。默认关。
+    /// 这个开关过去只存在进程内存里，重启就回到 config.toml 的值（等于每次都被关掉）。
+    #[serde(default)]
+    pub human_intervention: bool,
     /// Whether the background heartbeat (proactive HEARTBEAT.md checks) runs. Default: off.
     #[serde(default = "default_heartbeat_enabled")]
     pub heartbeat_enabled: bool,
@@ -122,6 +158,11 @@ pub struct AgentConfig {
     /// Tool permissions: category -> allowed (true) or denied (false)
     #[serde(default)]
     pub tool_permissions: HashMap<String, bool>,
+    /// External Tools（`<workspace>/tools` 目录里的可执行文件）的启用状态与自定义描述。
+    /// 过去存在 `tools/tools_state.json`，跟 GUI 其它配置分两处写；现在统一进 config.toml，
+    /// 旧文件只在 map 为空时一次性导入（不删，避免动用户文件）。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub external_tools: HashMap<String, ExternalToolState>,
     /// Expert mode: max iterations per Executor round (default: 200)
     #[serde(default = "default_expert_max_iterations")]
     pub expert_max_iterations: usize,
@@ -469,6 +510,10 @@ impl Default for Config {
                 debrief_enabled: default_debrief_enabled(),
                 two_tier_memory: default_two_tier_memory(),
                 budget_dashboard: default_budget_dashboard(),
+                linux_ir_tools: default_linux_ir_tools(),
+                browser_headless: default_browser_headless(),
+                browser_executable: default_browser_executable(),
+                browser_enabled: default_browser_enabled(),
                 context_window_threshold: default_context_window_threshold(),
                 enable_context_scaling: default_enable_context_scaling(),
                 max_inline_chars: default_max_inline_chars(),
@@ -483,11 +528,13 @@ impl Default for Config {
                 max_tool_retries: default_max_tool_retries(),
                 parallel_ir_tools: default_parallel_ir_tools(),
                 computer_use: false,
+                human_intervention: false,
                 heartbeat_enabled: default_heartbeat_enabled(),
                 primary_model: None,
                 fallback_model: None,
                 timezone_offset: default_timezone_offset(),
                 tool_permissions: HashMap::new(),
+                external_tools: HashMap::new(),
                 expert_max_iterations: default_expert_max_iterations(),
                 expert_tool_timeout_secs: default_expert_tool_timeout_secs(),
                 expert_max_tool_retries: default_expert_max_tool_retries(),
@@ -520,6 +567,17 @@ fn default_sop_replay() -> bool { true }
 fn default_debrief_enabled() -> bool { true }
 fn default_two_tier_memory() -> bool { true }
 fn default_budget_dashboard() -> bool { true }
+// Linux IR tool family ships demoted (on-demand schema loading) by default: the
+// family is ~14 tool schemas of fixed per-request cost that only pays off on a
+// Linux target. Keeping it out of the request prefix also protects the provider's
+// prompt cache (the schema block sits before the conversation).
+fn default_linux_ir_tools() -> bool { false }
+// 缺省开：Web Browser 是默认可用的能力，用户不想要时在 Tools 页关掉（真注销）。
+fn default_browser_enabled() -> bool { true }
+fn default_true() -> bool { true }
+// 缺省无头：取证桌面上不会弹窗口，用户也误关不了。需要登录时去 Settings 勾掉。
+fn default_browser_headless() -> bool { true }
+fn default_browser_executable() -> String { String::new() }
 fn default_context_window() -> usize { 128000 }
 fn default_context_window_threshold() -> usize { 80 }
 fn default_enable_context_scaling() -> bool { true }
@@ -830,6 +888,12 @@ skill_catalog_max = 40
 skill_hot_top_k = 3
 # Enable the skill self-improvement loop (default: false)
 skill_self_improve = false
+# browser_cdp: run hidden (true, default) or in a visible window (false, for one-time logins)
+browser_headless = true
+# Explicit browser executable path; leave empty for auto-detection
+browser_executable = ""
+# Web Browser capability on/off (off = the model loses the browser_cdp tool)
+browser_enabled = true
 tool_timeout_secs = 300
 # LLM 流式读间隔超时（秒）。计时在每次成功读取后重置：长响应中途持续输出时不会超时，
 # 只有真正静默达到该值才中断并触发恢复。默认 300。
@@ -842,6 +906,8 @@ max_tool_retries = 2
 parallel_ir_tools = true
 # Enable Computer Use (GUI control) tools
 computer_use = false
+# Simulate human intervention when Expert mode is blocked
+human_intervention = false
 # Heartbeat (proactive HEARTBEAT.md checks). Default: off.
 heartbeat_enabled = false
 # Primary and fallback model names (set via Settings UI)
@@ -890,6 +956,43 @@ orchestration = "off"
         config.save(workspace_dir)
     }
 
+    /// 持久化 Tools 页上一个内置能力开关。key 不认得时报错，不默默写默认值。
+    ///
+    /// 与 `save_heartbeat_setting` 的区别：这里 load 失败直接向上报错。`Config::save`
+    /// 写的是整个 config.toml，拿 `unwrap_or_default()` 接着走会把用户配好的 provider /
+    /// 权限段整体抹成默认值 —— 一个开关不该有这种后果。
+    pub fn set_builtin_tool_switch(
+        workspace_dir: &str,
+        key: &str,
+        enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Self::load(workspace_dir)?;
+        match key {
+            "browser_cdp" => config.agent.browser_enabled = enabled,
+            "computer_use" => config.agent.computer_use = enabled,
+            "human_intervention" => config.agent.human_intervention = enabled,
+            "linux_ir_tools" => config.agent.linux_ir_tools = enabled,
+            other => return Err(format!("unknown tool switch: {}", other).into()),
+        }
+        config.save(workspace_dir)
+    }
+
+    /// 用当前扫描到的全集重写 External Tools 状态（写入 config.toml）。
+    /// 全量重写而非逐条更新：目录里已删除的工具条目会跟着清掉，不会积压。
+    /// `description` 为 None = 用 sidecar / 文件名推出来的那份，不往配置里写死。
+    pub fn save_external_tools(
+        workspace_dir: &str,
+        entries: Vec<(String, bool, Option<String>)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Self::load(workspace_dir)?;
+        let map = &mut config.agent.external_tools;
+        map.clear();
+        for (name, enabled, description) in entries {
+            map.insert(name, ExternalToolState { enabled, description });
+        }
+        config.save(workspace_dir)
+    }
+
     pub fn save(&self, workspace_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = std::path::Path::new(workspace_dir).join("config.toml");
         let content = toml::to_string_pretty(self)?;
@@ -911,12 +1014,15 @@ orchestration = "off"
         knowledge_pre_retrieval: bool,
         two_tier_memory: bool,
         budget_dashboard: bool,
+        linux_ir_tools: bool,
         enable_context_scaling: bool,
         max_inline_chars: usize,
         skill_listing_strategy: String,
         skill_max_inline_chars: usize,
         skill_catalog_max: usize,
         skill_hot_top_k: usize,
+        browser_headless: bool,
+        browser_executable: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Load existing config (or create default if none exists)
         let mut config = Self::load(workspace_dir).unwrap_or_default();
@@ -931,12 +1037,15 @@ orchestration = "off"
         config.agent.knowledge_pre_retrieval = knowledge_pre_retrieval;
         config.agent.two_tier_memory = two_tier_memory;
         config.agent.budget_dashboard = budget_dashboard;
+        config.agent.linux_ir_tools = linux_ir_tools;
         config.agent.enable_context_scaling = enable_context_scaling;
         config.agent.max_inline_chars = max_inline_chars;
         config.agent.skill_listing_strategy = skill_listing_strategy;
         config.agent.skill_max_inline_chars = skill_max_inline_chars;
         config.agent.skill_catalog_max = skill_catalog_max;
         config.agent.skill_hot_top_k = skill_hot_top_k;
+        config.agent.browser_headless = browser_headless;
+        config.agent.browser_executable = browser_executable.trim().to_string();
 
         // Save back to file
         config.save(workspace_dir)
@@ -1000,6 +1109,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    /// Tools 页那一行开关必须存住：以前 computer_use / human_intervention 只改内存，
+    /// 重启就静默回到 config 的旧值，用户以为关掉了其实没关。
+    #[test]
+    fn builtin_tool_switch_persists() {
+        let ws = tmp_ws("toolswitch");
+        for (key, want) in [("browser_cdp", false), ("computer_use", true), ("human_intervention", true), ("linux_ir_tools", true)] {
+            Config::set_builtin_tool_switch(&ws, key, want).unwrap();
+        }
+        let back = Config::load(&ws).unwrap();
+        assert!(!back.agent.browser_enabled);
+        assert!(back.agent.computer_use);
+        assert!(back.agent.human_intervention);
+        assert!(back.agent.linux_ir_tools);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 写不下去就要报错，不能默默当成默认值继续：一个开关不该有能力把整个
+    /// config.toml（provider 配置、权限段）抹成默认值。
+    #[test]
+    fn builtin_tool_switch_refuses_to_clobber_a_broken_config() {
+        let ws = tmp_ws("broken");
+        std::fs::write(Path::new(&ws).join("config.toml"), "[agent\nthis is not valid toml").unwrap();
+        assert!(Config::set_builtin_tool_switch(&ws, "browser_cdp", false).is_err());
+        assert!(std::fs::read_to_string(Path::new(&ws).join("config.toml"))
+            .unwrap()
+            .contains("not valid toml"));
+        // 认不得的 key 也不能悄悄写成默认值。
+        let ws2 = tmp_ws("unknownkey");
+        assert!(Config::set_builtin_tool_switch(&ws2, "ir_scan", true).is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&ws2);
+    }
+
+    /// External Tools 状态现在住在 config.toml：重写的语义是“当前扫描到的全集”，
+    /// 所以目录里删掉的工具不会在配置里积压；description 为 None 时不能写死。
+    #[test]
+    fn external_tool_state_rewrites_the_whole_map() {
+        let ws = tmp_ws("exttools");
+        Config::save_external_tools(
+            &ws,
+            vec![
+                ("keep".into(), false, Some("user edited".into())),
+                ("gone".into(), true, None),
+            ],
+        )
+        .unwrap();
+        Config::save_external_tools(&ws, vec![("keep".into(), true, None)]).unwrap();
+        let back = Config::load(&ws).unwrap();
+        assert!(!back.agent.external_tools.contains_key("gone"), "removed tool must not linger");
+        let keep = back.agent.external_tools.get("keep").unwrap();
+        assert!(keep.enabled);
+        assert_eq!(keep.description, None, "None must not persist an auto description");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 没动过工具开关的旧 config.toml 里不该多出 `[agent.external_tools]` 噪声。
+    #[test]
+    fn empty_external_tool_map_is_not_serialized() {
+        let ws = tmp_ws("extempty");
+        Config::default().save(&ws).unwrap();
+        let text = std::fs::read_to_string(Path::new(&ws).join("config.toml")).unwrap();
+        assert!(!text.contains("external_tools"), "unexpected empty map:\n{}", text);
+        assert!(text.contains("browser_enabled"), "browser switch must be documented");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1085,5 +1260,46 @@ mod tests {
         assert!(modes.orchestration_enabled());
         modes.instant.orchestration = Some("off".to_string());
         assert!(!modes.orchestration_enabled());        // 显式 instant 优先
+    }
+
+    /// 新增的两个浏览器设置必须能存能取（Settings 靠这条路）。
+    #[test]
+    fn browser_settings_survive_a_save_load_round_trip() {
+        let ws = tmp_ws("browser");
+        let mut c = Config::default();
+        c.agent.browser_headless = false;
+        c.agent.browser_executable = r"D:\Edge\msedge.exe".to_string();
+        c.save(&ws).unwrap();
+        let back = Config::load(&ws).unwrap();
+        assert!(!back.agent.browser_headless, "visible-window flag must persist");
+        assert_eq!(back.agent.browser_executable, r"D:\Edge\msedge.exe");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 已有部署的 config.toml 里没有这两个键，加载时必须回到缺省
+    /// （无头 + 自动探测），不能把旧工作区弄坏。
+    #[test]
+    fn older_config_without_browser_keys_still_loads() {
+        let ws = tmp_ws("browser_legacy");
+        let mut c = Config::default();
+        c.agent.max_iterations = 7;
+        c.save(&ws).unwrap();
+        // 模拟旧版本写出的 config.toml：把这两个键整行删掉
+        let path = Path::new(&ws).join("config.toml");
+        let stripped: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("browser_headless") && !l.starts_with("browser_executable"))
+            .map(|l| l.to_string() + "\n")
+            .collect();
+        assert!(stripped.contains("max_iterations"), "fixture must keep other keys");
+        assert!(!stripped.contains("browser_headless"), "fixture must drop the new keys");
+        std::fs::write(&path, &stripped).unwrap();
+
+        let back = Config::load(&ws).unwrap();
+        assert_eq!(back.agent.max_iterations, 7, "existing keys must survive");
+        assert!(back.agent.browser_headless, "missing key must default to headless");
+        assert!(back.agent.browser_executable.is_empty(), "missing key must mean auto-detect");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
