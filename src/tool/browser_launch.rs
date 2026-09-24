@@ -140,9 +140,26 @@ pub fn executables_in_path(path_var: Option<&str>) -> Vec<PathBuf> {
     hits
 }
 
-/// First candidate that actually exists on disk.
+/// First candidate that actually exists on disk, and is a file.
+///
+/// 用 `is_file()` 而不是 `exists()`：Settings 里粘成安装目录（`...\Application`）
+/// 也是"存在"，交给 `chrome_executable` 只会换来一条看不出原因的 OS 错误。
 pub fn first_existing(candidates: &[Candidate]) -> Option<Candidate> {
-    candidates.iter().find(|c| c.path.exists()).cloned()
+    candidates.iter().find(|c| c.path.is_file()).cloned()
+}
+
+/// 纯函数：Settings 里显式填的路径不存在时把它报出来。
+///
+/// 填显式路径这个动作本身就发生在"自动探测选错了浏览器"之后，所以它是一条断言而不是
+/// 一个偏好：静默回落到 PATH/注册表里的另一个浏览器，等于把唯一的逃生门拆掉还报成功——
+/// 操作者会以为自己钉住了 Edge。环境变量和自动探测的来源仍然允许回落（那些本来就是
+/// "有一个算一个"）。
+pub fn missing_override(candidates: &[Candidate]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|c| c.source == Source::Config)
+        .filter(|c| !c.path.is_file())
+        .map(|c| c.path.clone())
 }
 
 /// True for a path segment shaped like a Chromium version directory
@@ -304,14 +321,21 @@ pub fn well_known_browsers() -> Vec<PathBuf> {
 pub struct Discovery {
     pub chosen: Option<Candidate>,
     pub tried: Vec<Candidate>,
+    /// Settings 里显式填了、但那个路径不存在（见 `missing_override`）。
+    pub override_missing: Option<PathBuf>,
 }
 
 impl Discovery {
     /// Human-readable account of the search, for logs and error text.
     pub fn summary(&self) -> String {
-        match &self.chosen {
-            Some(c) => format!("selected {}", c.describe()),
-            None => {
+        match (&self.chosen, &self.override_missing) {
+            (Some(c), _) => format!("selected {}", c.describe()),
+            (None, Some(p)) => format!(
+                "the browser configured in Settings does not exist: {} — fix the path, or clear \
+                 it to go back to auto-detection",
+                p.display()
+            ),
+            (None, None) => {
                 let tried: Vec<String> = self.tried.iter().map(Candidate::describe).collect();
                 if tried.is_empty() {
                     "no browser candidate could be constructed for this platform".to_string()
@@ -339,8 +363,15 @@ pub fn discover(override_path: &str) -> Discovery {
         registry_browsers(),
         well_known_browsers(),
     );
-    let chosen = first_existing(&candidates);
-    Discovery { chosen, tried: candidates }
+    let override_missing = missing_override(&candidates);
+    // 显式路径没命中时不给任何回落结果：宁可用不带浏览器的错误说清原因，也不要拿着
+    // 另一个浏览器"启动成功"——那正是填路径想解决的问题。
+    let chosen = if override_missing.is_some() {
+        None
+    } else {
+        first_existing(&candidates)
+    };
+    Discovery { chosen, tried: candidates, override_missing }
 }
 
 /// Everything a launch failure needs to explain itself.
@@ -496,13 +527,28 @@ mod tests {
                 (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", Source::WellKnown),
                 (r"C:\Edge\msedge.exe", Source::Config),
             ]),
+            override_missing: None,
         };
         let s = d.summary();
         assert!(s.contains("nothing found"), "{s}");
         assert!(s.contains("[config]"), "must name the override source: {s}");
         assert!(s.contains("[well-known]"), "must name the searched fallback: {s}");
 
-        let d2 = Discovery { chosen: Some(Candidate { path: p("/x"), source: Source::Env }), tried: vec![] };
+        // 显式路径没命中时，summary 说的是这件事，而不是"什么都没找到"
+        let d3 = Discovery {
+            chosen: None,
+            tried: cands(&[(r"C:\Edge\msedge.exe", Source::Config)]),
+            override_missing: Some(p(r"C:\Edge\msedge.exe")),
+        };
+        let s3 = d3.summary();
+        assert!(s3.contains("does not exist"), "{s3}");
+        assert!(s3.contains("Settings"), "要告诉用户去哪儿改: {s3}");
+
+        let d2 = Discovery {
+            chosen: Some(Candidate { path: p("/x"), source: Source::Env }),
+            tried: vec![],
+            override_missing: None,
+        };
         assert_eq!(d2.summary(), "selected /x [env]");
     }
 
@@ -531,12 +577,43 @@ mod tests {
 
     #[test]
     fn first_existing_skips_missing_paths() {
+        // is_file() 而不是 exists()：目录不算命中（粘成安装目录是最常见的填错方式）。
         let tmp = std::env::temp_dir();
+        let file = tmp.join(format!("foxir_exe_probe_{}.bin", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
         let list = cands(&[
             (r"Z:\missing\msedge.exe", Source::Config),
-            (tmp.to_str().unwrap(), Source::WellKnown),
+            (tmp.to_str().unwrap(), Source::Registry),
+            (file.to_str().unwrap(), Source::WellKnown),
         ]);
-        let hit = first_existing(&list).expect("temp dir exists");
-        assert_eq!(hit.source, Source::WellKnown);
+        let hit = first_existing(&list).expect("the file exists");
+        assert_eq!(hit.source, Source::WellKnown, "a directory must not count as an executable");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// 显式路径不存在 = 报出来，不是悄悄换一个浏览器上。
+    #[test]
+    fn a_configured_path_that_does_not_exist_is_reported() {
+        let tmp = std::env::temp_dir();
+        let file = tmp.join(format!("foxir_other_{}.bin", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        // 自动探测明明能找到"某个能跑的东西"——这正是静默回落最迷惑的地方。
+        let list = cands(&[
+            (r"Z:\nope\msedge.exe", Source::Config),
+            (file.to_str().unwrap(), Source::Path),
+        ]);
+        assert!(first_existing(&list).is_some());
+        assert_eq!(
+            missing_override(&list),
+            Some(PathBuf::from(r"Z:\nope\msedge.exe")),
+            "the configured path must surface as missing"
+        );
+
+        // 配置本身命中时不算缺失；没填配置也不算缺失
+        let good = cands(&[(file.to_str().unwrap(), Source::Config)]);
+        assert_eq!(missing_override(&good), None);
+        let none_config = cands(&[(file.to_str().unwrap(), Source::Path)]);
+        assert_eq!(missing_override(&none_config), None);
+        let _ = std::fs::remove_file(&file);
     }
 }
