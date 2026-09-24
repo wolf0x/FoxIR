@@ -688,7 +688,11 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         }
         // 报告导出复用同一个浏览器实例（覆盖 build_default 里不带会话的那份注册）：
         // 再起一个实例会跟它抢同一个 user-data-dir，后起的会直接失败。
-        reg.register(Arc::new(crate::tool::ir_report::IrReportTool::new(Some(browser_session.clone()))));
+        // Web Browser 能力关掉时它不会去唤醒持久会话（P1-5 就是这个口子）。
+        reg.register(Arc::new(crate::tool::ir_report::IrReportTool::new(
+            Some(browser_session.clone()),
+            browser_enabled.clone(),
+        )));
 
     }
     info!("Registered cron_manage + memory_md + todo_update + browser_cdp tools");

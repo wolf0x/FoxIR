@@ -5,31 +5,39 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use chrono::Utc;
 
-use super::browser_cdp::BrowserSession;
+use super::browser_cdp::{self, BrowserSession};
 use super::Tool;
 use crate::context::ToolContext;
 use crate::error::AgentResult;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Convert HTML content to PDF.
 ///
-/// 有共享的 browser_cdp 会话时复用它（在同一实例上开一个临时 tab）：同一台机器上
-/// 另起一个实例会跟它抢同一个 user-data-dir（Chromium 的单实例语义按用户数据目录
-/// 划分，不是按机器划分），后起的那个直接失败——这正是原实现那条隐性的崩溃路径。
-async fn html_to_pdf(html_content: &str, session: Option<&BrowserSession>) -> AgentResult<Vec<u8>> {
+/// 有共享的 browser_cdp 会话且 Web Browser 能力开着时复用它（在同一实例上开一个临时
+/// tab）：同一台机器上另起一个实例会跟它抢同一个 user-data-dir（Chromium 的单实例语义
+/// 按用户数据目录划分，不是按机器划分），后起的那个直接失败——这正是原实现那条隐性的
+/// 崩溃路径。
+///
+/// 能力关掉时**不去唤醒**那个持久会话（Tools 页承诺的是"off = 真没有浏览器"），
+/// 退到自起的隔离临时 profile：它目录不同，因此和会话是否活着无关，用完自己退。
+async fn html_to_pdf(
+    html_content: &str,
+    session: Option<&BrowserSession>,
+    browser_enabled: bool,
+) -> AgentResult<Vec<u8>> {
     match session {
-        Some(s) => {
+        Some(s) if browser_enabled => {
             let page = s
                 .scratch_page()
                 .await
                 .map_err(|e| -> crate::error::AgentError { e.into() })?;
             let result = render_to_pdf(&page, html_content).await;
-            if result.is_ok() {
-                // 只关自己开的 tab，绝不碰 browser——那会关掉整个会话
-                let _ = page.close().await;
-            }
+            // 自己开的 tab 成功失败都要关：漏一次就永久多一个 tab，多 tab 之后
+            // list_tabs 看得见这种残留。
+            let _ = page.close().await;
             result
         }
-        None => render_to_pdf_standalone(html_content).await,
+        _ => render_to_pdf_standalone(html_content).await,
     }
 }
 
@@ -90,7 +98,7 @@ async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
     };
     let _ = std::fs::create_dir_all(&profile_dir);
 
-    let (mut browser, mut handler) = Browser::launch(
+    let (browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             .no_sandbox()
             .chrome_executable(&chosen.path)
@@ -111,18 +119,23 @@ async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
         .map_err(|e| format!("Failed to create page: {}", e))?;
 
     let result = render_to_pdf(&page, html_content).await;
-    let _ = browser.close().await;
+    // 自起实例也要等进程真退出：它用的是固定的临时目录
+    // （%TEMP%/foxir_report_profile），发一条关闭就返回的话，下一次导出会撞上"上一个
+    // 实例还持有该目录"的单实例互斥——和共享会话那条是同一个 bug 的另一个现场。
+    browser_cdp::shutdown_browser(browser).await;
     result
 }
 
 pub struct IrReportTool {
     /// 与 browser_cdp 共享的会话；None = 未接线，导出时自起一个临时实例。
     session: Option<Arc<BrowserSession>>,
+    /// Web Browser 能力开关（Tools 页，运行期可切）。关掉时导出报告不去唤醒持久会话。
+    browser_enabled: Arc<AtomicBool>,
 }
 
 impl IrReportTool {
-    pub fn new(session: Option<Arc<BrowserSession>>) -> Self {
-        Self { session }
+    pub fn new(session: Option<Arc<BrowserSession>>, browser_enabled: Arc<AtomicBool>) -> Self {
+        Self { session, browser_enabled }
     }
 }
 
@@ -535,7 +548,7 @@ function filterFindings() {{
         // Generate PDF if requested
         let mut pdf_output = None;
         if format == "pdf" || format == "both" {
-            match html_to_pdf(&html, self.session.as_deref()).await {
+            match html_to_pdf(&html, self.session.as_deref(), self.browser_enabled.load(Ordering::SeqCst)).await {
                 Ok(pdf_bytes) => {
                     fs::write(&pdf_path, &pdf_bytes)
                         .map_err(|e| format!("Failed to write PDF report: {}", e))?;
@@ -664,14 +677,15 @@ mod tests {
     async fn pdf_export_reuses_the_shared_session() {
         let tmp = std::env::temp_dir().join(format!("foxir_rep_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let s = BrowserSession::new(
+        let s = BrowserSession::with_profile_dir(
             tmp.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(std::sync::RwLock::new(String::new())),
+            tmp.join(".test_profile"),
         );
 
         let html = "<html><body><h1>Incident report</h1></body></html>";
-        let pdf = html_to_pdf(html, Some(&s))
+        let pdf = html_to_pdf(html, Some(&s), true)
             .await
             .expect("shared-session PDF export must work");
         assert!(pdf.starts_with(b"%PDF"), "not a PDF ({} bytes)", pdf.len());
@@ -684,6 +698,32 @@ mod tests {
         // 导出后会话还能继续用
         let _ = s.scratch_page().await.expect("session still usable");
         s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Web Browser 关掉时，导出报告不能把持久会话叫醒（Tools 页承诺的是 off = 真没有
+    /// 浏览器）。导出本身不受影响：走的是自起的隔离临时 profile，目录不同所以不冲突。
+    #[tokio::test]
+    #[ignore = "launches a real browser to render the PDF"]
+    async fn a_disabled_browser_does_not_wake_the_session() {
+        let tmp = std::env::temp_dir().join(format!("foxir_rep_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = BrowserSession::with_profile_dir(
+            tmp.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(std::sync::RwLock::new(String::new())),
+            tmp.join(".test_profile"),
+        );
+
+        let pdf = html_to_pdf("<html><body><h1>x</h1></body></html>", Some(&s), false)
+            .await
+            .expect("export must still work with the capability off");
+        assert!(pdf.starts_with(b"%PDF"), "not a PDF ({} bytes)", pdf.len());
+        assert_eq!(
+            s.status().await["running"],
+            json!(false),
+            "a disabled Web Browser must not be woken by a report export"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
