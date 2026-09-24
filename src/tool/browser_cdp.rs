@@ -14,10 +14,10 @@
 //! - `probe`: Report which browser would be used + current session state
 //! - `close`: Close the browser session
 //!
-//! One page at a time: the session owns exactly one page and every page-level action
-//! runs on it. Pages opened by the site itself are visible through `list_tabs` /
-//! `tab_count` but cannot be driven (chromiumoxide 0.9 gives no reliable handle for a
-//! target we did not create) — bring the URL back with `navigate` instead.
+//! One page per caller: each agent (main session or sub-agent) gets its own page inside
+//! one shared browser process, so nobody can navigate somebody else's page. Pages opened
+//! by a site are counted but not drivable (chromiumoxide 0.9 gives no reliable handle for
+//! a target we did not create) — bring the URL back with `navigate` instead.
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -29,10 +29,11 @@ use chromiumoxide::page::Page;
 use chromiumoxide::Element;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
 
@@ -144,20 +145,14 @@ async fn find_element_wait(page: &Page, selector: &str) -> Result<Element, Strin
     }
 }
 
-/// 活动 tab：id 与句柄一起缓存。
-/// 我们自己创建、并且握有可用句柄的那一页。
+/// 一个 agent 自己创建、并且握有可用句柄的那一页。
 ///
-/// 只有一页，这是刻意的收缩——FoxIR 的用法就是"一次盯一页"。完整的多 tab（`new_tab`/
-/// `switch_tab`/`close_tab` + 按 target id 现取句柄）实现过，然后被两条真机事实否掉：
-/// 1. `Target.getTargets` 的返回顺序不稳定（最后开的会排在第一个），所以列表下标不是
-///    可靠的 tab 标识；
-/// 2. 用 `Browser::get_page(target_id)` 现取的句柄发命令会 `channel disconnected`
-///    （handler 只在 target 已经有 session 时才建 PageHandle，`handler/target.rs:162-169`），
-///    连我们自己从 `new_page` 拿到的句柄、跨调用再持有也会失效。
-/// 结论：在这一层上"驱动不是我们自己创建的那一页"没有可靠做法，于是只保留我们握得住的
-/// 一页。站点自己开新页时的需求（"我现在脚下是哪一页、那新页是什么"）由只读的 `list_tabs`
-/// 覆盖，要把内容拿回来就用 `navigate`——那条路每一环都验证过。
-struct ActiveTab {
+/// 为什么是"自己创建的这一页"而不是"任意一页"：完整的多 tab（`new_tab`/`switch_tab`/
+/// `close_tab` + 按 target id 现取句柄）实现过，被两条真机事实否掉——`Target.getTargets`
+/// 的返回顺序不稳定（最后开的会排在第一个），以及 `Browser::get_page(target_id)` 现取的
+/// 句柄发命令会 `channel disconnected`。所以每个调用者只驱动自己创建的那一页；站点自己
+/// 开的页只呈现"有这回事"，要把内容拿回来用 `navigate`——那条路每一环都验证过。
+struct OwnedPage {
     id: TargetId,
     page: Page,
 }
@@ -165,27 +160,53 @@ struct ActiveTab {
 /// Inner state holding the browser connection.
 struct BrowserInner {
     browser: Browser,
-    /// 唯一那一页。它被站点关掉时我们新开一页顶上（见 `replace_tab`），不去接手别人的页。
-    tab: Option<ActiveTab>,
+    /// 按调用者（`invocation_id`）分片：一个 agent 一页。浏览器进程和 profile 只有一个，
+    /// 所以登录态天然共享；页与页互不干扰，也就不需要一把全局锁去防并发抢同一页。
+    pages: HashMap<String, OwnedPage>,
+    /// 最后一个 agent 交回页面的时刻，用于把空闲的浏览器整个收掉。
+    idle_since: Option<Instant>,
 }
 
 impl BrowserInner {
-    fn tab_id(&self) -> Option<&TargetId> {
-        self.tab.as_ref().map(|t| &t.id)
+    fn page_for(&self, key: &str) -> Option<Page> {
+        self.pages.get(key).map(|p| p.page.clone())
     }
 
-    fn page(&self) -> Option<Page> {
-        self.tab.as_ref().map(|t| t.page.clone())
+    fn page_id(&self, key: &str) -> Option<TargetId> {
+        self.pages.get(key).map(|p| p.id.clone())
     }
 
-    /// 认领一页作为我们唯一那一页，并把句柄交回给调用方。
-    fn claim(&mut self, page: Page) -> Page {
-        self.tab = Some(ActiveTab {
-            id: page.target_id().clone(),
-            page: page.clone(),
-        });
+    /// 把一页交给 `key`；同一个 key 再要就是同一页（复用，不重开）。
+    fn claim(&mut self, key: &str, page: Page) -> Page {
+        self.pages.insert(
+            key.to_string(),
+            OwnedPage { id: page.target_id().clone(), page: page.clone() },
+        );
+        self.idle_since = None;
         page
     }
+
+    /// 一个 agent 交回自己那一页；空了才开始计空闲。
+    fn take_page(&mut self, key: &str) -> Option<OwnedPage> {
+        let page = self.pages.remove(key);
+        if self.pages.is_empty() {
+            self.idle_since = Some(Instant::now());
+        }
+        page
+    }
+}
+
+/// 空到多久就把浏览器整个收掉。太短会让连续几轮取证反复付启动成本（还要等进程退出握手），
+/// 太长就是白占一个带登录态的进程。
+const IDLE_REAP: Duration = Duration::from_secs(10 * 60);
+
+/// 纯函数：这一轮该不该把浏览器收掉。
+fn should_reap(pages_empty: bool, idle_since: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    pages_empty
+        && match idle_since {
+            Some(since) => now.saturating_duration_since(since) >= ttl,
+            None => false,
+        }
 }
 
 /// 问浏览器现在有哪些页。
@@ -211,23 +232,6 @@ fn page_targets(targets: Vec<TargetInfo>) -> Vec<TargetInfo> {
         .collect()
 }
 
-/// tab 列表的 JSON 视图（`active` 标出的是我们唯一能驱动的那一页）。
-fn tab_view(live: &[TargetInfo], active: Option<&TargetId>) -> Vec<Value> {
-    live.iter()
-        .enumerate()
-        .map(|(i, t)| {
-            json!({
-                "index": i,
-                "url": t.url,
-                "title": t.title,
-                "active": active.map(|a| a == &t.target_id).unwrap_or(false),
-                // 看得见但挂不上的条目（预渲染之类）要标出来：否则调用方只会拿到一句
-                // 冷冰冰的 NotFound，不知道为什么"列表里明明有"。
-                "attachable": t.attached,
-            })
-        })
-        .collect()
-}
 
 /// CDP 报"这个页面/目标已经没了"的错误文案。库里没有稳定错误码，只能按文案识别；
 /// 命中就走 `refresh_tabs` 重解析，而不是直接把这轮失败丢给调用方。
@@ -440,84 +444,139 @@ impl BrowserSession {
     /// 保证有一个活着的浏览器，并返回持有它的锁守卫。
     ///
     /// 整段（检查 + 启动）都持锁，所以并发调用不会起出两个实例。
-    async fn lock_ready(&self) -> Result<MutexGuard<'_, Option<BrowserInner>>, String> {
+    async fn lock_ready(&self, key: &str) -> Result<MutexGuard<'_, Option<BrowserInner>>, String> {
         let mut guard = self.inner.lock().await;
         if !self.is_alive() || guard.is_none() {
             // Slow path: clear stale state and (re-)launch while holding the lock
             guard.take();
-            self.launch_locked(&mut guard).await?;
+            self.launch_locked(&mut guard, key).await?;
         }
         Ok(guard)
     }
 
-    /// 我们那一页的句柄（快路径，不碰 CDP）；浏览器没起来就先起来。
-    async fn get_or_init(&self) -> Result<Page, String> {
-        let mut guard = self.lock_ready().await?;
+    /// `key`（一个 agent）那一页的句柄。快路径不碰 CDP；这个 key 第一次来要页时才新开一页。
+    async fn get_or_init(&self, key: &str) -> Result<Page, String> {
+        let mut guard = self.lock_ready(key).await?;
         let inner = guard
             .as_mut()
             .ok_or_else(|| "Browser session is not running".to_string())?;
-        inner.page().ok_or_else(|| "Browser session has no page".to_string())
-    }
-
-    /// 我们那一页被站点关掉时，新开一页顶上。
-    ///
-    /// 只新开、不接手：不去驱动不是我们自己创建的页（原因见 `ActiveTab`）。
-    /// Caller MUST hold the inner lock.
-    async fn replace_tab(&self, inner: &mut BrowserInner) -> Result<Page, String> {
+        if let Some(page) = inner.page_for(key) {
+            return Ok(page);
+        }
         let page = inner
             .browser
             .new_page("about:blank")
             .await
             .map_err(|e| format!("Browser is running but no page could be opened: {}", e))?;
-        Ok(inner.claim(page))
+        Ok(inner.claim(key, page))
     }
 
-    /// 我们那一页在 CDP 侧的 (url, title)。
+    /// 一个 agent 结束（或显式 `close`）：只交回自己那一页，绝不动别人的，也不关浏览器。
+    pub async fn release(&self, key: &str) {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else { return };
+        if let Some(owned) = inner.take_page(key) {
+            // 这一页是我们自己创建的，句柄也是自己拿的那个，关它是安全的路径；
+            // 不可靠的是"按 target id 现取句柄再驱动"（见 `OwnedPage`）。
+            let _ = owned.page.close().await;
+        }
+    }
+
+    /// 这一页被站点关掉时，给同一个 key 另开一页。只新开、不接手别人的页。
+    /// Caller MUST hold the inner lock.
+    async fn replace_page(&self, inner: &mut BrowserInner, key: &str) -> Result<Page, String> {
+        let page = inner
+            .browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| format!("Browser is running but no page could be opened: {}", e))?;
+        Ok(inner.claim(key, page))
+    }
+
+    /// `key` 那一页在 CDP 侧的 (url, title)。
     ///
     /// 为什么要这份兜底：`Page::url()` / `get_title()` 读的是 handler 里的 frame 状态，
     /// 可能比 CDP 的说法慢、甚至为空（真机实测过两次）。以 CDP 的说法为准，句柄自己的
     /// 说法为辅。
-    async fn active_tab_info(&self) -> Option<(String, String)> {
+    async fn page_info(&self, key: &str) -> Option<(String, String)> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut()?;
-        let id = inner.tab_id()?.clone();
+        let id = inner.page_id(key)?;
         let live = self.live_pages_locked(inner).await.ok()?;
         live.iter()
             .find(|t| t.target_id == id)
             .map(|t| (t.url.clone(), t.title.clone()))
     }
 
-    /// 失败恢复用：确认我们那一页还在不在，不在就新开一页。返回是否换过一页
+    /// 失败恢复用：确认这个 key 那一页还在不在，不在就另开一页。返回是否换过一页
     /// （换过就意味着页面状态没了，只有 `navigate` 能直接重试）。
-    async fn recover_page(&self) -> Result<bool, String> {
+    async fn recover_page(&self, key: &str) -> Result<bool, String> {
         let mut guard = self.inner.lock().await;
         let inner = match guard.as_mut() {
             Some(inner) => inner,
             None => return Ok(false),
         };
-        if let Some(id) = inner.tab_id().cloned() {
+        if let Some(id) = inner.page_id(key) {
             let live = self.live_pages_locked(inner).await?;
             if live.iter().any(|t| t.target_id == id) {
                 return Ok(false);
             }
         }
         warn!("Browser CDP: our page is gone, opening a fresh one");
-        self.replace_tab(inner).await?;
+        self.replace_page(inner, key).await?;
         Ok(true)
     }
 
-    /// 浏览器里现在有几个页（只读）。我们只能知道有这回事，不能切过去驱动别人开的页，
-    /// 所以动作结果里带一个 `tab_count`，具体是什么用 `list_tabs` 看。
-    async fn tab_count(&self) -> usize {
+    /// 浏览器里现在有几个页 + 我们自己握有几页（只读，不外泄别人的页 URL）。
+    async fn page_counts(&self) -> (usize, usize) {
         let mut guard = self.inner.lock().await;
         match guard.as_mut() {
-            Some(inner) => self
-                .live_pages_locked(inner)
-                .await
-                .map(|l| l.len())
-                .unwrap_or(0),
-            None => 0,
+            Some(inner) => {
+                let owned = inner.pages.len();
+                (
+                    self.live_pages_locked(inner).await.map(|l| l.len()).unwrap_or(0),
+                    owned,
+                )
+            }
+            None => (0, 0),
         }
+    }
+
+    /// 没人用够久就把浏览器整个收掉。返回是否真的收了。
+    async fn reap_if_idle(&self) -> bool {
+        let idle = {
+            let guard = self.inner.lock().await;
+            match guard.as_ref() {
+                Some(inner) => should_reap(
+                    inner.pages.is_empty(),
+                    inner.idle_since,
+                    Instant::now(),
+                    IDLE_REAP,
+                ),
+                None => false,
+            }
+        };
+        if !idle {
+            return false;
+        }
+        info!(
+            "Browser CDP: no page held for {}s, shutting the browser down",
+            IDLE_REAP.as_secs()
+        );
+        let _ = self.close().await;
+        true
+    }
+
+    /// 后台巡检空闲浏览器。由 `main` 在启动时拉起一次；agent 结束只交回自己那一页，
+    /// 浏览器本体留给这里统一收，省掉"下一轮又从头启动 + 等进程退出握手"的反复开销。
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        let session = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(IDLE_REAP / 4).await;
+                session.reap_if_idle().await;
+            }
+        });
     }
 
     /// Launch a fresh browser instance. Caller MUST hold the inner lock.
@@ -528,6 +587,7 @@ impl BrowserSession {
     async fn launch_locked(
         &self,
         guard: &mut MutexGuard<'_, Option<BrowserInner>>,
+        key: &str,
     ) -> Result<(), String> {
         let headless = self.headless.load(Ordering::Relaxed);
         let discovery = browser_launch::discover(&self.override_path());
@@ -655,17 +715,26 @@ impl BrowserSession {
         };
 
         let id = page.target_id().clone();
-        info!("Browser CDP: browser launched successfully (gen {}, 1 tab)", gen);
+        info!("Browser CDP: browser launched successfully (gen {}, 1 page)", gen);
 
-        let mut inner = BrowserInner { browser, tab: None };
-        drop(id);
-        inner.claim(page);
+        // 启动时探出的那一页直接归触发这次启动的 key —— 不留"公共的孤儿页"，
+        // 因为共享句柄正是这轮重构要消灭的东西。
+        let mut inner = BrowserInner {
+            browser,
+            pages: HashMap::new(),
+            idle_since: None,
+        };
+        let _ = id;
+        inner.claim(key, page);
         **guard = Some(inner);
 
         Ok(())
     }
 
     /// 关掉整个会话。等进程真退出后才返回（握手过程见 `shutdown_browser`）。
+    ///
+    /// 这是"整个浏览器"级别的关闭，只给 Tools 页开关、空闲回收和进程退出用；
+    /// agent 结束或模型调 `close` 走的是 `release`（只交回自己那一页）。
     pub async fn close(&self) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         if let Some(inner) = guard.take() {
@@ -677,41 +746,42 @@ impl BrowserSession {
         Ok(())
     }
 
-    /// 在已运行的共享实例上开一个临时 tab（报告导出用），调用方用完自己关 tab。
+    /// 报告导出用：在**同一个**浏览器实例上取调用者那一页。
     ///
     /// 不要为了导出另起一个浏览器：同一台机器上两个实例抢同一个 user-data-dir 会直接
-    /// 失败。也没必要去碰 `Browser::close()`——那会关掉整个会话。
-    ///
-    /// 这个 tab 故意**不**接管活动位：导出报告不该把会话正在浏览的那一页挤成后台。
-    pub async fn scratch_page(&self) -> Result<Page, String> {
-        let mut guard = self.lock_ready().await?;
-        let inner = guard
-            .as_mut()
-            .ok_or_else(|| "Browser session is not running".to_string())?;
-        inner
-            .browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| format!("Failed to open tab: {}", e))
+    /// 失败。用完请调 `release_scratch`，也不要关整个会话。
+    pub async fn scratch_page(&self, key: &str) -> Result<Page, String> {
+        self.get_or_init(key).await
     }
 
-    /// 列出浏览器里现在的每一个页（`list_tabs` 动作，只读诊断）。
+    /// 导出结束，交回那一页。
+    pub async fn release_scratch(&self, key: &str) {
+        self.release(key).await;
+    }
+
+    /// 列出"我这一页 + 浏览器里还有几页"（`list_tabs` 动作，只读）。
     ///
-    /// 我们只能"知道有这些页"，不能切过去驱动不是我们自己创建的那一页（原因见
-    /// `ActiveTab`）。要把某个页的内容拿回来，用 `navigate` 指到它的 url。
-    pub async fn list_tabs(&self) -> Result<Value, String> {
-        let mut guard = self.lock_ready().await?;
+    /// 不列别人的页 URL：并发取证时 A 能从列表里读到 B 正在看哪个页面，属于我们不该
+    /// 提供的旁路。要驱动的一定是自己创建的那一页，所以只报自己的 (url, title)。
+    pub async fn list_tabs(&self, key: &str) -> Result<Value, String> {
+        let mut guard = self.lock_ready(key).await?;
         let inner = guard
             .as_mut()
             .ok_or_else(|| "Browser session is not running".to_string())?;
         let live = self.live_pages_locked(inner).await?;
-        let ours = inner.tab_id().cloned();
+        let mine = inner.page_id(key);
+        let my_page = live
+            .iter()
+            .find(|t| Some(&t.target_id) == mine.as_ref())
+            .map(|t| json!({ "url": t.url, "title": t.title }));
         Ok(json!({
             "success": true,
             "action": "list_tabs",
-            "tab_count": live.len(),
-            "note": "only the page marked active=true can be driven by the other actions",
-            "tabs": tab_view(&live, ours.as_ref()),
+            "page": my_page,
+            "pages_in_browser": live.len(),
+            "pages_we_own": inner.pages.len(),
+            "note": "the other pages belong to other agents or to the site; drive only your own, \
+                      use navigate to bring a url to your page",
         }))
     }
 
@@ -724,31 +794,33 @@ impl BrowserSession {
     /// 自检报告：会用哪个浏览器、现在在不在跑、什么模式、profile 在哪。
     ///
     /// 不启动浏览器——它存在的意义正是“起不来的时候能问出为什么”。
-    pub async fn status(&self) -> Value {
+    pub async fn status(&self, key: Option<&str>) -> Value {
         let headless = self.headless.load(Ordering::Relaxed);
         let discovery = browser_launch::discover(&self.override_path());
 
-        // 一次 fetch_targets 就够：tab 列表和活动页 URL 都在里面，不用为每个 tab 建句柄。
+        // 一次普通命令就能拿到全部页：不建句柄、也不列别人的 URL。
         let mut guard = self.inner.lock().await;
-        let (running, tabs, current_url) = match guard.as_mut() {
-            Some(inner) if self.is_alive() => match list_pages(&mut inner.browser).await {
-                Ok(targets) => {
-                    let live = page_targets(targets);
-                    let active = inner.tab_id().cloned();
-                    let url = live
-                        .iter()
-                        .find(|t| Some(&t.target_id) == active.as_ref())
-                        .map(|t| t.url.clone())
-                        .unwrap_or_default();
-                    (true, tab_view(&live, active.as_ref()), url)
+        let (running, pages_in_browser, pages_we_own, my_page) = match guard.as_mut() {
+            Some(inner) if self.is_alive() => {
+                let owned = inner.pages.len();
+                let mine = key.and_then(|k| inner.page_id(k));
+                match list_pages(&mut inner.browser).await {
+                    Ok(targets) => {
+                        let live = page_targets(targets);
+                        let my_page = live
+                            .iter()
+                            .find(|t| Some(&t.target_id) == mine.as_ref())
+                            .map(|t| json!({ "url": t.url, "title": t.title }));
+                        (true, live.len(), owned, my_page)
+                    }
+                    Err(e) => {
+                        // 活着却问不到页——这正是"卡死但还没被判死"的窗口，要说出来。
+                        warn!("Browser CDP: probe could not list pages: {}", e);
+                        (true, 0, owned, None)
+                    }
                 }
-                Err(e) => {
-                    // 活着却问不到 tab —— 这正是"卡死但还没被判死"的窗口，要让 probe 说出来。
-                    warn!("Browser CDP: probe could not list tabs: {}", e);
-                    (true, Vec::new(), format!("unavailable: {}", e))
-                }
-            },
-            _ => (false, Vec::new(), String::new()),
+            }
+            _ => (false, 0, 0, None),
         };
         drop(guard);
 
@@ -770,9 +842,9 @@ impl BrowserSession {
             "success": true,
             "action": "probe",
             "running": running,
-            "current_url": current_url,
-            "tab_count": tabs.len(),
-            "tabs": tabs,
+            "pages_in_browser": pages_in_browser,
+            "pages_we_own": pages_we_own,
+            "page": my_page,
             "mode": if headless { "headless" } else { "visible" },
             "configured_path": self.override_path(),
             "browser": browser,
@@ -813,9 +885,12 @@ impl Tool for BrowserCdpTool {
          a site signed into once in this profile stays signed in for later sessions.\n\
          A login that needs a password, 2FA or a QR scan must be done once in the \
          visible-window mode available in Settings; headless runs then inherit that state.\n\
-         One page at a time: every page action runs on the single page this session owns. If the \
-         site opens a tab of its own you will see it in 'list_tabs' (and in a raised 'tab_count'), \
-         but it cannot be driven - take its url and 'navigate' to it instead.\n\
+         One page per caller: this tool keeps its own page for each agent (main session or \
+         sub-agent) inside one shared browser, so concurrent agents never navigate each other's \
+         page while the signed-in profile stays shared. 'list_tabs' shows your page plus how many \
+         pages exist - other agents' urls are deliberately not listed. A page the site opens is \
+         counted but cannot be driven; take its url and 'navigate' instead. 'close' releases only \
+         your page; a browser nobody holds gets shut down on its own.\n\
          Selectors are waited for (up to 8s), so 'Element not found' means the element really is \
          absent, not 'not rendered yet'. Long texts come back capped: continue with 'offset' (see \
          'next_offset'), or open 'full_text_path', which holds the whole page.\n\
@@ -829,7 +904,7 @@ impl Tool for BrowserCdpTool {
          - 'get_html': Get page or element HTML, script/style stripped unless 'raw'. Optional 'offset'.\n\
          - 'execute_js': Run JavaScript on our page. Provide 'js'.\n\
          - 'find_element': Find element and return its attributes. Provide 'selector'.\n\
-         - 'list_tabs': Read-only inventory of every page in the browser (url, title, which one is ours).\n\
+         - 'list_tabs': Your page (url, title) plus how many pages exist and how many we own.\n\
          - 'probe': Report the detected browser executable, mode, page list and session state \
            without launching anything. Use it first when a launch fails.\n\
          - 'close': Close the browser session."
@@ -895,28 +970,40 @@ impl Tool for BrowserCdpTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         let action = args["action"].as_str()
             .ok_or_else(|| "Missing 'action'".to_string())?;
+        // 状态按调用者分片：一个 agent（父会话或某个子代理）拥有自己那一页，
+        // 谁结束都不影响别人。
+        let key = ctx.base.base.invocation_id.clone();
 
         // Probe does not need (and must not trigger) a browser launch
         if action == "probe" {
-            return Ok(self.session.status().await);
+            return Ok(self.session.status(Some(&key)).await);
         }
 
-        // Close does not need browser init
+        if action == "list_tabs" {
+            return self
+                .session
+                .list_tabs(&key)
+                .await
+                .map_err(|e| -> crate::error::AgentError { e.into() });
+        }
+
+        // `close` 交回的是**自己那一页**，不是整个浏览器：并发下别的 agent、
+        // 以及模型下一轮还要用同一个浏览器。浏览器本体由 Tools 开关、空闲回收、
+        // 进程退出来收。
         if action == "close" {
-            self.session.close().await.map_err(|e| -> crate::error::AgentError { e.into() })?;
+            self.session.release(&key).await;
             return Ok(json!({
                 "success": true,
                 "action": "close",
-                "message": "Browser session closed"
+                "message": "Released this agent's page; the browser itself stays for other                             sessions and is shut down when it has been idle"
             }));
         }
-
 
         // Execute with auto-recovery: if the action fails due to a dead browser,
         // clear state and recover with a freshly launched browser.
         let output_dir = ctx.output_dir();
         let max_text_len = ctx.inline_limit(15_000);
-        let result = self.execute_action(action, &args, &output_dir, max_text_len).await;
+        let result = self.execute_action(action, &args, &output_dir, max_text_len, &key).await;
 
         // 两类失败分开处理，先轻后重：
         // - 只是我们那一页没了（站点关页、执行上下文被销毁）：确认一下，页还在就原样
@@ -926,10 +1013,10 @@ impl Tool for BrowserCdpTool {
             Err(ref e) if is_target_gone(&e.to_string()) => {
                 let why = e.to_string();
                 warn!("Browser CDP: page-level failure during '{}': {}", action, why);
-                match self.session.recover_page().await {
-                    Ok(false) => self.execute_action(action, &args, &output_dir, max_text_len).await,
+                match self.session.recover_page(&key).await {
+                    Ok(false) => self.execute_action(action, &args, &output_dir, max_text_len, &key).await,
                     Ok(true) => {
-                        self.retry_after_state_loss(action, &args, &output_dir, max_text_len, &why)
+                        self.retry_after_state_loss(action, &args, &output_dir, max_text_len, &why, &key)
                             .await
                     }
                     Err(r) => Err(format!(
@@ -946,7 +1033,7 @@ impl Tool for BrowserCdpTool {
                 warn!("Browser CDP: connection lost during '{}', attempting auto-recovery", action);
                 let why = e.to_string();
                 self.session.clear_state().await;
-                self.retry_after_state_loss(action, &args, &output_dir, max_text_len, &why).await
+                self.retry_after_state_loss(action, &args, &output_dir, max_text_len, &why, &key).await
             }
             other => other,
         }
@@ -962,9 +1049,10 @@ impl BrowserCdpTool {
         output_dir: &str,
         max_text_len: usize,
         why: &str,
+        key: &str,
     ) -> AgentResult<Value> {
         if action == "navigate" {
-            self.execute_action(action, args, output_dir, max_text_len).await
+            self.execute_action(action, args, output_dir, max_text_len, key).await
         } else {
             Err(format!(
                 "The browser page was lost ({why}) and a fresh blank page was opened. The \'{action}\' \
@@ -986,9 +1074,16 @@ impl BrowserCdpTool {
     }
 
     /// Execute a single browser action (called by execute, may be retried).
-    async fn execute_action(&self, action: &str, args: &Value, output_dir: &str, max_text_len: usize) -> AgentResult<Value> {
+    async fn execute_action(
+        &self,
+        action: &str,
+        args: &Value,
+        output_dir: &str,
+        max_text_len: usize,
+        key: &str,
+    ) -> AgentResult<Value> {
         // All page-level actions run on the session's current active tab.
-        let page = self.session.get_or_init().await
+        let page = self.session.get_or_init(key).await
             .map_err(|e| -> crate::error::AgentError { e.into() })?;
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let max_chars = (args["max_chars"].as_u64().unwrap_or(0) as usize)
@@ -1025,7 +1120,7 @@ impl BrowserCdpTool {
                 let title = page.get_title().await
                     .map_err(|e| format!("Get title failed: {}", e))?
                     .unwrap_or_default();
-                let tabs = self.session.tab_count().await;
+                let (tabs, _) = self.session.page_counts().await;
                 let mut out = json!({
                     "success": true,
                     "action": "navigate",
@@ -1079,7 +1174,7 @@ impl BrowserCdpTool {
                 // 等不等得到都不报错——下一动的 selector 轮询会接住慢页面。
                 let _ = tokio::time::timeout(CLICK_NAV_WAIT, page.wait_for_navigation()).await;
                 let after = page.url().await.ok().flatten().unwrap_or_default();
-                let tabs = self.session.tab_count().await;
+                let (tabs, _) = self.session.page_counts().await;
                 let mut out = json!({
                     "success": true,
                     "action": "click",
@@ -1142,7 +1237,7 @@ impl BrowserCdpTool {
             }
 
             "get_url" => {
-                let info = self.session.active_tab_info().await;
+                let info = self.session.page_info(key).await;
                 let url = page.url().await
                     .map_err(|e| format!("Get URL failed: {}", e))?
                     .filter(|u| !u.is_empty())
@@ -1401,6 +1496,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 空闲回收的判定：只有"没人握页"且"确实空够久"才收浏览器。
+    #[test]
+    fn only_a_long_idle_empty_session_gets_reaped() {
+        let now = Instant::now();
+        let long_ago = now - IDLE_REAP - Duration::from_secs(1);
+        assert!(should_reap(true, Some(long_ago), now, IDLE_REAP));
+        assert!(!should_reap(true, Some(now), now, IDLE_REAP), "刚空下来不收，下一轮再看");
+        assert!(!should_reap(false, Some(long_ago), now, IDLE_REAP), "还有人握页就不能收");
+        assert!(!should_reap(true, None, now, IDLE_REAP), "从来没空过就不该收");
+    }
+
     /// 无头开关是共享原子：会话在 launch 时现读，Settings 切换不需要重启。
     #[test]
     fn headless_toggle_is_observed_through_the_shared_atomic() {
@@ -1433,14 +1539,14 @@ mod tests {
     #[tokio::test]
     async fn status_does_not_launch_a_browser() {
         let s = session_in("unused", true);
-        let v = s.status().await;
+        let v = s.status(None).await;
         assert_eq!(v["running"], json!(false));
         assert!(!s.is_alive(), "status() must not change the session state");
         assert!(v.get("searched").is_some(), "must always report where it looked");
         assert_eq!(
-            v["tab_count"],
+            v["pages_in_browser"],
             json!(0),
-            "a session that never launched has no tabs to list: {v}"
+            "a session that never launched has no pages to report: {v}"
         );
     }
 
@@ -1456,8 +1562,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let s = session_in(tmp.to_str().unwrap(), true);
 
-        s.get_or_init().await.expect("first launch must succeed");
-        let first = s.status().await;
+        s.get_or_init("a").await.expect("first launch must succeed");
+        let first = s.status(Some("a")).await;
         println!(
             "round 1: running={} browser={} [{}] v{}",
             first["running"], first["browser"], first["browser_source"], first["version_on_disk"]
@@ -1467,7 +1573,7 @@ mod tests {
         s.close().await.expect("close must not fail");
         assert!(!s.is_alive(), "session must be marked dead after close");
 
-        let again = s.get_or_init().await.expect("relaunch right after close must succeed");
+        let again = s.get_or_init("a").await.expect("relaunch right after close must succeed");
         println!("round 2 relaunched, url={:?}", again.url().await.ok().flatten());
         s.close().await.unwrap();
 
@@ -1487,8 +1593,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let s = session_in(tmp.to_str().unwrap(), false);
 
-        s.get_or_init().await.expect("headed launch must succeed");
-        let st = s.status().await;
+        s.get_or_init("a").await.expect("headed launch must succeed");
+        let st = s.status(Some("a")).await;
         println!("visible mode: {}", st["mode"]);
         assert_eq!(st["mode"], json!("visible"));
         assert_eq!(st["running"], json!(true));
@@ -1507,9 +1613,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let s = session_in(tmp.to_str().unwrap(), true);
 
-        let page = s.get_or_init().await.expect("first launch must succeed");
+        let page = s.get_or_init("a").await.expect("first launch must succeed");
         page.goto("https://example.com/").await.expect("navigate to example.com");
-        let ours = s.active_tab_info().await.expect("our page is listed");
+        let ours = s.page_info("a").await.expect("our page is listed");
         assert!(ours.0.contains("example.com"), "our page url: {ours:?}");
 
         // 站点自己开一页：只要求"看得见多出来的这一页"。刚弹出的页在 CDP 列表里 URL/标题
@@ -1517,25 +1623,67 @@ mod tests {
         page.evaluate_expression("window.open('https://example.net/'); 'ok'")
             .await
             .expect("window.open should not throw");
-        let listed = s.list_tabs().await.expect("list_tabs");
-        let count = listed["tab_count"].as_u64().unwrap_or(0);
-        assert!(count >= 2, "the page the site opened must show up: {listed}");
-        assert_eq!(
-            listed["tabs"]
-                .as_array()
-                .map(|a| a.iter().filter(|t| t["active"] == json!(true)).count())
-                .unwrap_or(0),
-            1,
-            "exactly one page stays ours to drive: {listed}"
+        let listed = s.list_tabs("a").await.expect("list_tabs");
+        assert!(
+            listed["pages_in_browser"].as_u64().unwrap_or(0) >= 2,
+            "the page the site opened must be counted: {listed}"
         );
+        // 只报自己那一页，不泄露别人/站点那页的 URL
+        assert!(listed["page"]["url"].as_str().unwrap_or_default().contains("example.com"),
+                "{listed}");
+        assert!(listed.get("tabs").is_none(), "must not list other agents' pages: {listed}");
         assert!(page.get_title().await.is_ok(), "our own page must still be drivable");
 
         // 我们脚下这页没了：recover_page 应当另开一页，而不是让后续动作全线报错
         println!("closing our own page: {:?}", page.close().await);
-        s.recover_page().await.expect("recover_page must not fail");
-        let again = s.get_or_init().await.expect("a page must be available again");
+        s.recover_page("a").await.expect("recover_page must not fail");
+        let again = s.get_or_init("a").await.expect("a page must be available again");
         assert!(again.get_title().await.is_ok(), "the replacement page must be drivable");
-        assert!(s.list_tabs().await.is_ok(), "listing still works");
+        assert!(s.list_tabs("a").await.is_ok(), "listing still works");
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机验证（默认 `#[ignore]`）：方案 B 的正面证据——同一个 profile、同一个浏览器
+    /// 进程里，两个 agent 各自握一页，互不干扰；一个交回自己的页不影响另一个继续驱动，
+    /// 交回后同一 key 再要页拿到的是新的一页。
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn two_agents_each_own_their_own_page() {
+        let tmp = std::env::temp_dir().join(format!("foxir_cdp_two_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = session_in(tmp.to_str().unwrap(), true);
+
+        let a_page = s.get_or_init("agent-a").await.expect("agent A gets a page");
+        let b_page = s.get_or_init("agent-b").await.expect("agent B gets a page");
+        assert_ne!(
+            a_page.target_id(),
+            b_page.target_id(),
+            "两个 agent 必须是两页，否则会互相导航"
+        );
+        // 同一个 key 再要是同一页（复用，不重开）
+        let a_again = s.get_or_init("agent-a").await.expect("agent A re-asks");
+        assert_eq!(a_again.target_id(), a_page.target_id());
+
+        a_page.goto("https://example.com/").await.expect("A navigates");
+        b_page.goto("https://example.net/").await.expect("B navigates");
+        let a_info = s.page_info("agent-a").await.expect("A listed");
+        let b_info = s.page_info("agent-b").await.expect("B listed");
+        assert!(a_info.0.contains("example.com") && b_info.0.contains("example.net"),
+                "各自的页互不串：{a_info:?} {b_info:?}");
+
+        // A 交回自己那一页，B 必须照常能用
+        s.release("agent-a").await;
+        let after = s.list_tabs("agent-b").await.expect("B still lists");
+        assert!(after["page"]["url"].as_str().unwrap_or_default().contains("example.net"),
+                "A 的退出不该动 B: {after}");
+        assert!(b_page.get_title().await.is_ok(), "B 的句柄必须还能发命令");
+        assert_eq!(after["pages_we_own"].as_u64(), Some(1), "{after}");
+
+        // A 回来时是另一页（旧的已经关了）
+        let a_new = s.get_or_init("agent-a").await.expect("A gets a fresh page");
+        assert_ne!(a_new.target_id(), a_page.target_id());
 
         s.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);

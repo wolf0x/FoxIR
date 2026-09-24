@@ -509,6 +509,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser_headless.clone(),
         browser_executable.clone(),
     );
+    // 浏览器按 agent 分片持有页面，谁结束都只交回自己那一页；整个浏览器交给这个
+    // 巡检在没人用够久之后收掉（Tools 页关开关与进程退出仍然立刻收）。
+    browser_session.spawn_idle_reaper();
 
     // Build agent using builder pattern (ADK-RUST style)
     // Per-session skill-usage tracking (shared with AppState so SOP authoring can skip

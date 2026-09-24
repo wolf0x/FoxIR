@@ -24,17 +24,17 @@ async fn html_to_pdf(
     html_content: &str,
     session: Option<&BrowserSession>,
     browser_enabled: bool,
+    key: &str,
 ) -> AgentResult<Vec<u8>> {
     match session {
         Some(s) if browser_enabled => {
             let page = s
-                .scratch_page()
+                .scratch_page(key)
                 .await
                 .map_err(|e| -> crate::error::AgentError { e.into() })?;
             let result = render_to_pdf(&page, html_content).await;
-            // 自己开的 tab 成功失败都要关：漏一次就永久多一个 tab，多 tab 之后
-            // list_tabs 看得见这种残留。
-            let _ = page.close().await;
+            // 成功失败都要交回自己那一页，否则残留会一直挂在会话上。
+            s.release_scratch(key).await;
             result
         }
         _ => render_to_pdf_standalone(html_content).await,
@@ -548,7 +548,14 @@ function filterFindings() {{
         // Generate PDF if requested
         let mut pdf_output = None;
         if format == "pdf" || format == "both" {
-            match html_to_pdf(&html, self.session.as_deref(), self.browser_enabled.load(Ordering::SeqCst)).await {
+            match html_to_pdf(
+                &html,
+                self.session.as_deref(),
+                self.browser_enabled.load(Ordering::SeqCst),
+                &ctx.base.base.invocation_id,
+            )
+            .await
+            {
                 Ok(pdf_bytes) => {
                     fs::write(&pdf_path, &pdf_bytes)
                         .map_err(|e| format!("Failed to write PDF report: {}", e))?;
@@ -685,18 +692,18 @@ mod tests {
         );
 
         let html = "<html><body><h1>Incident report</h1></body></html>";
-        let pdf = html_to_pdf(html, Some(&s), true)
+        let pdf = html_to_pdf(html, Some(&s), true, "report")
             .await
             .expect("shared-session PDF export must work");
         assert!(pdf.starts_with(b"%PDF"), "not a PDF ({} bytes)", pdf.len());
         assert_eq!(
-            s.status().await["running"],
+            s.status(None).await["running"],
             json!(true),
             "exporting a report must not tear down the browser session"
         );
 
         // 导出后会话还能继续用
-        let _ = s.scratch_page().await.expect("session still usable");
+        let _ = s.scratch_page("t").await.expect("session still usable");
         s.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -715,12 +722,12 @@ mod tests {
             tmp.join(".test_profile"),
         );
 
-        let pdf = html_to_pdf("<html><body><h1>x</h1></body></html>", Some(&s), false)
+        let pdf = html_to_pdf("<html><body><h1>x</h1></body></html>", Some(&s), false, "off")
             .await
             .expect("export must still work with the capability off");
         assert!(pdf.starts_with(b"%PDF"), "not a PDF ({} bytes)", pdf.len());
         assert_eq!(
-            s.status().await["running"],
+            s.status(None).await["running"],
             json!(false),
             "a disabled Web Browser must not be woken by a report export"
         );

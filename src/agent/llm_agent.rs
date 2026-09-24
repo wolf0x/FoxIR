@@ -968,8 +968,8 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
         // 只会让模型去调一个不存在的工具，白烧轮次还会给用户编出“浏览器坏了”的理由。
         let browser_line = if self.browser_enabled.load(std::sync::atomic::Ordering::SeqCst) {
             "  - `browser_cdp` — Browser automation via CDP: navigate, screenshot, get text/HTML, execute JS, \
-             one page at a time (if the site opens a page of its own, `list_tabs` shows it and \
-             `navigate` brings that url back to our page), \
+             one page per agent inside one shared browser (sub-agents never navigate each other's \
+             page; a page the site opens is counted but not drivable - `navigate` brings its url over), \
              plus `probe` (reports which browser executable was detected and the session state, without launching). \
              Runs hidden by default; Settings can enable a visible window for a one-time interactive login. \
              It drives its own persistent browser profile kept in the local application-data directory \
@@ -2164,7 +2164,7 @@ impl Agent for LlmAgent {
                                tool_defs_tokens(&tool_defs), tool_defs.len());
                         let _ = tx.send(Ok(AgentEvent::error(&msg, &invocation_id, &author))).await;
                         let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
-                        for s in &cleanup_sessions { let _ = s.close().await; }
+                        for s in &cleanup_sessions { s.release(&invocation_id).await; }
                         return;
                     }
                 };
@@ -2245,7 +2245,7 @@ impl Agent for LlmAgent {
                                     &invocation_id, &author
                                 ))).await;
                                 let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
-                                for s in &cleanup_sessions { let _ = s.close().await; }
+                                for s in &cleanup_sessions { s.release(&invocation_id).await; }
                                 return;
                             }
                         }
@@ -2538,7 +2538,7 @@ impl Agent for LlmAgent {
                             }
                             let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
                             // Cleanup: close browser sessions after agent completes
-                            for s in &cleanup_sessions { let _ = s.close().await; }
+                            for s in &cleanup_sessions { s.release(&invocation_id).await; }
                             return;
                         }
 
@@ -2586,7 +2586,7 @@ impl Agent for LlmAgent {
                                         });
                                     }
                                     let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
-                                    for s in &cleanup_sessions { let _ = s.close().await; }
+                                    for s in &cleanup_sessions { s.release(&invocation_id).await; }
                                     return;
                                 }
                                 tool_calls = kept;
@@ -2853,7 +2853,7 @@ impl Agent for LlmAgent {
                                     &invocation_id, &author
                                 ))).await;
                                 let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
-                                for s in &cleanup_sessions { let _ = s.close().await; }
+                                for s in &cleanup_sessions { s.release(&invocation_id).await; }
                                 return;
                             }
 
@@ -2917,7 +2917,7 @@ impl Agent for LlmAgent {
                         let _ = tx.send(Ok(AgentEvent::error(&e, &invocation_id, &author))).await;
                         let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
                         // Cleanup: close browser sessions after agent error
-                        for s in &cleanup_sessions { let _ = s.close().await; }
+                        for s in &cleanup_sessions { s.release(&invocation_id).await; }
                         return;
                     }
                 }
@@ -2964,7 +2964,7 @@ impl Agent for LlmAgent {
             }
             let _ = tx.send(Ok(AgentEvent::done(&invocation_id, &author))).await;
             // Cleanup: close browser sessions after max iterations
-            for s in &cleanup_sessions { let _ = s.close().await; }
+            for s in &cleanup_sessions { s.release(&invocation_id).await; }
         });
 
         // Convert mpsc Receiver into a Stream.
