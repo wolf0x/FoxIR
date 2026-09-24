@@ -151,7 +151,7 @@ impl ConversationLogger {
                 "request_id": request_id,
                 "allowed": allowed,
             }),
-            AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, .. } => json!({
+            AgentEvent::Usage { model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, .. } => json!({
                 "ts": Utc::now().to_rfc3339(),
                 "session": session_id,
                 "role": "system",
@@ -160,6 +160,12 @@ impl ConversationLogger {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
+                // null = provider reported nothing about the prompt cache;
+                // 0 = reported and this call hit nothing.
+                "cached_tokens": cached_tokens,
+                "cache_hit_ratio": (*cached_tokens)
+                    .filter(|_| *prompt_tokens > 0)
+                    .map(|c| c as f64 / *prompt_tokens as f64),
             }),
             _ => return,
         };

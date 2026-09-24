@@ -464,6 +464,29 @@ impl MemoryStore {
             info!("Schema v8 migration: subagent_results table created");
         }
 
+        // ── Schema v9: prompt-cache accounting on usage_stats ──
+        // `cached_tokens` is NULL when the provider does not report cache info for
+        // that call, and 0 when it reports a genuine miss. Keeping them apart is
+        // what lets the dashboard compute an honest hit rate (NULL rows leave the
+        // denominator) instead of showing 0% for a cache-blind model.
+        if version < 9 {
+            let has_col: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_stats') WHERE name='cached_tokens'",
+                [],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            if has_col == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE usage_stats ADD COLUMN cached_tokens INTEGER;"
+                ).map_err(|e| format!("v9 migration failed: {}", e))?;
+            }
+
+            conn.execute("INSERT INTO schema_version(version) VALUES(9)", [])
+                .map_err(|e| format!("Version 9 insert failed: {}", e))?;
+
+            info!("Schema v9 migration: cached_tokens column added to usage_stats");
+        }
+
         Ok(())
     }
 
@@ -1351,19 +1374,22 @@ impl MemoryStore {
         ).map_err(|e| format!("Failed to clear active task contracts: {}", e))
     }
 
-    /// Record a token usage entry.
-    pub fn record_usage(&self, model_name: &str, prompt_tokens: u64, completion_tokens: u64, total_tokens: u64, session_id: &str) -> Result<(), String> {
+    /// Record a token usage entry. `cached_tokens` = input tokens served from the
+    /// provider's prompt cache; `None` means the endpoint reported no cache info.
+    pub fn record_usage(&self, model_name: &str, prompt_tokens: u64, completion_tokens: u64, total_tokens: u64, cached_tokens: Option<u64>, session_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO usage_stats (timestamp, model_name, session_id, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![now, model_name, session_id, prompt_tokens as i64, completion_tokens as i64, total_tokens as i64],
+            "INSERT INTO usage_stats (timestamp, model_name, session_id, prompt_tokens, completion_tokens, total_tokens, cached_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![now, model_name, session_id, prompt_tokens as i64, completion_tokens as i64, total_tokens as i64, cached_tokens.map(|v| v as i64)],
         ).map_err(|e| format!("Failed to record usage: {}", e))?;
         Ok(())
     }
 
     /// Get aggregated usage stats grouped by model and day.
-    /// Returns JSON array of {date, model, total_calls, total_prompt, total_completion, total_tokens}.
+    /// Returns JSON array of {date, model, calls, prompt_tokens, completion_tokens,
+    /// total_tokens, cached_tokens, cache_input_tokens, cache_reported_calls}.
+    /// `cached_tokens` is null when no call in that bucket reported cache info.
     pub fn get_usage_stats(&self, days: usize, tz_hours: f64) -> Result<serde_json::Value, String> {
         let conn = self.conn.lock().unwrap();
 
@@ -1379,6 +1405,11 @@ impl MemoryStore {
                 "prompt_tokens": row.get::<_, i64>(3)?,
                 "completion_tokens": row.get::<_, i64>(4)?,
                 "total_tokens": row.get::<_, i64>(5)?,
+                // NULL (all-NULL group) -> null: "not reported", not "0% hit".
+                "cached_tokens": row.get::<_, Option<i64>>(6)?,
+                // Denominator: input tokens of cache-aware calls only.
+                "cache_input_tokens": row.get::<_, i64>(7)?,
+                "cache_reported_calls": row.get::<_, i64>(8)?,
             }))
         }
 
@@ -1387,7 +1418,10 @@ impl MemoryStore {
                     COUNT(*) as calls,
                     SUM(prompt_tokens) as prompt_sum,
                     SUM(completion_tokens) as completion_sum,
-                    SUM(total_tokens) as total_sum
+                    SUM(total_tokens) as total_sum,
+                    SUM(cached_tokens) as cached_sum,
+                    SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END) as cache_input_sum,
+                    COUNT(cached_tokens) as cache_calls
              FROM usage_stats", tz = tz_mod);
         let tail = " GROUP BY date, model_name ORDER BY date DESC, model_name";
 
@@ -1450,7 +1484,10 @@ impl MemoryStore {
                     COUNT(*) as calls,
                     SUM(prompt_tokens) as prompt_sum,
                     SUM(completion_tokens) as completion_sum,
-                    SUM(total_tokens) as total_sum
+                    SUM(total_tokens) as total_sum,
+                    SUM(cached_tokens) as cached_sum,
+                    SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END) as cache_input_sum,
+                    COUNT(cached_tokens) as cache_calls
              FROM usage_stats
              WHERE DATE(timestamp) = ?1
              GROUP BY model_name
@@ -1464,6 +1501,9 @@ impl MemoryStore {
                 "prompt_tokens": row.get::<_, i64>(2)?,
                 "completion_tokens": row.get::<_, i64>(3)?,
                 "total_tokens": row.get::<_, i64>(4)?,
+                "cached_tokens": row.get::<_, Option<i64>>(5)?,
+                "cache_input_tokens": row.get::<_, i64>(6)?,
+                "cache_reported_calls": row.get::<_, i64>(7)?,
             }))
         }).map_err(|e| format!("Failed to query today's usage: {}", e))?;
 
@@ -1472,6 +1512,9 @@ impl MemoryStore {
         let mut total_prompt: i64 = 0;
         let mut total_completion: i64 = 0;
         let mut total_tokens: i64 = 0;
+        let mut total_cached: i64 = 0;
+        let mut total_cache_input: i64 = 0;
+        let mut total_cache_calls: i64 = 0;
 
         for row in rows {
             let v = row.map_err(|e| format!("Row error: {}", e))?;
@@ -1479,6 +1522,9 @@ impl MemoryStore {
             total_prompt += v["prompt_tokens"].as_i64().unwrap_or(0);
             total_completion += v["completion_tokens"].as_i64().unwrap_or(0);
             total_tokens += v["total_tokens"].as_i64().unwrap_or(0);
+            total_cached += v["cached_tokens"].as_i64().unwrap_or(0);
+            total_cache_input += v["cache_input_tokens"].as_i64().unwrap_or(0);
+            total_cache_calls += v["cache_reported_calls"].as_i64().unwrap_or(0);
             by_model.push(v);
         }
 
@@ -1488,6 +1534,12 @@ impl MemoryStore {
             "total_prompt_tokens": total_prompt,
             "total_completion_tokens": total_completion,
             "total_tokens": total_tokens,
+            // Cache rollup: hit rate is over cache-aware input only, so a model
+            // that never reports cache info yields null rather than 0%.
+            "total_cached_tokens": total_cached,
+            "total_cache_input_tokens": total_cache_input,
+            "cache_reported_calls": total_cache_calls,
+            "cache_hit_rate": if total_cache_input > 0 { serde_json::json!(total_cached as f64 / total_cache_input as f64) } else { serde_json::Value::Null },
             "by_model": by_model,
         }))
     }
@@ -2289,4 +2341,58 @@ fn deep_find_subject_any_includes_archived() {
     let found = store.deep_find_subject_any("global", "host-10.0.0.5").unwrap();
     assert!(found.is_some());
     assert_eq!(found.unwrap().id, "eg1");
+}
+
+#[cfg(test)]
+mod usage_cache_stats {
+    use super::*;
+
+    fn tmp_store() -> MemoryStore {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("usage.db").to_str().unwrap().to_string();
+        std::mem::forget(dir);
+        MemoryStore::new(&p).unwrap()
+    }
+
+    /// The hit-rate denominator must be "input tokens of calls that reported cache
+    /// accounting", so a cache-blind endpoint can never pull the ratio down. This
+    /// is the whole reason `cached_tokens` is NULL and not 0.
+    #[test]
+    fn silent_calls_leave_the_cache_denominator() {
+        let s = tmp_store();
+        s.record_usage("m1", 1000, 50, 1050, Some(800), "sess-a").unwrap(); // hit
+        s.record_usage("m1", 500, 20, 520, Some(0), "sess-a").unwrap(); // reported miss
+        s.record_usage("m2", 9999, 10, 10009, None, "sess-b").unwrap(); // silent endpoint
+
+        let rows = s.get_usage_stats(0, 0.0).unwrap();
+        let rows = rows.as_array().unwrap();
+        let m1 = rows.iter().find(|r| r["model"] == "m1").expect("m1 row");
+        assert_eq!(m1["cached_tokens"].as_i64(), Some(800));
+        assert_eq!(m1["cache_input_tokens"].as_i64(), Some(1500));
+        assert_eq!(m1["cache_reported_calls"].as_i64(), Some(2));
+        assert_eq!(m1["prompt_tokens"].as_i64(), Some(1500));
+
+        let m2 = rows.iter().find(|r| r["model"] == "m2").expect("m2 row");
+        assert!(m2["cached_tokens"].is_null(), "a silent model must surface null, not 0");
+        assert_eq!(m2["cache_input_tokens"].as_i64(), Some(0));
+        assert_eq!(m2["cache_reported_calls"].as_i64(), Some(0));
+    }
+
+    /// Migration idempotence: reopening an already-v9 database must not fail on the
+    /// ALTER, and the recorded cache numbers must survive the reopen.
+    #[test]
+    fn cache_column_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("usage2.db").to_str().unwrap().to_string();
+        std::mem::forget(dir);
+        {
+            let s = MemoryStore::new(&p).unwrap();
+            s.record_usage("m3", 2000, 10, 2010, Some(1500), "sess-c").unwrap();
+        }
+        let s = MemoryStore::new(&p).unwrap();
+        let rows = s.get_usage_stats(0, 0.0).unwrap();
+        let m3 = rows.as_array().unwrap().iter().find(|r| r["model"] == "m3").expect("m3 row");
+        assert_eq!(m3["cached_tokens"].as_i64(), Some(1500));
+        assert_eq!(m3["cache_input_tokens"].as_i64(), Some(2000));
+    }
 }

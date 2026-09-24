@@ -186,6 +186,12 @@ pub struct UsageMetadata {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Input tokens served from the provider's prompt (prefix) cache, i.e. a cache
+    /// HIT. `None` means the provider did not report cache info at all — which is
+    /// NOT the same thing as `Some(0)` (reported, and nothing was hit). Every
+    /// rollup keeps these apart so an unsupported model cannot drag the hit rate
+    /// down to a fake 0%.
+    pub cached_prompt_tokens: Option<u64>,
 }
 
 /// Streaming response chunk from an LLM.

@@ -296,13 +296,23 @@ mod tests {
         dir.to_string_lossy().into_owned()
     }
 
+    /// Contract (since per-session TODO isolation): ONLY an empty session id maps
+    /// to the shared legacy `todos.json`; every real session id — including the
+    /// user's main Chat session — gets its own file. Assert through
+    /// `todos_file_path` so this test can never drift from the implementation
+    /// again, and note that the agent-side readers resolve the same helper.
     #[test]
     fn session_path_routing() {
         let ws = tmp_ws("route");
         let t = tool(&ws);
-        assert_eq!(t.todos_path("main-123").file_name().unwrap(), "todos.json");
+        assert_eq!(t.todos_path("main-123").file_name().unwrap(), "todos-main-123.json");
         assert_eq!(t.todos_path("").file_name().unwrap(), "todos.json");
         assert_eq!(t.todos_path("cron-abc").file_name().unwrap(), "todos-cron-abc.json");
+        for sid in ["main-123", "", "cron-abc", "sub-7"] {
+            assert_eq!(t.todos_path(sid), todos_file_path(&ws, sid), "path key drift for {:?}", sid);
+        }
+        // The main session is NOT shared: two sessions must never collide.
+        assert_ne!(t.todos_path("main-1"), t.todos_path("main-2"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -320,8 +330,9 @@ mod tests {
         ).await.unwrap();
         assert!(main["success"].as_bool().unwrap());
         assert!(cron["success"].as_bool().unwrap());
-        assert!(std::path::Path::new(&ws).join("todos.json").exists());
-        let main_raw = std::fs::read_to_string(std::path::Path::new(&ws).join("todos.json")).unwrap();
+        let main_path = t.todos_path("main-1");
+        assert!(main_path.exists());
+        let main_raw = std::fs::read_to_string(&main_path).unwrap();
         assert!(main_raw.contains("m1"));
         assert!(!main_raw.contains("c1"));
         assert!(std::path::Path::new(&ws).join("todos-cron-9.json").exists());
@@ -371,7 +382,7 @@ mod tests {
         ]}), &c).await.unwrap();
 
         t.execute(json!({"action": "update", "index": 0, "status": "in_progress"}), &c).await.unwrap();
-        let raw0 = std::fs::read_to_string(std::path::Path::new(&ws).join("todos.json")).unwrap();
+        let raw0 = std::fs::read_to_string(t.todos_path("main-4")).unwrap();
         let v0: Value = serde_json::from_str(&raw0).unwrap();
         let item0 = &v0["items"][0];
         assert_eq!(item0["status"], "in_progress");
@@ -379,7 +390,7 @@ mod tests {
 
         // terminal clears
         t.execute(json!({"action": "update", "index": 0, "status": "completed"}), &c).await.unwrap();
-        let raw1 = std::fs::read_to_string(std::path::Path::new(&ws).join("todos.json")).unwrap();
+        let raw1 = std::fs::read_to_string(t.todos_path("main-4")).unwrap();
         let v1: Value = serde_json::from_str(&raw1).unwrap();
         assert!(v1["items"][0]["started_at"].is_null());
         let _ = std::fs::remove_dir_all(&ws);

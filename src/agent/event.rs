@@ -108,6 +108,10 @@ pub enum AgentEvent {
         completion_tokens: u64,
         /// Total tokens (prompt + completion).
         total_tokens: u64,
+        /// Prompt tokens served from the provider's prefix cache (cache hit).
+        /// `None` = this endpoint does not report cache accounting; distinguish
+        /// that from `Some(0)` = reported and nothing was hit.
+        cached_tokens: Option<u64>,
     },
 
     /// A worker sub-agent has been dispatched (Expert orchestration, T6.5+).
@@ -283,13 +287,14 @@ impl AgentEvent {
         }
     }
 
-    pub fn usage(model: &str, prompt_tokens: u64, completion_tokens: u64, total_tokens: u64, invocation_id: &str, author: &str) -> Self {
+    pub fn usage(model: &str, prompt_tokens: u64, completion_tokens: u64, total_tokens: u64, cached_tokens: Option<u64>, invocation_id: &str, author: &str) -> Self {
         AgentEvent::Usage {
             meta: EventMeta::new(invocation_id, author),
             model: model.to_string(),
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cached_tokens,
         }
     }
 

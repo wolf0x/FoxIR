@@ -13,6 +13,9 @@
 //! - **决策只由结构化信号推导**：解析出的 tool_calls 数、归一化 finish_reason、
 //!   可见正文有无、坏信封标志、能力位、是否跑过工具、是否已重试。**绝不扫描正文子串。**
 //! - **"无工具调用"是一等合法终止态**：有可见正文即 `Answer`，信任模型的文本决定。
+//! - **唯一的例外是「预告动作却收场」**（[`TurnDecision::NudgePendingAction`]）：它**不扫描
+//!   正文**、**不匹配工具名**，只看**末句是否在开头就宣告即时行动**且整轮回复极短——
+//!   这是 finish=stop 早停的唯一可结构化的外部特征，且一次性、上限 1。
 //! - **层级防火墙**：本核只决定"如何处理这一个 provider turn"，**不是任务完成权威**。
 //!   任务完成权威在 Instant=迭代预算(+可选 TODO 门)、Expert=Manager Route+TaskContract。
 //! - **长任务续跑保证**：`tool_calls>0 → RunTools` 为最高优先，任何文本/finish_reason
@@ -82,6 +85,11 @@ pub struct TurnSignals {
     pub ran_tools: bool,
     /// 一次性 malformed 严格重试是否已用过。
     pub malformed_retry_done: bool,
+    /// 本轮文本是否「宣告了一个即时动作然后收场」（由边界层用
+    /// [`announces_pending_action`] 计算；只看末句开头 + 极短回复，不扫正文）。
+    pub pending_action: bool,
+    /// pending-action 补发是否已用过（每 run 上限 1 次）。
+    pub nudge_done: bool,
 }
 
 /// 轮次决策（全枚举；主循环对其做 total match）。
@@ -97,6 +105,9 @@ pub enum TurnDecision {
     Recover { ran_tools: bool },
     /// 被 max_tokens 截断且无可恢复调用/正文 → 走既有截断处理，绝不重提示。
     Truncated,
+    /// 模型宣告了动作（"我这就调:" / "Let me check it."）却以纯文本收场 →
+    /// 一次性补发提示（上限 1 次/run），要求它要么真发调用、要么直接回答。
+    NudgePendingAction,
 }
 
 /// 单一决策入口：**只由结构信号推导**，不扫描任何正文子串。
@@ -108,8 +119,10 @@ pub enum TurnDecision {
 ///       microclaw 明确把 max_tokens 排除在"重问"之外——重问只会白烧预算）。
 ///    b. 坏信封 + 提示模式 + 未重试过 → [`TurnDecision::RetryMalformed`]（唯一的一次性推动）。
 ///    c. 其余 → [`TurnDecision::Recover`]（真正空响应，交恢复层）。
-/// 3. 有可见正文且无调用 → [`TurnDecision::Answer`]（信任文本；即便 finish_reason=Length
-///    也视为"部分回答"而非截断丢弃，保持与旧行为一致、不回退）。
+/// 3. 有可见正文且无调用 → 先看是否「预告动作却收场」
+///    （[`TurnDecision::NudgePendingAction`]，仅当极短回复 + 末句开头宣告即时行动 + 未补发过），
+///    否则 [`TurnDecision::Answer`]（信任文本；即便 finish_reason=Length 也视为"部分回答"
+///    而非截断丢弃，保持与旧行为一致、不回退）。
 pub fn decide_turn(s: &TurnSignals) -> TurnDecision {
     // 1) 真实工具调用永远最高优先——保证长任务/大 TODO 的工具推理不被打断。
     if s.tool_calls > 0 {
@@ -130,8 +143,63 @@ pub fn decide_turn(s: &TurnSignals) -> TurnDecision {
             ran_tools: s.ran_tools,
         };
     }
-    // 3) 有可见正文、无工具调用 → 信任为最终回答（治愈 HARTSAS 类误触）。
+    // 3) 有可见正文、无工具调用。
+    // 3a) 例外：模型宣告了动作然后收场（finish=stop 早停的唯一可结构化特征）。
+    //     Length 不补发——那是传输/预算截断，由 transport recovery 负责。
+    if s.pending_action && !s.nudge_done && s.finish_reason != Some(FinishReason::Length) {
+        return TurnDecision::NudgePendingAction;
+    }
+    // 3b) 其余：信任为最终回答（治愈 HARTSAS 类误触）。
     TurnDecision::Answer
+}
+
+/// 「预告动作却收场」探测器：**只看尾部，不扫正文**。
+///
+/// 同时满足才判真（三条都是窄门，故意避开旧散文启发式的误报面）：
+/// 1. 整轮可见回复极短（`<= MAX_REPLY_CHARS`）——实质答案永远不会这么短；
+/// 2. 取**最后一句**（按 `。！？\n` 切），它必须 ≤ [`MAX_SENTENCE_CHARS`] 且
+///    **以即时行动开场词起头**（`Let me …` / `我这就 …`）或以冒号/省略号收场（交接给动作）；
+/// 3. 不匹配任何工具名、不匹配正文中段的意图词。
+///
+/// 已知可接受的漏判：以 `。` 结尾且开场词在句中的宣告（"我马上就去查。"）——宁可漏判
+/// 也不开误判口子，误判会白烧一轮预算。
+pub fn announces_pending_action(text: &str) -> bool {
+    const MAX_REPLY_CHARS: usize = 220;
+    const MAX_SENTENCE_CHARS: usize = 40;
+    // 即时行动开场词（小写比对；只允许出现在末句**开头**）。
+    const OPENERS: &[&str] = &[
+        "let me", "i'll", "i will", "i now will", "now let me", "let's", "i need to", "i must",
+        "让我", "我这就", "我马上", "我现在就", "我来", "我重新", "我先", "我将", "马上查", "这就去",
+    ];
+    // 宣告交接收场符（文本在这里断在动作之前）。
+    const HANDOFF_ENDINGS: &[char] = &[':', '：', '…'];
+
+    let t = text.trim();
+    let total = t.chars().count();
+    if total == 0 || total > MAX_REPLY_CHARS {
+        return false;
+    }
+    // 最后一句：从最后一个句末标点之后开始（逐字推进，字节偏移由 len_utf8 保证）。
+    let mut tail_start = 0usize;
+    for (i, c) in t.char_indices() {
+        if matches!(c, '。' | '！' | '？' | '；' | ';' | '!' | '?' | '\n') {
+            tail_start = i + c.len_utf8();
+        }
+    }
+    let tail = t[tail_start..].trim();
+    let slen = tail.chars().count();
+    if slen == 0 || slen > MAX_SENTENCE_CHARS {
+        return false;
+    }
+    let low = tail.to_lowercase();
+    let head: String = low.chars().take(8).collect();
+    if OPENERS.iter().any(|p| head.starts_with(p)) {
+        return true;
+    }
+    tail.chars()
+        .last()
+        .map(|c| HANDOFF_ENDINGS.contains(&c))
+        .unwrap_or(false)
 }
 
 /// 结构探测：文本是否**包含一个工具调用信封**（``` 围栏内含 tool-call 键，或工具协议 tag）。
@@ -417,6 +485,14 @@ mod tests {
             TurnDecision::Truncated
         );
         assert_eq!(decide_turn(&sig()), TurnDecision::Recover { ran_tools: false });
+        assert_eq!(
+            decide_turn(&TurnSignals {
+                has_visible_text: true,
+                pending_action: true,
+                ..sig()
+            }),
+            TurnDecision::NudgePendingAction
+        );
     }
 
     // ── 8) looks_like_tool_envelope：信封结构探测（只认结构，不认散文）──
@@ -457,5 +533,107 @@ mod tests {
     fn empty_and_plain_text_are_not_envelope() {
         assert!(!looks_like_tool_envelope(""));
         assert!(!looks_like_tool_envelope("just a normal answer with no fence"));
+    }
+
+    // ── 9) NudgePendingAction：预告动作却收场（模式 B）的窄门 ────────────
+
+    #[test]
+    fn nudge_fires_on_announced_then_stopped_action() {
+        // 现网形态：完整句子说完（带冒号）但本轮没有工具调用。
+        let s = TurnSignals {
+            has_visible_text: true,
+            pending_action: true,
+            ..sig()
+        };
+        assert_eq!(decide_turn(&s), TurnDecision::NudgePendingAction);
+    }
+
+    #[test]
+    fn nudge_fires_even_after_tools_ran() {
+        // 模式 B 发生在 run 中途（已跑过工具）——旧重提示被 !ran_tools 锁死，本门不受管。
+        let s = TurnSignals {
+            has_visible_text: true,
+            pending_action: true,
+            ran_tools: true,
+            ..sig()
+        };
+        assert_eq!(decide_turn(&s), TurnDecision::NudgePendingAction);
+    }
+
+    #[test]
+    fn nudge_is_one_shot_per_run() {
+        let s = TurnSignals {
+            has_visible_text: true,
+            pending_action: true,
+            nudge_done: true,
+            ..sig()
+        };
+        assert_eq!(decide_turn(&s), TurnDecision::Answer);
+    }
+
+    #[test]
+    fn nudge_never_beats_run_tools() {
+        let s = TurnSignals {
+            tool_calls: 1,
+            has_visible_text: true,
+            pending_action: true,
+            ..sig()
+        };
+        assert_eq!(decide_turn(&s), TurnDecision::RunTools);
+    }
+
+    #[test]
+    fn nudge_skips_length_truncation() {
+        // Length 截断走 transport recovery，不补发（否则白烧一轮）。
+        let s = TurnSignals {
+            has_visible_text: true,
+            pending_action: true,
+            finish_reason: Some(FinishReason::Length),
+            ..sig()
+        };
+        assert_eq!(decide_turn(&s), TurnDecision::Answer);
+    }
+
+    #[test]
+    fn detector_fires_on_known_early_stop_shapes() {
+        for t in [
+            "好的，我这就调：",
+            "当前端口变化较大，让我重新看一下：",
+            "Let me check it.",
+            "Let me query it.",
+            "Let me fix this.",
+            "我马上查…",
+            "先确认一下监听端口。我这就去：",
+        ] {
+            assert!(announces_pending_action(t), "should fire: {t:?}");
+        }
+    }
+
+    #[test]
+    fn detector_rejects_real_answers() {
+        for t in [
+            // 结构完整的答案（末句不是宣告）。
+            "百度首页已经在你默认浏览器里打开了，无头浏览器启动有点问题。",
+            // 长答案：永不动（D3 保证）。
+            "本机监听端口如下：135 用于 RPC 终结器，445 为 SMB 文件共享；两者均为系统服务默认监听，属正常。建议继续保持防火墙入站限制，并对 445 做一次基线比对，因为近年勒索软件常利用该入面。",
+            // 内容已在冒号后给出（末句是实际数据）。
+            "帮你查了，主要就两条：CPU 91% / 内存 78%。",
+            // 工具名在正文（旧启发式的 HARTSAS 误报面）。
+            "browser_cdp 与 shell_exec 在这个场景下不需要，结论是内存充足。",
+            // 开场词在句中且已完整收场。
+            "你说得对，我马上就去查了，结果是磁盘没满。",
+            "",
+            "   ",
+        ] {
+            assert!(!announces_pending_action(t), "should NOT fire: {t:?}");
+        }
+    }
+
+    #[test]
+    fn detector_is_utf8_safe_on_multibyte_separators() {
+        // 句末多字节标点 + 尾部空白不得 panic。
+        assert!(!announces_pending_action("完全答案。"));
+        assert!(announces_pending_action("已确认。我重新查："));
+        assert!(!announces_pending_action("\n\n"));
     }
 }

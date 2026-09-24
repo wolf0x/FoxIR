@@ -50,6 +50,37 @@ struct RawUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// OpenAI-style nested accounting: `usage.prompt_tokens_details.cached_tokens`.
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek / Moonshot-style flat accounting.
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u64>,
+}
+
+impl RawUsage {
+    /// Input tokens served from the provider's prompt cache (a cache HIT), or
+    /// `None` when this endpoint reports no cache accounting at all. The two are
+    /// deliberately distinct: `Some(0)` is a measured miss, `None` must be kept
+    /// out of the denominator so an unsupported model cannot look like a broken
+    /// cache. Field names differ per vendor, hence the fallback ladder.
+    fn cached_prompt_tokens(&self) -> Option<u64> {
+        if let Some(v) = self.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens) {
+            return Some(v);
+        }
+        if let Some(v) = self.prompt_cache_hit_tokens {
+            return Some(v);
+        }
+        // A few gateways expose only the miss counter; derive the hit from it.
+        match (self.prompt_tokens, self.prompt_cache_miss_tokens) {
+            (Some(p), Some(miss)) => Some(p.saturating_sub(miss)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,6 +436,7 @@ impl OpenAiProvider {
                                     prompt_tokens: raw.prompt_tokens,
                                     completion_tokens: raw.completion_tokens,
                                     total_tokens: raw.total_tokens,
+                                    cached_prompt_tokens: raw.cached_prompt_tokens(),
                                 });
                             }
                         }
@@ -566,6 +598,7 @@ impl Llm for OpenAiProvider {
                                         prompt_tokens: raw.prompt_tokens,
                                         completion_tokens: raw.completion_tokens,
                                         total_tokens: raw.total_tokens,
+                                        cached_prompt_tokens: raw.cached_prompt_tokens(),
                                     });
                                 }
                                 if let Some(choices) = chunk.choices {
@@ -839,5 +872,55 @@ mod stream_cut_by_transport_error {
         assert!(stream_timed_out, "a transport error before the finish_reason must set stream_timed_out");
         assert_eq!(content, "The", "the prefix received before the cut must be preserved");
         assert!(finish_reason.is_none(), "no finish_reason was sent in this scenario");
+    }
+}
+
+#[cfg(test)]
+mod usage_cache_parsing {
+    use super::*;
+
+    fn parse(s: &str) -> RawUsage {
+        serde_json::from_str::<RawUsage>(s).expect("usage object must parse")
+    }
+
+    /// Vendor field names for the same quantity differ; all three known shapes
+    /// must land in one field, and "not reported" must stay distinguishable from
+    /// "reported a miss".
+    #[test]
+    fn cache_fields_from_every_vendor_shape() {
+        // OpenAI-compatible nested details.
+        let openai = parse(r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,
+                                 "prompt_tokens_details":{"cached_tokens":800}}"#);
+        assert_eq!(openai.cached_prompt_tokens(), Some(800));
+
+        // DeepSeek / Moonshot flat counters.
+        let flat = parse(r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,
+                             "prompt_cache_hit_tokens":640,"prompt_cache_miss_tokens":360}"#);
+        assert_eq!(flat.cached_prompt_tokens(), Some(640));
+
+        // Only a miss counter: derive the hit from the input total.
+        let miss_only = parse(r#"{"prompt_tokens":1000,"prompt_cache_miss_tokens":250}"#);
+        assert_eq!(miss_only.cached_prompt_tokens(), Some(750));
+
+        // Explicit zero is a measured miss, NOT a silence.
+        let zero = parse(r#"{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":0}}"#);
+        assert_eq!(zero.cached_prompt_tokens(), Some(0));
+
+        // Silence: no cache fields at all -> None (must be excluded upstream).
+        let blind = parse(r#"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}"#);
+        assert_eq!(blind.cached_prompt_tokens(), None);
+
+        // A miss counter larger than the input total cannot invent a negative hit.
+        let weird = parse(r#"{"prompt_tokens":100,"prompt_cache_miss_tokens":180}"#);
+        assert_eq!(weird.cached_prompt_tokens(), Some(0));
+    }
+
+    /// Unknown extra fields from a gateway must not break usage capture.
+    #[test]
+    fn unknown_usage_fields_are_ignored() {
+        let u = parse(r#"{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,
+                          "reasoning_tokens":2,"serving_cost":0.001}"#);
+        assert_eq!(u.prompt_tokens, Some(10));
+        assert_eq!(u.cached_prompt_tokens(), None);
     }
 }

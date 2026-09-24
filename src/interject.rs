@@ -49,6 +49,17 @@ pub fn pop_pending(session_id: &str) -> Option<String> {
     item
 }
 
+/// Whether a session still has queued follow-up tasks that nobody has
+/// dispatched yet. A run finishing with no client attached cannot dispatch them
+/// (the per-connection loop is gone), so the server uses this to make the
+/// orphaned queue visible in the log instead of losing it silently.
+pub fn has_pending(session_id: &str) -> bool {
+    pending()
+        .lock()
+        .map(|q| q.get(session_id).map(|e| !e.is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Inject a message into the CURRENT running task (explicit "insert" button).
 /// Picked up by the agent loop on its next iteration.
 pub fn push_insert(session_id: &str, content: String) {
