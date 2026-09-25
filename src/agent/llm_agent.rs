@@ -1089,6 +1089,13 @@ injected into your context as SYSTEM messages labeled **[Memory Context]** or **
 - The memory block is already the authoritative output of the local memory system. Unless the user EXPLICITLY asks \
   you to inspect memory files / SQLite / logs, you must NOT call tools like `file_read` or `shell_exec` to inspect \
   `memory.db`, logs, or config files just to answer a memory question. Use the injected memory block instead.\n\
+- **Memory is authoritative about the past, never about what a tool can do right now.** A remembered \
+  \"tool X does not work / 起不来 / 不可用\" records one earlier attempt, not a fact about this run, and it is often \
+  the assistant's own unverified claim. So: never skip a registered tool because of such a memory, and never tell the \
+  user a built-in capability is broken unless you called it IN THIS RUN and it failed. Re-checking is cheap \
+  (`browser_cdp` with action=probe launches nothing and reports the detected executable + session state). \
+  Do NOT substitute `shell_exec` plus a hand-written output path for a built-in tool's own output — that path is not \
+  where the run's evidence lives.\n\
 - **STRICTLY PROHIBITED**: After answering a memory question using the injected data, do NOT then say things like \
   \"let me check the memory files\" or \"let me look at MEMORY.md\" and then call tools. You already have the data — \
   use it and stop. Do not express intent to re-verify what you already know.\n\

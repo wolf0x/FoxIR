@@ -3097,6 +3097,26 @@ fn deep_near_duplicate(a: &str, b: &str) -> bool {
     inter / union >= 0.6
 }
 
+/// "某个内置能力坏了"这类断言不能进深层记忆。
+///
+/// 它自我强化：下一轮读到它就跳过那个工具，而跳过就没有反证——来源往往只是模型上一轮
+/// 一句没验证过的话（真机案例：模型没调 `browser_cdp`，直接 shell_exec 起 Edge，回复里
+/// 写"内置浏览器还是起不来（老问题）"，curator 把这句蒸成了 durable fact）。
+/// 要求同一句里既指向自己的工具、又有"坏了/不可用/绕道"的断言，避免把对目标的取证结论
+/// （"Defender 不可用"）一起挡掉。
+fn deep_fact_disables_a_capability(content: &str) -> bool {
+    let c = content.to_lowercase();
+    const OWN_CAPABILITY: [&str; 7] = [
+        "内置浏览器", "内置工具", "本工具", "browser_cdp", "built-in browser", "built-in tool", "assistant",
+    ];
+    const UNAVAILABLE: [&str; 12] = [
+        "起不来", "不可用", "用不了", "无法启动", "无法使用", "坏了", "失灵", "替代方案",
+        "does not work", "cannot start", "can't start", "unavailable",
+    ];
+    OWN_CAPABILITY.iter().any(|k| c.contains(k))
+        && UNAVAILABLE.iter().any(|k| c.contains(k))
+}
+
 /// 后台 Engram Curator：实质回复后异步蒸馏 durable facts 到深层记忆。
 fn spawn_deep_curator(
     state: Arc<AppState>,
@@ -3135,7 +3155,8 @@ fn spawn_deep_curator(
 1) user or project facts — standing preferences, identity details, hard constraints, stable project facts;
 2) stable connection/endpoint details — target hosts, IPs, credentials, accounts, infrastructure references;
 3) IR investigation findings/leads established or confirmed in the assistant reply — affected components/versions, C2/IP/domain/hash indicators, evidence or report file paths, and conclusions.
-Ignore one-off or transient details, and do not re-state the same point more than once (dedupe by subject_key). Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
+Ignore one-off or transient details, and do not re-state the same point more than once (dedupe by subject_key).
+Never record whether this assistant's OWN tools or capabilities work, are broken, or are unavailable — not being able to use a tool is decided by calling it, and a remembered \"tool X is broken\" makes later runs skip it. If a reply says a built-in tool failed, record at most what was learned about the task, not that claim. Respond ONLY with JSON of the form {\"facts\":[{\"content\":\"<fact, third person>\",\"fact_type\":\"identity|preference|project|constraint|reference\",\"subject_key\":\"<short stable key>\"}]}. If nothing durable, respond {\"facts\":[]}.";
         let messages = vec![ChatMessage::system(sys), ChatMessage::user(&digest)];
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -3170,6 +3191,14 @@ Ignore one-off or transient details, and do not re-state the same point more tha
         for cf in facts.iter().take(3) {
             let fcontent = cf.content.trim();
             if fcontent.is_empty() {
+                continue;
+            }
+            if deep_fact_disables_a_capability(fcontent) {
+                tracing::info!(
+                    "[deep-curator] skipped a capability-disabling fact (would suppress the tool call \
+                     that could disprove it): {}",
+                    fcontent
+                );
                 continue;
             }
             let existing = cf.subject_key.as_deref().and_then(|sk| {
@@ -4276,6 +4305,32 @@ fn two_tier_write(state: &AppState, assistant_text: &mut String, session_id: &st
     let _ = session_id;
     let _ = user_text;
     *assistant_text = crate::deep_memory::strip_memory_blocks(assistant_text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// curator 收进去的那三条现场文案，一条都不能再落到深层记忆里。
+    #[test]
+    fn a_capability_disabling_claim_is_never_curated_into_memory() {
+        for claim in [
+            "内置浏览器当前不可用（配置文件损坏且有残留进程占用），可用 Edge 无头模式抓取页面作为替代方案。",
+            "The project's built-in browser still cannot start, which is a known recurring issue.",
+            "The built-in browser tool does not work (a recurring, known issue); the assistant works around it by using Edge in headless mode.",
+        ] {
+            assert!(deep_fact_disables_a_capability(claim), "漏掉了: {claim}");
+        }
+
+        // 反面对照：这是对**目标机器**的取证结论、以及普通项目事实，不能被误杀
+        for ok in [
+            "Target host's Windows Defender real-time protection is unavailable (service disabled).",
+            "内置浏览器 profile 位于 case 目录的 .browser_profile，每个 workspace 一份。",
+            "Wolf 习惯把报告导出成 PDF 后再移交。",
+        ] {
+            assert!(!deep_fact_disables_a_capability(ok), "误杀了: {ok}");
+        }
+    }
 }
 
 
