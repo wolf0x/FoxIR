@@ -10,6 +10,7 @@
 //! - `get_html`: Get page or element HTML
 //! - `execute_js`: Execute JavaScript and return result
 //! - `find_element`: Find element and return its attributes
+//! - `snapshot`: Number the visible interactive elements; act on them by `index`
 //! - `list_tabs`: read-only inventory of every page the browser has
 //! - `probe`: Report which browser would be used + current session state
 //! - `close`: Release this agent's page (the browser itself stays; in visible-window mode the
@@ -213,13 +214,93 @@ fn strip_html_noise(html: &str) -> String {
     out
 }
 
-/// 等元素出现，最多 `SELECTOR_WAIT`。
+/// 一份快照最多标多少个元素。真机量的：门户页可见交互元素 25–27 个，300 个按钮的页面
+/// 序列化 9,979 字节 —— 上限是为了不让极端页面把上下文一次灌满。
+const SNAPSHOT_CAP: u64 = 250;
+
+/// 按编号找回元素时的等待：比 selector 的 8s 短得多。编号来自上一份快照，页面已经变了的话
+/// 再等也不会等回来；等太久只是把"漂号"这件事说得更晚。
+const INDEX_WAIT: Duration = Duration::from_millis(2_000);
+
+/// `snapshot` 用的那段 JS：把**可见的**交互元素编号并写进 `data-fx`，同时序列化成人和模型
+/// 都能直接读的清单。
+///
+/// 为什么要这个：CSS 表达不了"按可见文本点这个"，而这恰恰是模型要做的事（真机 4 个页面上
+/// 文本目标 0/4 能写成合法 CSS，有 id 把手的只有 15–16%），于是它写 `a:contains('设置')`
+/// 这种非法选择器，失败后再用 execute_js 自己遍历。这里把那一步挪进工具。
+///
+/// 三条边界要写明白：
+/// - 先清掉上一轮的 `data-fx`，否则"刚才可见现在隐藏"的元素会带着旧编号，
+///   `[data-fx="3"]` 就会匹配到两个节点；
+/// - 只认文档内的元素：iframe / shadow DOM 里面的不标（我们现在也穿不进去）；
+/// - `data-fx` 是对页面 DOM 的写操作（只加属性，不改结构），可能触发站点自己的
+///   MutationObserver —— 这是这个机制的已知代价。
+const SNAPSHOT_JS: &str = r#"((cap) => {
+  const SEL = 'a[href],button,input,select,textarea,[onclick],[role],[tabindex],summary,label,iframe';
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  document.querySelectorAll('[data-fx]').forEach((e) => { delete e.dataset.fx; });
+  const lines = [];
+  let skipped = 0;
+  for (const el of document.querySelectorAll(SEL)) {
+    if (!vis(el)) continue;
+    if (lines.length >= cap) { skipped++; continue; }
+    const i = lines.length;
+    el.dataset.fx = i;
+    const tag = el.tagName.toLowerCase();
+    const type = el.getAttribute('type') || '';
+    const role = el.getAttribute('role') || '';
+    const text = ((el.innerText || el.value || el.getAttribute('aria-label')
+      || el.getAttribute('placeholder') || el.getAttribute('title') || '')
+      .replace(/\s+/g, ' ').trim()).slice(0, 60);
+    const href = tag === 'a' ? (el.getAttribute('href') || '').slice(0, 80) : '';
+    const checked = (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio'))
+      ? (el.checked ? ' checked' : '') : '';
+    lines.push('[' + i + ']<' + tag
+      + (type ? ' type=' + type : '')
+      + (role ? ' role=' + role : '')
+      + (text ? ' ' + text : '')
+      + checked
+      + (href ? ' href=' + href : '') + '/>');
+  }
+  return JSON.stringify({ count: lines.length, skipped, snapshot: lines.join('\n') });
+})"#;
+
+/// click / type_text 的两种点名方式。`index` 来自 `snapshot`；两个都给时 index 优先，
+/// 都不给就报错 —— 猜一个空 selector 去查 DOM 没有任何意义。
+fn target_of(args: &Value) -> Result<(String, Option<u64>), String> {
+    if let Some(i) = args["index"].as_u64() {
+        return Ok((format!("[data-fx=\"{i}\"]"), Some(i)));
+    }
+    match args["selector"].as_str() {
+        Some(s) => Ok((s.to_string(), None)),
+        None => Err("Missing 'index' (from 'snapshot') or 'selector' (CSS)".to_string()),
+    }
+}
+
+/// 编号失效和"元素不存在"要分开说：编号是上一份快照里的坐标，页面一动它就漂走，
+/// 正确的下一步是重拍快照，不是换一个编号瞎猜。
+fn target_error(index: Option<u64>, selector: &str, err: &str) -> String {
+    match index {
+        Some(i) => format!(
+            "Index {i} is no longer on the page ({err}). Indices come from the last 'snapshot' and \
+             drift as soon as the page changes: take a fresh 'snapshot' and pick again instead of \
+             guessing another index."
+        ),
+        None => selector_error(selector, err),
+    }
+}
+
+/// 等元素出现，最多 `wait`。
 ///
 /// 库里 `find_element` 是一次性 DOM 查询，在 SPA / 懒加载页面上"还没渲染出来"和
 /// "确实不存在"报的是同一个错——调用方只能靠重试瞎猜。轮询到超时才把最后一条错误
 /// 抛出去，两者就分开了；也不再需要固定 sleep。
-async fn find_element_wait(page: &Page, selector: &str) -> Result<Element, String> {
-    let deadline = tokio::time::Instant::now() + SELECTOR_WAIT;
+async fn find_element_wait(page: &Page, selector: &str, wait: Duration) -> Result<Element, String> {
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match page.find_element(selector).await {
             Ok(elem) => return Ok(elem),
@@ -638,7 +719,8 @@ impl BrowserSession {
         }
     }
 
-    /// 一个 agent 结束（或显式 `close`）：只交回自己那一页，绝不动别人的，也不关浏览器。
+    
+/// 一个 agent 结束（或显式 `close`）：只交回自己那一页，绝不动别人的，也不关浏览器。
     /// 可见窗口模式下连页都不交回 —— 那一页就是人正在用的窗口。
     pub async fn release(&self, key: &str) {
         let mut guard = self.inner.lock().await;
@@ -1102,11 +1184,15 @@ impl Tool for BrowserCdpTool {
          Long texts come back capped: continue with 'offset' (see \
          'next_offset'), or open 'full_text_path', which holds the whole page.\n\
          Actions:\n\
-         - 'navigate': Go to a URL on our page. Provide 'url'. Reports the browser's own 'url' \
-           (after any redirect) plus 'loaded'. 'loaded': false means the page is still arriving \
-           (or never finishes) - read what is there instead of sending 'navigate' again.\n\
+         - 'navigate': Go to a URL on our page. Provide 'url'. Reports 'requested_url' plus the \
+           browser's own 'url' (only what it will admit to — possibly still about:blank mid-load) \
+           and 'loaded'. 'loaded': false means the page is still arriving (or never finishes) — \
+           read what is there with 'get_text'/'snapshot' instead of sending 'navigate' again.\n\
          - 'get_text': Get page text or element text. Optional 'selector' (CSS), 'offset', 'max_chars'.\n\
-         - 'click': Click an element. Provide 'selector' (CSS). \
+         - 'snapshot': Number the visible interactive elements and list them as '[N]<tag text/>' \
+           lines — the way to address something by what it says, since CSS cannot match text. \
+           Then pass 'index' to 'click'/'type_text'. Re-snapshot after navigation.\n\
+         - 'click': Click an element. Provide 'index' (from 'snapshot') or 'selector' (CSS). \
            Reports 'navigated' (true/false, or \"unknown\" when the page is still busy — then \
            re-read with 'get_url' instead of clicking again) and the new 'url'.\n\
          - 'type_text': Type into an element. Provide 'selector' and 'text'.\n\
@@ -1134,7 +1220,7 @@ impl Tool for BrowserCdpTool {
                 "action": {
                     "type": "string",
                     "enum": ["navigate", "get_text", "click", "type_text", "screenshot",
-                             "get_url", "get_html", "execute_js", "find_element",
+                             "get_url", "get_html", "execute_js", "find_element", "snapshot",
                              "list_tabs", "probe", "close"],
                     "description": "Which browser action to perform"
                 },
@@ -1144,7 +1230,15 @@ impl Tool for BrowserCdpTool {
                 },
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector (for 'click', 'type_text', 'get_text', 'get_html', 'find_element')"
+                    "description": "CSS selector (for 'click', 'type_text', 'get_text', 'get_html', 'find_element'). CSS cannot match by visible text — prefer 'index' from 'snapshot' for that"
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "'click' / 'type_text': the Nth entry of the last 'snapshot' (takes precedence over 'selector'). Indices drift when the page changes — on 'no longer on the page', re-snapshot, do not guess another index"
+                },
+                "cap": {
+                    "type": "integer",
+                    "description": "'snapshot': how many visible interactive elements to number at most (default 250)"
                 },
                 "text": {
                     "type": "string",
@@ -1168,7 +1262,7 @@ impl Tool for BrowserCdpTool {
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "'get_text' / 'get_html' / 'execute_js': cap the inline result (bounded by the context budget)"
+                    "description": "'get_text' / 'get_html' / 'execute_js' / 'snapshot': cap the inline result (bounded by the context budget)"
                 },
                 "raw": {
                     "type": "boolean",
@@ -1367,24 +1461,25 @@ impl BrowserCdpTool {
                     .and_then(|r| r.ok())
                     .flatten()
                     .unwrap_or_default();
-                // 报回来的 url 以浏览器的说法为准（句柄自己的说法优先，CDP 兜底）：请求里那个
-                // url 可能被重定向、也可能根本没落地，回显请求值就是骗调用方。兜底那次查询要
-                // 拿会话锁 + 一趟 CDP，所以只在句柄的说法是空时才走。
-                let where_now = match url_now(&page).await {
-                    Some(u) => u,
+                // 报回来的 url 只写浏览器自己承认的那个：句柄的说法优先，CDP 兜底，
+                // 两者都没话说就留空 —— 绝不拿"请求的那个"冒充"到达的那个"。
+                // （上一版把请求值当兜底，配合 4s 的有界读取，会在慢页面上把还在
+                //   `about:blank` 的文档报成已经到了目标页 —— 那是撒谎，不是保守。）
+                let reported = match url_now(&page).await {
+                    Some(u) => Some(u),
                     None => self
                         .session
                         .page_info(key)
                         .await
                         .map(|(u, _)| u)
-                        .filter(|u| !u.is_empty())
-                        .unwrap_or_else(|| url.to_string()),
+                        .filter(|u| !u.is_empty()),
                 };
                 let (tabs, _) = self.session.page_counts().await;
                 let mut out = json!({
                     "success": true,
                     "action": "navigate",
-                    "url": where_now,
+                    "url": reported.clone().unwrap_or_default(),
+                    "requested_url": url,
                     "title": title,
                     // 没等到底就返回时必须是 false：只 warn 进日志的话，结果里看起来
                     // 和"页面加载完成"一模一样，模型会当成已就绪去取内容。
@@ -1401,9 +1496,57 @@ impl BrowserCdpTool {
                 Ok(out)
             }
 
+            "snapshot" => {
+                let cap = args["cap"]
+                    .as_u64()
+                    .unwrap_or(SNAPSHOT_CAP)
+                    .clamp(10, SNAPSHOT_CAP);
+                let raw = page
+                    .evaluate_expression(&format!("({SNAPSHOT_JS})({cap})"))
+                    .await
+                    .map_err(|e| format!("Snapshot failed: {}", e))?;
+                // JS 回的是 JSON 文本（returnByValue 下的字符串），在这里再解开
+                let payload: Value = raw
+                    .value()
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(Value::Null);
+                let count = payload["count"].as_u64().unwrap_or(0);
+                let skipped = payload["skipped"].as_u64().unwrap_or(0);
+                let list = payload["snapshot"].as_str().unwrap_or_default().to_string();
+                // 和 get_text 同一套上限/续读：大页面不能一次整份灌进上下文
+                let s = slice_text(
+                    &list,
+                    offset,
+                    max_chars,
+                    output_dir,
+                    &format!("page_snapshot_{}.txt", stamp()),
+                );
+                let mut out = json!({
+                    "success": true,
+                    "action": "snapshot",
+                    "marked": count,
+                    "snapshot": s.window,
+                    "offset": s.offset,
+                    "total_chars": s.total,
+                    "truncated": s.truncated || skipped > 0,
+                    "next_offset": s.next_offset,
+                    "full_text_path": s.path
+                });
+                if skipped > 0 {
+                    out["not_marked"] = json!(skipped);
+                    out["note"] = json!(format!(
+                        "only the first {count} visible interactive elements were numbered; \
+                         {skipped} more were skipped — narrow with 'get_text'/'selector' \
+                         or pass a smaller-scope snapshot"
+                    ));
+                }
+                Ok(out)
+            }
+
             "get_text" => {
                 let text = if let Some(selector) = args["selector"].as_str() {
-                    let elem = find_element_wait(&page, selector).await
+                    let elem = find_element_wait(&page, selector, SELECTOR_WAIT).await
                         .map_err(|e| selector_error(selector, &e))?;
                     elem.inner_text().await
                         .map_err(|e| format!("Get text failed: {}", e))?
@@ -1429,10 +1572,10 @@ impl BrowserCdpTool {
             }
 
             "click" => {
-                let selector = args["selector"].as_str()
-                    .ok_or_else(|| "Missing 'selector' for click".to_string())?;
-                let elem = find_element_wait(&page, selector).await
-                    .map_err(|e| selector_error(selector, &e))?;
+                let (selector, index) = target_of(args).map_err(|e| -> crate::error::AgentError { e.into() })?;
+                let elem = find_element_wait(&page, &selector, index.map(|_| INDEX_WAIT).unwrap_or(SELECTOR_WAIT))
+                    .await
+                    .map_err(|e| target_error(index, &selector, &e))?;
                 let before = url_now(&page).await;
                 // `Element::click()` = scroll_into_view + clickable_point + dispatchMouseEvent，
                 // 三条命令。点了会跳转的链接之后，目标文档没就绪前这些命令都不会回包 ——
@@ -1463,9 +1606,14 @@ impl BrowserCdpTool {
                 let mut out = json!({
                     "success": true,
                     "action": "click",
+                    // 编号点名时这里回的是解析后的 `[data-fx="N"]`，index 另给一个字段，
+                    // 免得读的人以为是我们自己造的把手
                     "selector": selector,
                     "url": after.clone().unwrap_or_default()
                 });
+                if let Some(i) = index {
+                    out["index"] = json!(i);
+                }
                 // `navigated` 只在两次 url 都读得到的时候是布尔；读不到就说 unknown，
                 // 不把"读失败"混成"没跳转"或"跳了"。
                 match (&before, &after) {
@@ -1485,12 +1633,12 @@ impl BrowserCdpTool {
             }
 
             "type_text" => {
-                let selector = args["selector"].as_str()
-                    .ok_or_else(|| "Missing 'selector' for type_text".to_string())?;
+                let (selector, index) = target_of(args).map_err(|e| -> crate::error::AgentError { e.into() })?;
                 let text = args["text"].as_str()
                     .ok_or_else(|| "Missing 'text' for type_text".to_string())?;
-                let elem = find_element_wait(&page, selector).await
-                    .map_err(|e| selector_error(selector, &e))?;
+                let elem = find_element_wait(&page, &selector, index.map(|_| INDEX_WAIT).unwrap_or(SELECTOR_WAIT))
+                    .await
+                    .map_err(|e| target_error(index, &selector, &e))?;
                 // 聚焦这一击和逐字输入同样可能被页面跳转吞掉回包（见 CLICK_DELIVERED），
                 // 不能硬等：送出去就算送出，用 confirmed 说清有没有得到回执。
                 let _ = tokio::time::timeout(CLICK_DELIVERED, elem.click()).await;
@@ -1505,6 +1653,9 @@ impl BrowserCdpTool {
                     "typed": text,
                     "confirmed": confirmed
                 });
+                if let Some(i) = index {
+                    out["index"] = json!(i);
+                }
                 if !confirmed {
                     out["note"] = json!(
                         "the keystrokes were sent but the page never answered (it is probably \
@@ -1555,7 +1706,7 @@ impl BrowserCdpTool {
 
             "get_html" => {
                 let html = if let Some(selector) = args["selector"].as_str() {
-                    let elem = find_element_wait(&page, selector).await
+                    let elem = find_element_wait(&page, selector, SELECTOR_WAIT).await
                         .map_err(|e| selector_error(selector, &e))?;
                     elem.inner_html().await
                         .map_err(|e| format!("Get HTML failed: {}", e))?
@@ -1621,7 +1772,7 @@ impl BrowserCdpTool {
             "find_element" => {
                 let selector = args["selector"].as_str()
                     .ok_or_else(|| "Missing 'selector' for find_element".to_string())?;
-                let elem = find_element_wait(&page, selector).await
+                let elem = find_element_wait(&page, selector, SELECTOR_WAIT).await
                     .map_err(|e| selector_error(selector, &e))?;
                 let attrs = elem.attributes().await
                     .map_err(|e| format!("Get attributes failed: {}", e))?;
@@ -1682,6 +1833,28 @@ mod tests {
 
         assert!(cookie.exists(), "close() must never delete the persistent profile");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `target_of`：index 优先、两者都不给就报错（拿空 selector 去查 DOM 没有意义），
+    /// 以及编号失效与"元素不存在"分开说。
+    #[test]
+    fn index_and_selector_are_two_names_for_the_same_target() {
+        let (sel, idx) = target_of(&json!({ "index": 7, "selector": "#ignored" })).unwrap();
+        assert_eq!(sel, "[data-fx=\"7\"]");
+        assert_eq!(idx, Some(7), "两个都给时 index 优先");
+
+        let (sel, idx) = target_of(&json!({ "selector": "#go" })).unwrap();
+        assert_eq!(sel, "#go");
+        assert_eq!(idx, None);
+
+        let missing = target_of(&json!({})).unwrap_err();
+        assert!(missing.contains("index") && missing.contains("selector"), "{missing}");
+
+        let by_index = target_error(Some(3), "[data-fx=\"3\"]", "Could not find node with given id");
+        assert!(by_index.contains("no longer on the page"), "{by_index}");
+        assert!(by_index.contains("snapshot"), "要说清下一步: {by_index}");
+        let by_css = target_error(None, "#gone", "Could not find node with given id");
+        assert!(by_css.starts_with("Element not found"), "{by_css}");
     }
 
     /// `parse_devtools_active_port` 的形状：首行端口，第二行 ws 路径，可能带 \r\n。
@@ -1860,9 +2033,13 @@ mod tests {
             .expect("a page that is merely still loading is not a failed navigate");
         println!("stalled navigate: {:?} -> {}", t.elapsed(), v);
         assert_eq!(v["loaded"], json!(false), "还在加载必须标出来: {v}");
+        assert_eq!(v["requested_url"], json!(format!("http://{}/hang", addr)), "{v}");
+        // `url` 只写浏览器自己承认的地方：慢页面上它可能还是 about:blank ——
+        // 那是实话，比拿请求值冒充"已到达"好。
+        let said = v["url"].as_str().unwrap_or("?");
         assert!(
-            v["url"].as_str().is_some_and(|u| u.ends_with("/hang")),
-            "要报浏览器实际到达的地方: {v}"
+            said.ends_with("/hang") || said == "about:blank" || said.is_empty(),
+            "url 只能是浏览器说得出的一种: {v}"
         );
         assert!(v.get("note").is_some(), "还要告诉调用方别重发 navigate: {v}");
 
@@ -2310,6 +2487,97 @@ mod tests {
         assert!(
             v["navigated"].is_boolean() || v["navigated"] == json!("unknown"),
             "读不到就要说 unknown，不能硬判: {v}"
+        );
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机回归：`snapshot` 编号 → `click {index}` 点到的就是那一行；重拍不留下重复编号；
+    /// 页面换了之后旧编号要说"重新快照"，而不是"元素不存在"。
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn snapshot_numbers_the_page_and_clicks_by_number() {
+        // data: URL 不写 charset 时按 Latin-1 解，中文会变成乱码 —— 这里要测的正是中文按钮
+        let two_buttons = "data:text/html;charset=utf-8,<body><button onclick=\"document.title='ONE'\">第一个按钮</button>\
+            <button onclick=\"document.title='TWO'\">第二个按钮</button></body>";
+        let tmp = std::env::temp_dir().join(format!("foxir_snap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out_dir = tmp.join("output").to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        let page = s.get_or_init("a").await.expect("launch");
+        let nav = |url: String| {
+            let page = page.clone();
+            async move {
+                page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+                    url,
+                    referrer: None,
+                    transition_type: None,
+                    frame_id: None,
+                    referrer_policy: None,
+                })
+                .await
+                .ok();
+                let _ = tokio::time::timeout(Duration::from_secs(3), page.wait_for_navigation()).await;
+            }
+        };
+
+        nav(two_buttons.to_string()).await;
+        let snap = tool
+            .execute_action("snapshot", &json!({}), &out_dir, 15_000, "a")
+            .await
+            .expect("snapshot works");
+        println!("snapshot -> {}", snap);
+        assert_eq!(snap["marked"], json!(2), "{snap}");
+        let list = snap["snapshot"].as_str().unwrap();
+        assert!(list.contains("[0]<button 第一个按钮/>"), "{list}");
+        assert!(list.contains("[1]<button 第二个按钮/>"), "{list}");
+
+        // 点第 2 个（index=1）——按文本点名这件事，CSS 根本写不出来
+        tool.execute_action("click", &json!({ "index": 1 }), &out_dir, 15_000, "a")
+            .await
+            .expect("click by index");
+        let title = page.evaluate_expression("document.title").await.unwrap();
+        println!("after click index=1, title={:?}", title.value());
+        assert_eq!(
+            title.value().and_then(|v| v.as_str()).map(str::to_string).as_deref(),
+            Some("TWO"),
+            "点到的必须是快照里那一行"
+        );
+
+        // 重拍一遍：不能留下重复编号（旧 mark 要先清掉）
+        let again = tool
+            .execute_action("snapshot", &json!({}), &out_dir, 15_000, "a")
+            .await
+            .expect("re-snapshot");
+        let dup = page
+            .evaluate_expression("document.querySelectorAll('[data-fx]').length")
+            .await
+            .unwrap();
+        println!("re-snapshot marked={} marked_attr_count={:?}", again["marked"], dup.value());
+        assert_eq!(again["marked"], json!(2), "{again}");
+        assert_eq!(
+            dup.value().and_then(|v| v.as_u64()),
+            Some(2),
+            "重拍之后页面上只应有 2 个编号，多余的会让 [data-fx=N] 匹配到两个节点"
+        );
+
+        // 换了页面再用旧编号：报"重新快照"，而且不能等满 8s
+        nav("data:text/html,<body><h1>别的页面</h1></body>".to_string()).await;
+        let t = Instant::now();
+        let stale = tool
+            .execute_action("click", &json!({ "index": 0 }), &out_dir, 15_000, "a")
+            .await
+            .expect_err("a stale index must not pretend to have clicked");
+        let took = t.elapsed();
+        let msg = stale.to_string();
+        println!("stale index after {:?} -> {}", took, msg);
+        assert!(msg.contains("no longer on the page"), "{msg}");
+        assert!(msg.contains("snapshot"), "要说出下一步是重新快照: {msg}");
+        assert!(
+            took < Duration::from_secs(5),
+            "编号失效不该按 8s 的 selector 轮询干等: {took:?}"
         );
 
         s.close().await.unwrap();

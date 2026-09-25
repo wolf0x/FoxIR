@@ -971,7 +971,7 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
              one page per agent inside one shared browser, one page per chat session while a \
              visible window is open (sub-agents never navigate each other's \
              page; a page the site opens is counted but not drivable - `navigate` brings its url over), \
-             plus `probe` (reports which browser executable was detected and the session state, without launching). \
+             plus `probe` (reports which browser executable was detected and the session state, without launching). \n             When you need an element by its visible text, call `snapshot` and act on the returned \n             `[N]` index — CSS cannot match text, so a selector like `a:contains('..')` is invalid. \
              Runs hidden by default; Settings can enable a visible window for a one-time interactive login. \
              In that visible mode the page belongs to the user: navigate it to the login page, tell them to \
              finish signing in in that window, then stop - the window stays open after your run ends and you \
