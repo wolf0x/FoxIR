@@ -183,6 +183,9 @@ struct BrowserInner {
     pages: HashMap<String, OwnedPage>,
     /// 最后一个 agent 交回页面的时刻，用于把空闲的浏览器整个收掉。
     idle_since: Option<Instant>,
+    /// 这一次启动用的是无头还是可见窗口。Settings 里那个开关只有在这个值和当前设置
+    /// 不一致、浏览器被重启之后才会生效（见 `lock_ready`）。
+    launched_headless: bool,
 }
 
 impl BrowserInner {
@@ -488,12 +491,28 @@ impl BrowserSession {
         }
     }
 
-    /// 保证有一个活着的浏览器，并返回持有它的锁守卫。
+    /// 保证有一个活着的浏览器（且模式与 Settings 一致），并返回持有它的锁守卫。
     ///
-    /// 整段（检查 + 启动）都持锁，所以并发调用不会起出两个实例。
+    /// 整段（检查 + 重启 + 启动）都持锁，所以并发调用不会起出两个实例。
     async fn lock_ready(&self, key: &str) -> Result<MutexGuard<'_, Option<BrowserInner>>, String> {
         let mut guard = self.inner.lock().await;
-        if !self.is_alive() || guard.is_none() {
+        let want_headless = self.headless.load(Ordering::Relaxed);
+        // 开关对不上就必须重启：可见窗口模式是"登录一次、之后长期复用"这条路的唯一入口，
+        // 而浏览器现在会在 run 之间存活（还可能是从上一台收养来的）。只在启动时读一次开关
+        // 的话，用户勾掉无头之后看到的仍然只有截图，登录这件事就永远做不成。
+        let stale_mode = guard
+            .as_ref()
+            .map(|i| i.launched_headless != want_headless)
+            .unwrap_or(false);
+        if stale_mode || !self.is_alive() || guard.is_none() {
+            if stale_mode {
+                let was = guard.as_ref().map(|i| i.launched_headless).unwrap_or(true);
+                info!(
+                    "Browser CDP: mode setting changed ({} -> {}), restarting the browser",
+                    if was { "headless" } else { "visible window" },
+                    if want_headless { "headless" } else { "visible window" }
+                );
+            }
             // Slow path. `is_alive()==false` only means the handler stream ended — the
             // child can still be draining and holding the profile directory, so this is
             // the one place a plain `guard.take()` (drop without waiting) reintroduces
@@ -785,6 +804,7 @@ impl BrowserSession {
             browser,
             pages: HashMap::new(),
             idle_since: None,
+            launched_headless: headless,
         };
         let _ = id;
         inner.claim(key, page);
@@ -862,6 +882,7 @@ impl BrowserSession {
 
         // 一次普通命令就能拿到全部页：不建句柄、也不列别人的 URL。
         let mut guard = self.inner.lock().await;
+        let live_mode = guard.as_ref().filter(|_| self.is_alive()).map(|i| i.launched_headless);
         let (running, pages_in_browser, pages_we_own, my_page) = match guard.as_mut() {
             Some(inner) if self.is_alive() => {
                 let owned = inner.pages.len();
@@ -908,6 +929,9 @@ impl BrowserSession {
             "pages_we_own": pages_we_own,
             "page": my_page,
             "mode": if headless { "headless" } else { "visible" },
+            // 开关刚改过、活着的还是上一台模式时说清楚：下一次真正干活会自动重启。
+            // 不说的话，用户勾掉无头却仍然只拿到截图，会以为这个开关根本没生效。
+            "restart_pending": live_mode.map(|was| was != headless).unwrap_or(false),
             "configured_path": self.override_path(),
             "browser": browser,
             "browser_source": browser_source,
@@ -1559,6 +1583,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         panic!("the first browser never wrote DevToolsActivePort");
+    }
+
+    /// 真机回归：Settings 里那个无头开关必须在**下一次调用**就生效。
+    ///
+    /// 为什么值得单独一条：浏览器现在会在 run 之间存活（还可能是从上一台收养来的），
+    /// 如果只在启动时读一次开关，用户勾掉无头之后看到的仍然只有截图 —— 而可见窗口是
+    /// "登录一次、之后长期复用"这条路的唯一入口（账号密码/扫码/2FA 都没法在隐藏窗口里做）。
+    #[tokio::test]
+    #[ignore = "flips the headless switch and briefly opens a real window"]
+    async fn the_headless_switch_takes_effect_on_the_next_call() {
+        let tmp = std::env::temp_dir().join(format!("foxir_mode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let headless = Arc::new(AtomicBool::new(true));
+        let s = BrowserSession::with_profile_dir(
+            tmp.to_string_lossy().to_string(),
+            headless.clone(),
+            Arc::new(RwLock::new(String::new())),
+            tmp.join(".browser_profile"),
+        );
+
+        let page = s.get_or_init("a").await.expect("headless launch must work");
+        let before = page.target_id().clone();
+        assert_eq!(s.status(Some("a")).await["mode"], json!("headless"));
+
+        headless.store(false, Ordering::Relaxed);
+        let probe = s.status(Some("a")).await;
+        assert_eq!(probe["running"], json!(true));
+        assert_eq!(
+            probe["restart_pending"],
+            json!(true),
+            "开关还没落到这台活浏览器上，探针必须说出来: {probe}"
+        );
+
+        let after = s.get_or_init("a").await.expect("relaunch in visible mode must work");
+        assert_ne!(*after.target_id(), before, "换模式必须是一台新浏览器");
+        let st = s.status(Some("a")).await;
+        assert_eq!(st["mode"], json!("visible"));
+        assert_eq!(st["restart_pending"], json!(false));
+        assert_eq!(st["running"], json!(true));
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// profile 就在 case 目录里（本机工具，不做网络暴露面设计）：案件目录自包含、

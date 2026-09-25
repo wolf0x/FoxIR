@@ -1137,7 +1137,7 @@ input:checked+.slider:before{transform:translateX(20px)}
           <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
             <div>
               <label style="margin-bottom:0">Browser: Visible Window</label>
-              <small style="color:var(--t3)">Off (default): browser_cdp runs hidden and cannot be closed by accident. Turn it on to complete a login that needs a password, 2FA or a QR scan. The login lives in the workspace browser profile and later hidden runs inherit it. Enabling/disabling the browser itself is on the Tools page</small>
+              <small style="color:var(--t3)">Off (default): browser_cdp runs hidden and cannot be closed by accident. Turn it on to complete a login that needs a password, 2FA or a QR scan. The login lives in the workspace browser profile and later hidden runs inherit it. It applies on the next browser call — a browser that is still running in the other mode gets restarted for you. Enabling/disabling the browser itself is on the Tools page</small>
             </div>
             <label class="perm-toggle">
               <input type="checkbox" id="browserVisibleInput" onchange="saveAgentSettings()">
