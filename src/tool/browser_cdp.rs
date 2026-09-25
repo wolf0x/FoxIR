@@ -57,6 +57,44 @@ const SELECTOR_WAIT: Duration = Duration::from_millis(8_000);
 /// 点击之后给导航留的等待窗口：真导航在飞就等它落地，静态页面会立刻返回。
 const CLICK_NAV_WAIT: Duration = Duration::from_millis(2_000);
 
+/// `navigate` 等页面 load 事件的上限：卡住的页面不能把工具拖到全局超时。
+const NAV_WAIT: Duration = Duration::from_secs(30);
+
+/// CDP 命令自己超时了（chromiumoxide 的 request_timeout 到点）。这条**不代表动作没做成**：
+/// `Page.navigate` 的回包要等 load 事件，慢页面上命令超时而页面照常到达（真机验证过）。
+fn is_command_timeout(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("request timed out")
+}
+
+/// 选择器被浏览器直接拒绝（语法错）的特征，真机文案是
+/// `Error -32000: DOM Error while querying`。
+///
+/// 跟"页面上确实没有这个元素"是两回事：语法错每次都是同一句，轮询 8 秒不会它变成找得到，
+/// 而报成 "Element not found" 会把调用方推去重试、改 URL，而不是改选择器
+/// （现场：模型写了非 CSS 的 `a:contains('设置')`，8 秒后收到一句"元素不存在"）。
+fn is_invalid_selector(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("dom error while querying")
+        || e.contains("invalid selector")
+        || e.contains("syntaxcssselectorerror")
+        || e.contains("failed to execute 'queryselectorall'")
+}
+
+/// 选择器失败的两种结局要分开说：一个是"去改你的选择器"，一个是"页面上真没有"。
+fn selector_error(selector: &str, err: &str) -> String {
+    if is_invalid_selector(err) {
+        format!(
+            "Invalid CSS selector '{}' (the browser rejected it: {}). Text matching like \
+             ':contains(\"设置\")' is not CSS: locate it with execute_js instead, e.g. \
+             [...document.querySelectorAll('a')].map((e,i)=>i+':'+e.textContent).join('\\n'), \
+             then click it by index or pass a real CSS selector.",
+            selector, err
+        )
+    } else {
+        format!("Element not found '{}': {}", selector, err)
+    }
+}
+
 /// 一次调用内的时间戳后缀。原来只到秒，同一秒里两张截图会互相覆盖。
 fn stamp() -> String {
     let now = chrono::Local::now();
@@ -157,8 +195,13 @@ async fn find_element_wait(page: &Page, selector: &str) -> Result<Element, Strin
         match page.find_element(selector).await {
             Ok(elem) => return Ok(elem),
             Err(e) => {
+                let err = e.to_string();
+                // 被浏览器直接拒绝的选择器不值得等：8 秒后还是同一句话。
+                if is_invalid_selector(&err) {
+                    return Err(err);
+                }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(e.to_string());
+                    return Err(err);
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1024,10 +1067,14 @@ impl Tool for BrowserCdpTool {
          counted but cannot be driven; take its url and 'navigate' instead. 'close' releases only \
          your page (and keeps the window in visible mode); a browser nobody holds gets shut down on its own.\n\
          Selectors are waited for (up to 8s), so 'Element not found' means the element really is \
-         absent, not 'not rendered yet'. Long texts come back capped: continue with 'offset' (see \
+         absent, not 'not rendered yet'; a selector the browser rejects comes back at once as \
+         'Invalid CSS selector' (text matching like ':contains(..)' is not CSS - use execute_js). \
+         Long texts come back capped: continue with 'offset' (see \
          'next_offset'), or open 'full_text_path', which holds the whole page.\n\
          Actions:\n\
-         - 'navigate': Go to a URL on our page. Provide 'url'. Reports 'loaded'.\n\
+         - 'navigate': Go to a URL on our page. Provide 'url'. Reports the browser's own 'url' \
+           (after any redirect) plus 'loaded'. 'loaded': false means the page is still arriving \
+           (or never finishes) - read what is there instead of sending 'navigate' again.\n\
          - 'get_text': Get page text or element text. Optional 'selector' (CSS), 'offset', 'max_chars'.\n\
          - 'click': Click an element. Provide 'selector' (CSS). Reports 'navigated' and the new 'url'.\n\
          - 'type_text': Type into an element. Provide 'selector' and 'text'.\n\
@@ -1231,50 +1278,90 @@ impl BrowserCdpTool {
         let page = self.session.get_or_init(key).await
             .map_err(|e| -> crate::error::AgentError { e.into() })?;
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-        let max_chars = (args["max_chars"].as_u64().unwrap_or(0) as usize)
-            .min(max_text_len)
-            .max(1)
-            .min(max_text_len);
+        // 没传 max_chars（或传了 0）= 用上下文额度那么多个字符。这里原先写成
+        // `.min(max_text_len).max(1)`，把"没传"变成"只要 1 个字符"：get_text / get_html /
+        // execute_js 三个动作的默认行为一起废掉（现场日志 execute_js 回来
+        // `result: "\""、total_chars: 476`，模型据此认为页面是空的）。
+        let asked = args["max_chars"].as_u64().unwrap_or(0) as usize;
+        let max_chars = if asked == 0 { max_text_len } else { asked.min(max_text_len) };
 
         match action {
             "navigate" => {
                 let url = args["url"].as_str()
                     .ok_or_else(|| "Missing 'url' for navigate".to_string())?;
-                page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+                // `Page.navigate` 的回包要等到 load 事件，所以慢页面（SPA 长轮询、挂着不写完
+                // 的流）会让这条命令在 30s 后报 "Request timed out." —— 而**导航其实已经落地**。
+                // 真机：本地一台故意永不发完 body 的服务器上，goto 30.007s 超时，紧接着
+                // page.url()/get_title() 已经是目标页。当时我们把它当失败，调用方连着重发 4 次
+                // navigate（每次 30s），最后一轮 get_url 显示页面早就到了。所以超时不是失败。
+                let mut loaded = true;
+                let mut in_flight = false;
+                match page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
                     url: url.to_string(),
                     referrer: None,
                     transition_type: None,
                     frame_id: None,
                     referrer_policy: None,
-                }).await
-                    .map_err(|e| format!("Navigate failed: {}", e))?;
-                // Wait for the page load event with a 30s cap — stalled pages must not
-                // hang the tool until the global tool timeout.
-                let mut loaded = true;
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    page.wait_for_navigation(),
-                ).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => return Err(format!("Navigation wait failed: {}", e).into()),
-                    Err(_) => {
+                }).await {
+                    Ok(_) => {}
+                    Err(e) if is_command_timeout(&e.to_string()) => {
+                        in_flight = true;
                         loaded = false;
-                        warn!("Browser CDP: navigation wait timed out after 30s, continuing");
+                        warn!(
+                            "Browser CDP: Page.navigate got no reply within {}s (page still loading); \
+                             reporting the page as it is instead of failing",
+                            chromiumoxide::handler::REQUEST_TIMEOUT / 1000
+                        );
+                    }
+                    Err(e) => return Err(format!("Navigate failed: {}", e).into()),
+                }
+                // 命令回來了才去等 load 事件（没回源必还没 load 完，再等 30s 只是翻倍卡用户）。
+                if !in_flight {
+                    match tokio::time::timeout(NAV_WAIT, page.wait_for_navigation()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => return Err(format!("Navigation wait failed: {}", e).into()),
+                        Err(_) => {
+                            loaded = false;
+                            warn!(
+                                "Browser CDP: navigation wait timed out after {}s, continuing",
+                                NAV_WAIT.as_secs()
+                            );
+                        }
                     }
                 }
                 let title = page.get_title().await
                     .map_err(|e| format!("Get title failed: {}", e))?
                     .unwrap_or_default();
+                // 报回来的 url 以浏览器的说法为准（句柄自己的说法优先，CDP 兜底）：请求里那个
+                // url 可能被重定向、也可能根本没落地，回显请求值就是骗调用方。兜底那次查询要
+                // 拿会话锁 + 一趟 CDP，所以只在句柄的说法是空时才走。
+                let where_now = match page.url().await.ok().flatten() {
+                    Some(u) if !u.is_empty() => u,
+                    _ => self
+                        .session
+                        .page_info(key)
+                        .await
+                        .map(|(u, _)| u)
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| url.to_string()),
+                };
                 let (tabs, _) = self.session.page_counts().await;
                 let mut out = json!({
                     "success": true,
                     "action": "navigate",
-                    "url": url,
+                    "url": where_now,
                     "title": title,
                     // 没等到底就返回时必须是 false：只 warn 进日志的话，结果里看起来
                     // 和"页面加载完成"一模一样，模型会当成已就绪去取内容。
                     "loaded": loaded
                 });
+                if in_flight {
+                    out["note"] = json!(
+                        "the page is still loading (it has not fired 'load'); what you can read now is \
+                         partial. Do NOT re-send 'navigate' for this - read what is there, or come back \
+                         after it settles."
+                    );
+                }
                 if tabs > 1 { out["tab_count"] = json!(tabs); }
                 Ok(out)
             }
@@ -1282,7 +1369,7 @@ impl BrowserCdpTool {
             "get_text" => {
                 let text = if let Some(selector) = args["selector"].as_str() {
                     let elem = find_element_wait(&page, selector).await
-                        .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+                        .map_err(|e| selector_error(selector, &e))?;
                     elem.inner_text().await
                         .map_err(|e| format!("Get text failed: {}", e))?
                         .unwrap_or_default()
@@ -1310,7 +1397,7 @@ impl BrowserCdpTool {
                 let selector = args["selector"].as_str()
                     .ok_or_else(|| "Missing 'selector' for click".to_string())?;
                 let elem = find_element_wait(&page, selector).await
-                    .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+                    .map_err(|e| selector_error(selector, &e))?;
                 let before = page.url().await.ok().flatten().unwrap_or_default();
                 elem.click().await
                     .map_err(|e| format!("Click failed: {}", e))?;
@@ -1337,7 +1424,7 @@ impl BrowserCdpTool {
                 let text = args["text"].as_str()
                     .ok_or_else(|| "Missing 'text' for type_text".to_string())?;
                 let elem = find_element_wait(&page, selector).await
-                    .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+                    .map_err(|e| selector_error(selector, &e))?;
                 elem.click().await
                     .map_err(|e| format!("Click (focus) failed: {}", e))?;
                 elem.type_str(text).await
@@ -1392,7 +1479,7 @@ impl BrowserCdpTool {
             "get_html" => {
                 let html = if let Some(selector) = args["selector"].as_str() {
                     let elem = find_element_wait(&page, selector).await
-                        .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+                        .map_err(|e| selector_error(selector, &e))?;
                     elem.inner_html().await
                         .map_err(|e| format!("Get HTML failed: {}", e))?
                         .unwrap_or_default()
@@ -1458,7 +1545,7 @@ impl BrowserCdpTool {
                 let selector = args["selector"].as_str()
                     .ok_or_else(|| "Missing 'selector' for find_element".to_string())?;
                 let elem = find_element_wait(&page, selector).await
-                    .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+                    .map_err(|e| selector_error(selector, &e))?;
                 let attrs = elem.attributes().await
                     .map_err(|e| format!("Get attributes failed: {}", e))?;
                 let text = elem.inner_text().await
@@ -1628,6 +1715,169 @@ mod tests {
         .unwrap_or(false);
         assert!(gone, "the adopted browser was still listening 15s after close");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 超时/语法错/确实没有，三种失败必须分得开（真机文案钉在这里）。
+    #[test]
+    fn a_timeout_or_a_rejected_selector_is_not_reported_as_a_missing_element() {
+        assert!(is_command_timeout("Request timed out."));
+        assert!(!is_command_timeout("net::ERR_NAME_NOT_RESOLVED"));
+
+        assert!(is_invalid_selector("Error -32000: DOM Error while querying"));
+        assert!(!is_invalid_selector("error code: -32000, message: No node with given id found"));
+
+        let rejected = selector_error("a:contains('设置')", "Error -32000: DOM Error while querying");
+        assert!(rejected.starts_with("Invalid CSS selector"), "{rejected}");
+        assert!(rejected.contains("execute_js"), "要给出下走路: {rejected}");
+        let missing = selector_error("#nope", "No node with given id found");
+        assert!(missing.starts_with("Element not found"), "{missing}");
+    }
+
+    /// 真机回归，两条都是被现场日志证实过的：
+    /// ① 页面永远加载不完时 `Page.navigate` 30s 超时，可导航其实已经落地 —— 旧代码把它报成
+    ///   失败，调用方连发 4 次 navigate（每次 30s，共两分钟），最后一轮 get_url 显示页面早到了；
+    /// ② 非法选择器不该等满 8 秒，更不该被报成"元素不存在"（现场那句是 `a:contains('设置')`）。
+    #[tokio::test]
+    #[ignore = "launches a real browser against a stalling local server"]
+    async fn a_still_loading_page_and_a_bad_selector_both_report_the_truth() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let body = "<html><head><title>partial</title></head><body>ARRIVED";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                body.len() + 4096
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.flush();
+            // body 永不写完：load 事件不会来，Page.navigate 的回包也就一直不回来
+            std::thread::sleep(Duration::from_secs(90));
+        });
+
+        let tmp = std::env::temp_dir().join(format!("foxir_stall_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = tmp.join("output");
+        let out_dir = out.to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        s.get_or_init("a").await.expect("launch");
+
+        let t = Instant::now();
+        let v = tool
+            .execute_action(
+                "navigate",
+                &json!({ "url": format!("http://{}/hang", addr) }),
+                &out_dir,
+                20_000,
+                "a",
+            )
+            .await
+            .expect("a page that is merely still loading is not a failed navigate");
+        println!("stalled navigate: {:?} -> {}", t.elapsed(), v);
+        assert_eq!(v["loaded"], json!(false), "还在加载必须标出来: {v}");
+        assert!(
+            v["url"].as_str().is_some_and(|u| u.ends_with("/hang")),
+            "要报浏览器实际到达的地方: {v}"
+        );
+        assert!(v.get("note").is_some(), "还要告诉调用方别重发 navigate: {v}");
+
+        let t = Instant::now();
+        let e = tool
+            .execute_action(
+                "find_element",
+                &json!({ "selector": "a:contains('设置')" }),
+                &out_dir,
+                20_000,
+                "a",
+            )
+            .await
+            .expect_err("an invalid selector must fail");
+        let msg = e.to_string();
+        println!("invalid selector: {:?} -> {}", t.elapsed(), msg);
+        assert!(t.elapsed() < Duration::from_secs(3), "语法错不该把 8s 轮询走完: {msg}");
+        assert!(msg.contains("Invalid CSS selector"), "{msg}");
+        assert!(msg.contains("execute_js"), "要给出可执行的下走路: {msg}");
+
+        let e2 = tool
+            .execute_action(
+                "find_element",
+                &json!({ "selector": "#no-such-el-9f3a" }),
+                &out_dir,
+                20_000,
+                "a",
+            )
+            .await
+            .expect_err("a missing element must fail");
+        let msg2 = e2.to_string();
+        println!("missing element -> {}", msg2);
+        assert!(msg2.contains("Element not found"), "确实没有的要照旧: {msg2}");
+        assert!(!msg2.contains("Invalid CSS"), "别和语法错混在一起: {msg2}");
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机回归：**不传 max_chars** 时必须拿到上下文额度那么多个字，不是 1 个字符。
+    ///
+    /// 旧写法 `(args["max_chars"].unwrap_or(0)).min(budget).max(1)` 把"没传"算成"要 1 个"，
+    /// get_text / get_html / execute_js 三个动作的默认返回一起被削成一个引号；单元测试抓不到，
+    /// 因为它只测 `slice_text`，而这个错发生在参数装配那一行。
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn a_call_without_max_chars_gets_the_budget_not_one_character() {
+        let tmp = std::env::temp_dir().join(format!("foxir_maxc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out_dir = tmp.join("output").to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        let page = s.get_or_init("a").await.expect("launch");
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: "data:text/html,<body>alpha beta gamma delta epsilon</body>".to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .expect("data url");
+
+        let whole = tool
+            .execute_action("get_text", &json!({}), &out_dir, 15_000, "a")
+            .await
+            .expect("get_text without max_chars");
+        println!("default get_text -> {}", whole);
+        assert!(
+            whole["text"].as_str().is_some_and(|t| t.contains("gamma")),
+            "默认额度下应该拿到正文: {whole}"
+        );
+        assert_eq!(whole["truncated"], json!(false), "{whole}");
+
+        // 显式只要 1 个字符时才走截断 + 续读那套
+        let one = tool
+            .execute_action("get_text", &json!({ "max_chars": 1 }), &out_dir, 15_000, "a")
+            .await
+            .expect("get_text with max_chars");
+        println!("max_chars=1 get_text -> {}", one);
+        assert_eq!(one["text"].as_str().unwrap().chars().count(), 1, "{one}");
+        assert_eq!(one["truncated"], json!(true), "{one}");
+        assert!(one["next_offset"].is_number(), "要能续读: {one}");
+
+        // 超过额度的请求被夹到额度上，不能当成"不限制"
+        let greedy = tool
+            .execute_action("get_text", &json!({ "max_chars": 5 }), &out_dir, 3, "a")
+            .await
+            .expect("capped get_text");
+        assert_eq!(greedy["text"].as_str().unwrap().chars().count(), 3, "{greedy}");
+
+        s.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
