@@ -106,6 +106,9 @@ async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
             .launch_timeout(std::time::Duration::from_secs(
                 super::browser_launch::LAUNCH_WAIT_SECS,
             ))
+            // 与共享会话同一套单条命令上限（库里默认 30s）：渲染进程一时不就绪，
+            // 不该把一次导出拖成几分钟
+            .request_timeout(super::browser_cdp::CMD_TIMEOUT)
             .build()
             .map_err(|e| format!("Failed to build browser config: {}", e))?
     ).await {

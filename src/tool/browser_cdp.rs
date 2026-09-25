@@ -60,6 +60,35 @@ const CLICK_NAV_WAIT: Duration = Duration::from_millis(2_000);
 /// `navigate` 等页面 load 事件的上限：卡住的页面不能把工具拖到全局超时。
 const NAV_WAIT: Duration = Duration::from_secs(30);
 
+/// 单条 CDP 命令的上限。库里默认 30s，而"点了一个会跳转的链接"之后的每条命令都要等
+/// 目标文档就绪 —— 于是三条命令叠成 90s+（真机量到一次 click 动作 181s、一次工具 click
+/// 动作 10 分钟没返回）。压到 15s：正常页面用不到，卡住的页面早点说出"不知道"。
+pub(crate) const CMD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 动作发出去之后那些"顺便读一下"的读取（url、页数）自己的上限。它们失败不是动作失败，
+/// 宁可回一句"不知道"，也不能把等待叠在已经卡住的渲染进程后面。
+const POST_READ: Duration = Duration::from_secs(4);
+
+/// 点击"送出去"的等待上限。
+///
+/// 为什么必须有这一层：`Element::click()` 是 scroll_into_view + clickable_point +
+/// `Input.dispatchMouseEvent`。真机实测前两步 1–250ms，而**点了会跳转的链接之后第三条命令
+/// 永远不回**（20s 探针 unanswered；导航把 CDP 会话拆了，回包丢了，要等库的超时清扫才报错，
+/// 一次动作能叠成 181s，工具的 click 动作甚至 10 分钟不返回）。事件其实已经送出去了，
+/// 所以我们自己夹时间：到点就按"已送达、结果未知"返回，不陪它等。
+const CLICK_DELIVERED: Duration = Duration::from_secs(5);
+
+/// 输入命令的回执上限：输入本身比点击慢（逐字派发），但页面卡住时也不该陪它等满库默认。
+const TYPE_DELIVERED: Duration = Duration::from_secs(10);
+
+/// 读一下页面现在的 url；读不到就是"不知道"（None），不报错、不等满命令超时。
+async fn url_now(page: &Page) -> Option<String> {
+    match tokio::time::timeout(POST_READ, page.url()).await {
+        Ok(Ok(u)) => u.filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
 /// CDP 命令自己超时了（chromiumoxide 的 request_timeout 到点）。这条**不代表动作没做成**：
 /// `Page.navigate` 的回包要等 load 事件，慢页面上命令超时而页面照常到达（真机验证过）。
 fn is_command_timeout(err: &str) -> bool {
@@ -789,6 +818,7 @@ impl BrowserSession {
             .chrome_executable(&chosen.path)
             .user_data_dir(&self.profile_dir)
             .launch_timeout(Duration::from_secs(browser_launch::LAUNCH_WAIT_SECS))
+            .request_timeout(CMD_TIMEOUT)
             .arg("no-startup-window")
             .viewport(chromiumoxide::handler::viewport::Viewport {
                 width: 1920,
@@ -1076,7 +1106,9 @@ impl Tool for BrowserCdpTool {
            (after any redirect) plus 'loaded'. 'loaded': false means the page is still arriving \
            (or never finishes) - read what is there instead of sending 'navigate' again.\n\
          - 'get_text': Get page text or element text. Optional 'selector' (CSS), 'offset', 'max_chars'.\n\
-         - 'click': Click an element. Provide 'selector' (CSS). Reports 'navigated' and the new 'url'.\n\
+         - 'click': Click an element. Provide 'selector' (CSS). \
+           Reports 'navigated' (true/false, or \"unknown\" when the page is still busy — then \
+           re-read with 'get_url' instead of clicking again) and the new 'url'.\n\
          - 'type_text': Type into an element. Provide 'selector' and 'text'.\n\
          - 'screenshot': Take a screenshot; 'full_page' captures the whole scrollable page.\n\
          - 'get_url': Get our page's URL and title.\n\
@@ -1329,15 +1361,18 @@ impl BrowserCdpTool {
                         }
                     }
                 }
-                let title = page.get_title().await
-                    .map_err(|e| format!("Get title failed: {}", e))?
+                let title = tokio::time::timeout(POST_READ, page.get_title())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
                     .unwrap_or_default();
                 // 报回来的 url 以浏览器的说法为准（句柄自己的说法优先，CDP 兜底）：请求里那个
                 // url 可能被重定向、也可能根本没落地，回显请求值就是骗调用方。兜底那次查询要
                 // 拿会话锁 + 一趟 CDP，所以只在句柄的说法是空时才走。
-                let where_now = match page.url().await.ok().flatten() {
-                    Some(u) if !u.is_empty() => u,
-                    _ => self
+                let where_now = match url_now(&page).await {
+                    Some(u) => u,
+                    None => self
                         .session
                         .page_info(key)
                         .await
@@ -1398,22 +1433,53 @@ impl BrowserCdpTool {
                     .ok_or_else(|| "Missing 'selector' for click".to_string())?;
                 let elem = find_element_wait(&page, selector).await
                     .map_err(|e| selector_error(selector, &e))?;
-                let before = page.url().await.ok().flatten().unwrap_or_default();
-                elem.click().await
-                    .map_err(|e| format!("Click failed: {}", e))?;
+                let before = url_now(&page).await;
+                // `Element::click()` = scroll_into_view + clickable_point + dispatchMouseEvent，
+                // 三条命令。点了会跳转的链接之后，目标文档没就绪前这些命令都不会回包 ——
+                // 库里每条的默认超时 30s，于是动作叠成几分钟（真机：181s；单次工具 click 十分钟未返回）。
+                // 超时在这里不代表没点到：事件多半已经送出去了，只是回包赶不上。
+                let click_outcome = match tokio::time::timeout(CLICK_DELIVERED, elem.click()).await {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) if is_command_timeout(&e.to_string()) => Err(e.to_string()),
+                    Ok(Err(e)) => return Err(format!("Click failed: {}", e).into()),
+                    // 命令送出去了、回包等不到 —— 十有八九是这一跳把页面带走了
+                    Err(_) => Err("unanswered".to_string()),
+                };
+                if let Err(why) = &click_outcome {
+                    warn!(
+                        "Browser CDP: click command not answered within {}s ({why}) — the page is probably navigating",
+                        CLICK_DELIVERED.as_secs()
+                    );
+                }
                 // 点击可能触发导航。`wait_for_navigation` 在页面已经加载完时会立刻返回
                 // （handler 先查 frame.is_loaded()），所以这里只在真有导航在飞时等；
                 // 等不等得到都不报错——下一动的 selector 轮询会接住慢页面。
                 let _ = tokio::time::timeout(CLICK_NAV_WAIT, page.wait_for_navigation()).await;
-                let after = page.url().await.ok().flatten().unwrap_or_default();
-                let (tabs, _) = self.session.page_counts().await;
+                let after = url_now(&page).await;
+                let (tabs, _) = match tokio::time::timeout(POST_READ, self.session.page_counts()).await {
+                    Ok(v) => v,
+                    Err(_) => (0, 0),
+                };
                 let mut out = json!({
                     "success": true,
                     "action": "click",
                     "selector": selector,
-                    "navigated": before != after,
-                    "url": after
+                    "url": after.clone().unwrap_or_default()
                 });
+                // `navigated` 只在两次 url 都读得到的时候是布尔；读不到就说 unknown，
+                // 不把"读失败"混成"没跳转"或"跳了"。
+                match (&before, &after) {
+                    (Some(b), Some(a)) => out["navigated"] = json!(a != b),
+                    _ => {
+                        out["navigated"] = json!("unknown");
+                        out["note"] = json!(format!(
+                            "the click was sent but the page did not answer within the read window \
+                             (the click itself {} answered), so it is probably navigating — call \
+                             'get_url' or 'snapshot' before the next action, and do NOT click again",
+                            if click_outcome.is_ok() { "did" } else { "never" }
+                        ));
+                    }
+                }
                 if tabs > 1 { out["tab_count"] = json!(tabs); }
                 Ok(out)
             }
@@ -1425,16 +1491,27 @@ impl BrowserCdpTool {
                     .ok_or_else(|| "Missing 'text' for type_text".to_string())?;
                 let elem = find_element_wait(&page, selector).await
                     .map_err(|e| selector_error(selector, &e))?;
-                elem.click().await
-                    .map_err(|e| format!("Click (focus) failed: {}", e))?;
-                elem.type_str(text).await
-                    .map_err(|e| format!("Type failed: {}", e))?;
-                Ok(json!({
+                // 聚焦这一击和逐字输入同样可能被页面跳转吞掉回包（见 CLICK_DELIVERED），
+                // 不能硬等：送出去就算送出，用 confirmed 说清有没有得到回执。
+                let _ = tokio::time::timeout(CLICK_DELIVERED, elem.click()).await;
+                let confirmed = matches!(
+                    tokio::time::timeout(TYPE_DELIVERED, elem.type_str(text)).await,
+                    Ok(Ok(_))
+                );
+                let mut out = json!({
                     "success": true,
                     "action": "type_text",
                     "selector": selector,
-                    "typed": text
-                }))
+                    "typed": text,
+                    "confirmed": confirmed
+                });
+                if !confirmed {
+                    out["note"] = json!(
+                        "the keystrokes were sent but the page never answered (it is probably \
+                         navigating) — verify with 'get_text' before typing again, do not repeat blindly"
+                    );
+                }
+                Ok(out)
             }
 
             "screenshot" => {
@@ -1876,6 +1953,364 @@ mod tests {
             .await
             .expect("capped get_text");
         assert_eq!(greedy["text"].as_str().unwrap().chars().count(), 3, "{greedy}");
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A/B 基准（跑完保留，`#[ignore]`）：CSS 选择器路线 vs 数字索引路线，
+    /// 在同一批页面上量"能寻址的比例 + 每步耗时"。
+    ///
+    /// CSS 那一侧的天花板是结构性的：CSS 无法表达"按可见文本点这个"，而模型想做的正是这件事
+    /// （现场：`a:contains('设置')`）。所以统计每个可见交互元素有没有 id / name / href 可当把手。
+    #[tokio::test]
+    #[ignore = "visits real web pages and benchmarks both addressing styles"]
+    async fn ab_selector_vs_index() {
+        const STATS: &str = r#"(() => {
+  const SEL='a[href],button,input,select,textarea,[onclick],[role],[tabindex],summary,label';
+  const vis=el=>{const r=el.getBoundingClientRect();const s=getComputedStyle(el);
+    return r.width>1&&r.height>1&&s.visibility!=='hidden'&&s.display!=='none';};
+  const all=[...document.querySelectorAll(SEL)]; const nodes=all.filter(vis);
+  let wid=0,wn=0,wh=0; const labels={};
+  nodes.forEach((el,i)=>{
+    if(el.id) wid++;
+    if(el.name) wn++;
+    if(el.tagName.toLowerCase()==='a'&&el.getAttribute('href')) wh++;
+    el.dataset.fx=i;
+    const t=((el.innerText||el.value||el.getAttribute('aria-label')||el.getAttribute('placeholder')||'').replace(/\s+/g,' ').trim()).slice(0,40);
+    if(t) labels[t]=(labels[t]||0)+1;
+  });
+  const dup=Object.values(labels).filter(v=>v>1).length;
+  return JSON.stringify({visible:nodes.length,with_id:wid,with_name:wn,with_href:wh,dup_labels:dup,
+    total_matched:all.length});
+})()"#;
+
+        let big_page = String::from(
+            "data:text/html,<body><script>for(let i=0;i<300;i++){let b=document.createElement('button');\
+             b.textContent='按钮 '+i;document.body.appendChild(b);}</script></body>",
+        );
+
+        let tmp = std::env::temp_dir().join(format!("foxir_ab_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let page = s.get_or_init("a").await.expect("launch");
+
+        for url in [
+            "https://example.com/",
+            "https://www.baidu.com/",
+            "https://mail.126.com/",
+            big_page.as_str(),
+        ] {
+            let t = Instant::now();
+            let goto = page
+                .goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+                    url: url.to_string(),
+                    referrer: None,
+                    transition_type: None,
+                    frame_id: None,
+                    referrer_policy: None,
+                })
+                .await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), page.wait_for_navigation()).await;
+            let nav_ms = t.elapsed().as_millis();
+            if goto.is_err() {
+                println!("AB {url}: navigate failed ({goto:?}) — skipped");
+                continue;
+            }
+
+            let t = Instant::now();
+            let r = page.evaluate_expression(STATS).await.expect("stats");
+            let stats_ms = t.elapsed().as_millis();
+            let v: Value = r
+                .value()
+                .cloned()
+                .and_then(|x| serde_json::from_str(x.as_str().unwrap_or("{}")).ok())
+                .unwrap_or(Value::Null);
+
+            // 索引路线：解析 `[data-fx="N"]` 并读一次属性（= click 的同一前置）
+            let target = v["visible"].as_u64().unwrap_or(1).saturating_sub(1) as usize;
+            let t = Instant::now();
+            let mut by_index_ok = false;
+            if let Ok(el) = page
+                .find_element(&format!("[data-fx=\"{target}\"]"))
+                .await
+            {
+                by_index_ok = el.attribute("data-fx").await.is_ok();
+            }
+            let index_ms = t.elapsed().as_millis();
+
+            // CSS 路线的常见写法：`:contains()`（非法）/ `nth-of-type`（合法但按文本无从下手）
+            let t = Instant::now();
+            let bad = page.find_element("a:contains('设置')").await;
+            let bad_ms = t.elapsed().as_millis();
+            let t = Instant::now();
+            let nth = page.find_element("button:nth-of-type(137)").await;
+            let nth_ms = t.elapsed().as_millis();
+
+            println!(
+                "AB {url} | nav={nav_ms}ms stats={stats_ms}ms(visible={}/{}, id={} name={} href={} dupText={}) \
+                 indexClickPrep={}ms ok={} | invalidSelector={}ms ok={} | nthOfType={}ms ok={}",
+                v["visible"],
+                v["total_matched"],
+                v["with_id"],
+                v["with_name"],
+                v["with_href"],
+                v["dup_labels"],
+                index_ms,
+                by_index_ok,
+                bad_ms,
+                bad.is_ok(),
+                nth_ms,
+                nth.is_ok()
+            );
+        }
+
+        // 索引过期时是哪一种错：导航后 [data-fx] 还在不在（决定"过期"能不能靠查询兜住）
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: "https://example.com/".to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .ok();
+        let _ = tokio::time::timeout(Duration::from_secs(3), page.wait_for_navigation()).await;
+        let stale = page.find_element("[data-fx=\"99999\"]").await;
+        println!(
+            "AB stale-index after navigation: ok={} err={:?}",
+            stale.is_ok(),
+            stale.err().map(|e| e.to_string())
+        );
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 端到端 A/B（跑完保留，`#[ignore]`）：同一个任务"点到文字为 X 的元素"，
+    /// A = 今天的真实走法（看文本 → 猜 CSS → 失败 → execute_js 遍历 → JS 里点），
+    /// B = 索引走法（snapshot → click index）。只计工具侧耗时/往返/字节，
+    /// 模型往返那一维另算（用今天日志里 iteration 的实测均时长）。
+    ///
+    /// 用的时候注意两点：B 侧是**模拟**（真正的 `snapshot` 动作还没做），而且 A 侧点的是
+    /// JS `el.click()`、B 侧点的是 `Element::click()` —— 后者在会跳转的链接上要等一个永不
+    /// 回来的回包（见 `CLICK_DELIVERED`），所以耗时只在同一原语的干净样本上可比。
+    #[tokio::test]
+    #[ignore = "visits real web pages and times both flows end to end"]
+    async fn ab_end_to_end_task() {
+        // 今天日志里模型实际写过的两种选择器，和它兜底用的那段遍历 JS
+        const ENUMERATE: &str = r#"(() => {
+  const SEL='a[href],button,input,select,textarea,[onclick],[role],[tabindex]';
+  const vis=el=>{const r=el.getBoundingClientRect();const s=getComputedStyle(el);
+    return r.width>1&&r.height>1&&s.visibility!=='hidden'&&s.display!=='none';};
+  return [...document.querySelectorAll(SEL)].filter(vis).map((el,i)=>{
+    const t=((el.innerText||el.value||el.getAttribute('aria-label')||el.getAttribute('placeholder')||'').replace(/\s+/g,' ').trim()).slice(0,40);
+    return i+':'+el.tagName.toLowerCase()+' '+t;}).join('\n');
+})()"#;
+        const SNAPSHOT: &str = r#"(() => {
+  const SEL='a[href],button,input,select,textarea,[onclick],[role],[tabindex]';
+  const vis=el=>{const r=el.getBoundingClientRect();const s=getComputedStyle(el);
+    return r.width>1&&r.height>1&&s.visibility!=='hidden'&&s.display!=='none';};
+  return [...document.querySelectorAll(SEL)].filter(vis).map((el,i)=>{
+    el.dataset.fx=i;
+    const tag=el.tagName.toLowerCase();
+    const type=el.getAttribute('type')||'';
+    const t=((el.innerText||el.value||el.getAttribute('aria-label')||el.getAttribute('placeholder')||'').replace(/\s+/g,' ').trim()).slice(0,60);
+    return '['+i+']<'+tag+(type?' type='+type:'')+(t?' '+t:'')+'/>';}).join('\n');
+})()"#;
+
+        let big = String::from(
+            "data:text/html,<body><script>for(let i=0;i<300;i++){let b=document.createElement('button');\
+             b.textContent='按钮 '+i;document.body.appendChild(b);}</script></body>",
+        );
+
+        let tmp = std::env::temp_dir().join(format!("foxir_ab2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let page = s.get_or_init("a").await.expect("launch");
+
+        for (url, want, css_guess) in [
+            ("https://www.baidu.com/", "hao123", "a:contains('hao123')"),
+            ("https://mail.126.com/", "VIP", "a:contains('VIP')"),
+            (big.as_str(), "按钮 137", "button:nth-of-type(137)"),
+        ] {
+            let nav = page
+                .goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+                    url: url.to_string(),
+                    referrer: None,
+                    transition_type: None,
+                    frame_id: None,
+                    referrer_policy: None,
+                })
+                .await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), page.wait_for_navigation()).await;
+            if nav.is_err() {
+                println!("AB2 {url} skipped (nav err)");
+                continue;
+            }
+
+            // ---------- A：今天的走法 ----------
+            let t = Instant::now();
+            let mut a_ms = 0u128;
+            let mut a_rt = 0usize;
+            let mut a_chars = 0usize;
+            let mut a_fail = 0usize;
+
+            // 1) 先看页面文字（get_text 的默认路径）
+            let r = page.evaluate_expression("document.body.innerText").await;
+            a_rt += 1;
+            a_chars += r.ok().and_then(|x| x.value().cloned().and_then(|v| v.as_str().map(str::len))).unwrap_or(0);
+            // 2) 猜一个 CSS（文本选择器）
+            let g = page.find_element(css_guess).await;
+            a_rt += 1;
+            if g.is_err() { a_fail += 1; }
+            // 3) 兜底：JS 遍历元素列表（今天日志里模型真做了三次）
+            let e = page.evaluate_expression(ENUMERATE).await;
+            a_rt += 1;
+            a_chars += e.ok().and_then(|x| x.value().cloned().and_then(|v| v.as_str().map(str::len))).unwrap_or(0);
+            // 4) 再猜一次真选择器（按 href 猜，通常猜不到）
+            let g2 = page.find_element("a[href=\"__nope__\"]").await;
+            a_rt += 1;
+            if g2.is_err() { a_fail += 1; }
+            // 5) 最后在 JS 里按文本点掉
+            let js_click = format!(
+                "(() => {{const el=[...document.querySelectorAll('a,button')].find(e=>((e.innerText||'').trim())==='{want}');\
+                 if(!el) return 'MISS'; el.click(); return 'OK';}})()"
+            );
+            let c = page.evaluate_expression(&js_click).await;
+            a_rt += 1;
+            let a_clicked = c.ok().and_then(|x| x.value().cloned()).map(|v| v.as_str().unwrap_or("") == "OK").unwrap_or(false);
+            a_ms = t.elapsed().as_millis();
+
+            // ---------- B：索引走法 ----------
+            let t = Instant::now();
+            let mut b_rt = 0usize;
+            let mut b_chars = 0usize;
+            let snap = page.evaluate_expression(SNAPSHOT).await;
+            b_rt += 1;
+            let snap_text = snap.ok().and_then(|x| x.value().cloned()).and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            b_chars += snap_text.len();
+            // 从快照里按文本找到编号（这一步是"模型读快照"的替身，不算往返）
+            let idx = snap_text
+                .lines()
+                .find(|l| l.contains(want))
+                .and_then(|l| l.trim_start_matches('[').split(']').next().and_then(|n| n.parse::<usize>().ok()));
+            let mut b_clicked = false;
+            if let Some(i) = idx {
+                if let Ok(el) = page.find_element(&format!("[data-fx=\"{i}\"]")).await {
+                    b_rt += 1;
+                    b_clicked = el.click().await.is_ok();
+                    b_rt += 1;
+                }
+            }
+            let b_ms = t.elapsed().as_millis();
+
+            println!(
+                "AB2 {url}\n   A(今天) {:>6}ms 往返={} 失败={} 字节={:>6} 点中={}\n   B(索引) {:>6}ms 往返={} 失败=0 字节={:>6} 点中={}",
+                a_ms, a_rt, a_fail, a_chars, a_clicked,
+                b_ms, b_rt, b_chars, b_clicked
+            );
+        }
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归：点了会跳转的链接之后，click 动作必须在有界时间内返回。每一步单独打印，便于看出是谁在等回包。
+    #[tokio::test]
+    #[ignore = "clicks a real link and times every step"]
+    async fn a_click_that_triggers_navigation_returns_in_bounded_time() {
+        let tmp = std::env::temp_dir().join(format!("foxir_wht_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out_dir = tmp.join("output").to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        let page = s.get_or_init("a").await.expect("launch");
+        let ms = |t: Instant| t.elapsed().as_millis();
+
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: "https://www.baidu.com/".to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .ok();
+        let _ = tokio::time::timeout(Duration::from_secs(3), page.wait_for_navigation()).await;
+
+        // 1) 只读：解析一个存在的元素，不点
+        let t = Instant::now();
+        let found = page.find_element("a[href*='news']").await;
+        println!("STEP find(no click) {}ms ok={}", ms(t), found.is_ok());
+
+        // 2) Element::click() 的三步拆开计时（click = scroll_into_view + clickable_point + tab.click）
+        if found.is_ok() {
+            let el = found.unwrap();
+            let t = Instant::now();
+            let scrolled = el.scroll_into_view().await;
+            println!("STEP scroll_into_view {}ms ok={}", ms(t), scrolled.is_ok());
+            if let Ok(el2) = scrolled {
+                let t = Instant::now();
+                let pt = el2.clickable_point().await;
+                println!("STEP clickable_point {}ms ok={}", ms(t), pt.is_ok());
+            }
+            let t = Instant::now();
+            let c = el.click().await;
+            println!("STEP Element::click() 整体 {}ms ok={}", ms(t), c.is_ok());
+        }
+        let t = Instant::now();
+        let w = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
+        println!("STEP wait_for_navigation {}ms timed_out={}", ms(t), w.is_err());
+
+        // 4) 逐步加硬超时，把"谁在挂"问出来（上面已经点过一次，页面此刻正在跳转）
+        let t = Instant::now();
+        let re = tokio::time::timeout(Duration::from_secs(20), s.get_or_init("a")).await;
+        println!("PROBE get_or_init {}ms answered={}", ms(t), re.is_ok());
+        if let Ok(Ok(p2)) = re {
+            let t = Instant::now();
+            let f = tokio::time::timeout(Duration::from_secs(20), p2.find_element("a[href*='news']")).await;
+            println!("PROBE find_element {}ms answered={}", ms(t), f.is_ok());
+            if let Ok(Ok(el)) = f {
+                let t = Instant::now();
+                let c = tokio::time::timeout(Duration::from_secs(20), el.click()).await;
+                println!("PROBE click {}ms answered={}", ms(t), c.is_ok());
+            }
+        }
+        let t = Instant::now();
+        let pc = tokio::time::timeout(Duration::from_secs(20), s.page_counts()).await;
+        println!("PROBE page_counts {}ms answered={:?}", ms(t), pc.map(|(a, b)| (a, b)));
+
+        // 5) 我们工具的 click 动作：必须在有界时间内返回（回归断言）
+        let t = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(25),
+            tool.execute_action("click", &json!({ "selector": "a[href*='news']" }), &out_dir, 15_000, "a"),
+        )
+        .await;
+        let (answered, val) = match r {
+            Ok(Ok(v)) => (true, Some(v)),
+            Ok(Err(e)) => {
+                panic!("click action returned an error after {}ms: {e}", ms(t));
+            }
+            Err(_) => (false, None),
+        };
+        println!(
+            "STEP tool click action {}ms answered={} -> {}",
+            ms(t),
+            answered,
+            val.clone().map(|v| v.to_string()).unwrap_or_default()
+        );
+        assert!(
+            answered,
+            "点了会跳转的链接之后，click 动作不能陪浏览器等回包（真机旧行为：10 分钟不返回）"
+        );
+        let v = val.unwrap();
+        assert_eq!(v["success"], json!(true), "{v}");
+        assert!(
+            v["navigated"].is_boolean() || v["navigated"] == json!("unknown"),
+            "读不到就要说 unknown，不能硬判: {v}"
+        );
 
         s.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
