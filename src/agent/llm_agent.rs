@@ -972,8 +972,8 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
              page; a page the site opens is counted but not drivable - `navigate` brings its url over), \
              plus `probe` (reports which browser executable was detected and the session state, without launching). \
              Runs hidden by default; Settings can enable a visible window for a one-time interactive login. \
-             It drives its own persistent browser profile kept in the local application-data directory \
-             (one per workspace, never inside the case directory), so a site signed into once \
+             It drives its own persistent browser profile inside the case directory (one per \
+             workspace), so a site signed into once \
              stays signed in for later sessions; using it needs no extra authorization or confirmation. \
              If a page fails to load or a launch error mentions the profile, call `probe` first and pass its \
              findings to the user instead of retrying blindly. \

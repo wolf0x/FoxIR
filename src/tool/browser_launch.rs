@@ -404,6 +404,24 @@ pub fn describe_profile(dir: &Path) -> String {
     }
 }
 
+/// Chromium 的"立刻退出、一声不吭"签名。
+///
+/// 用同一个 user-data-dir 起第二个实例时，它把请求转交给活着的那个然后以 0 退出，
+/// 不写 stderr——于是 DevTools 端点永远不出现。这和"真的起不来"在原始报错上长得几乎
+/// 一样，处理方向却相反（一个要等/要清残留进程，另一个要换可执行文件），所以必须点名。
+fn silent_immediate_exit(raw: &str) -> bool {
+    let low = raw.to_ascii_lowercase();
+    if !low.contains("before websocket url could be resolved") {
+        return false;
+    }
+    match low.rsplit_once("stderr:") {
+        // 空 stderr 才是这个签名。有内容时 Chromium 已经自己说明了原因（profile 被锁、
+        // 沙箱起不来、缺 dll），这条诊断不能盖在它上面。
+        Some((_, tail)) => tail.trim().trim_matches('"').trim().is_empty(),
+        None => true,
+    }
+}
+
 /// Compose the actionable launch-failure message.
 ///
 /// The distinguishing question on a machine where the browser "fails to
@@ -439,11 +457,31 @@ pub fn describe_failure(ctx: &LaunchContext, raw_error: &str, waited_secs: u64) 
         ));
     }
     s.push_str(&format!("\n  raw error: {}", raw_error.trim()));
-    s.push_str("\n  Likely causes, in order: (1) a previous browser instance is still \
-        shutting down and holds the profile — close any leftover msedge/chrome windows \
-        or switch this agent to a visible window once; (2) the browser is installed \
-        somewhere auto-detection does not look — set the explicit path in Settings; \
-        (3) the installed browser is too old to expose the DevTools endpoint — update it.");
+    // 通用清单排在"报错本身已经说明是哪一条"之后：一条把方向指错的提示，比没有提示更贵。
+    if silent_immediate_exit(raw_error) {
+        s.push_str(&format!(
+            "\n  Diagnosis: the process exited immediately and wrote nothing to stderr — that is the \
+            single-instance handoff. Another browser instance already owns {} ({}), took the request, \
+            and the copy we launched quit. The executable itself is fine.",
+            ctx.profile_dir.display(),
+            if ctx.headless { "headless" } else { "visible window" }
+        ));
+        s.push_str("\n  What to do: (1) close the leftover msedge/chrome window or process that uses \
+            this profile and retry; (2) if it is mid-shutdown, retry in a few seconds — this agent now \
+            waits for its own browser to exit before re-launching; (3) do not switch browsers, this is \
+            not a missing-or-old executable.");
+    } else {
+        s.push_str("\n  Likely causes, in order: (1) a previous browser instance is still \
+            shutting down and holds the profile — close any leftover msedge/chrome windows \
+            or switch this agent to a visible window once; (2) the browser is installed \
+            somewhere auto-detection does not look — set the explicit path in Settings; \
+            (3) the installed browser is too old to expose the DevTools endpoint — update it.");
+    }
+    // 这条不是修饰：上一次失败后模型照着"close any leftover window"自己去 shell_exec
+    // 拉起 edge --headless --screenshot，把证据写到了案件目录之外。修复动作属于人，
+    // 不属于这一轮 run。
+    s.push_str("\n  Do not work around this by launching a browser yourself: report that the \
+        built-in browser is unavailable and continue without it.");
     s
 }
 
@@ -567,6 +605,40 @@ mod tests {
         assert!(msg.contains("(missing)"), "profile state must be reported: {msg}");
         assert!(msg.contains("20s"), "wait budget must be visible: {msg}");
         assert!(msg.contains("previous browser instance"), "must list the top cause: {msg}");
+    }
+
+    /// 现场那次"一直起不来"的原始报错：进程以 0 退出、stderr 为空。
+    /// 通用清单会把人先引向"换个浏览器"，方向正好相反，所以这条必须点名。
+    #[test]
+    fn a_silent_exit_0_is_named_as_the_single_instance_handoff() {
+        let ctx = LaunchContext {
+            chosen: Some(Candidate { path: p(r"C:\Edge\msedge.exe"), source: Source::WellKnown }),
+            tried: vec![],
+            profile_dir: PathBuf::from(r"C:\case\.browser_profile"),
+            headless: true,
+        };
+        for raw in [
+            "Browser process exited with status ExitStatus(ExitStatus(0)) before websocket URL could be resolved, stderr: \"\"",
+            // 我们自己日志里被截断的样子（引号没收住），同一个意思
+            "browser exited with status: ExitStatus(0) before websocket URL could be resolved, stderr: \"",
+        ] {
+            let msg = describe_failure(&ctx, raw, 0);
+            assert!(msg.contains("single-instance handoff"), "{msg}");
+            assert!(msg.contains(".browser_profile"), "要点名被谁占着: {msg}");
+            assert!(msg.contains("do not switch browsers"), "{msg}");
+            assert!(msg.contains("Do not work around this"), "不许模型自己拉浏览器兜底: {msg}");
+            assert!(!msg.contains("Likely causes"), "不该再给通用清单: {msg}");
+        }
+
+        // 反过来：stderr 有内容 / 只是超时，仍然走通用清单
+        let loud = describe_failure(
+            &ctx,
+            "Browser process exited with status ExitStatus(21) before websocket URL could be resolved, stderr: \"Gtk-WARNING\"",
+            0,
+        );
+        assert!(!loud.contains("handoff"), "{loud}");
+        assert!(loud.contains("Likely causes"), "{loud}");
+        assert!(loud.contains("Do not work around this"), "{loud}");
     }
 
     #[test]

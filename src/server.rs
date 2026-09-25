@@ -3383,7 +3383,7 @@ async fn tools_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         json!({
             "key": "browser_cdp",
             "name": "Web Browser",
-            "description": "browser_cdp: navigate, screenshot, extract page content, run JS, one page per agent in one shared browser (`list_tabs` also counts pages the site opened itself). Uses its own persistent profile in the local application-data directory, one per workspace.",
+            "description": "browser_cdp: navigate, screenshot, extract page content, run JS, one page per agent in one shared browser (`list_tabs` also counts pages the site opened itself). Uses its own persistent profile inside the case directory, one per workspace.",
             "enabled": state.browser_enabled.load(Ordering::SeqCst),
             "on_label": "Enabled",
             "off_label": "Disabled (unregistered)",

@@ -28,7 +28,6 @@ use chromiumoxide::cdp::browser_protocol::target::{GetTargetsParams, TargetId, T
 use chromiumoxide::page::Page;
 use chromiumoxide::Element;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +103,22 @@ fn display_url(path: &Path, workspace_dir: &str) -> String {
         }
     }
     path.to_string_lossy().to_string()
+}
+
+/// 截图落在哪：**永远**是这一轮 run 的 output 目录，调用方给的 `path` 只取文件名。
+///
+/// 证据去哪儿由 `ToolContext::output_dir()` 说了算，不由模型传参说了算：传
+/// `C:\workspace\output\x.png` 这种绝对路径也只留 `x.png`。否则一次跑完，截图会散在
+/// 案件目录之外——既进不了证据包，`/workspace/*` 也服务不到它。
+fn screenshot_target(output_dir: &str, requested: Option<&str>) -> PathBuf {
+    let fallback = format!("screenshot_{}.png", stamp());
+    let name = requested
+        .map(PathBuf::from)
+        .and_then(|pb| pb.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or(fallback);
+    let dir = PathBuf::from(output_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(name)
 }
 
 /// `page.content()` 是原始 HTML：script / style / 注释 / 内联 base64 常常占掉大半，
@@ -285,7 +300,7 @@ pub struct BrowserSession {
     inner: Mutex<Option<BrowserInner>>,
     workspace_dir: String,
     /// 持久浏览器 profile：跨启动保留，登录态就住在这里，绝不删除。
-    /// 位置由 `default_profile_dir` 决定（在 workspace 之外），测试可用
+    /// 位置由 `default_profile_dir` 决定（就在 case 目录里），测试可用
     /// `with_profile_dir` 指到临时目录。
     profile_dir: PathBuf,
     /// 无头开关（Settings 热更）。true = 无头（缺省）。
@@ -300,65 +315,14 @@ pub struct BrowserSession {
     generation: Arc<AtomicU64>,
 }
 
-/// 浏览器 profile 的缺省位置：`<本地应用数据目录>/FoxIR/browser_profiles/<案名>-<hash8>`
-/// （Windows 即 `%LOCALAPPDATA%`，Linux 即 `$XDG_DATA_HOME`）。
+/// 浏览器 profile 的位置：**就在 case 目录里** —— `<workspace>/.browser_profile`。
 ///
-/// 不能放在 workspace 里，两个理由：
-/// 1. `/workspace/{*path}` 是免鉴权的静态文件路由（只防 traversal），而 profile 里装的是
-///    登录后的 cookie —— 放在里面等于把凭据挂在一个可读目录上；
-/// 2. case 目录要被打包、移交，profile 跟进去就是证据包里夹带活凭据。
-///
-/// 末尾的 hash 让每个 workspace 各拿一份目录：Chromium 的单实例互斥按 user-data-dir
-/// 划分，两个案子共用一份 profile 会直接起不来。取 canonical 路径做 hash，所以同一个
-/// 目录写成 `g:/x` 或 `G:\X` 都落在这一个 profile 上。
+/// 这是有意的取舍：FoxIR 是单机本机工具，不把它当网络暴露面来设计，于是换来三个实在好处：
+/// 案件目录自包含（拷走案子就带着登录态）、删案即清、出问题时运维直接在 case 目录里能看到它。
+/// 每个 workspace 一份也必须成立——Chromium 的单实例互斥按 user-data-dir 划分，
+/// 两个案子共用一份 profile 会直接起不来。
 pub fn default_profile_dir(workspace_dir: &str) -> PathBuf {
-    let canonical = std::fs::canonicalize(workspace_dir)
-        .unwrap_or_else(|_| PathBuf::from(workspace_dir));
-    let base = dirs_next::data_local_dir().unwrap_or_else(std::env::temp_dir);
-    let label: String = canonical
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "case".to_string())
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .take(24)
-        .collect();
-    let label = if label.is_empty() { "case".to_string() } else { label };
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let suffix: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
-    base.join("FoxIR")
-        .join("browser_profiles")
-        .join(format!("{label}-{suffix}"))
-}
-
-/// 旧版本把 profile 建在 workspace 里（`<workspace>/.browser_profile`），第一次启动时
-/// 搬到新位置，登录态跟着走。搬不动（最常见是跨盘）只警告，旧目录原样留着——绝不删。
-fn migrate_legacy_profile(workspace_dir: &str, profile_dir: &Path) {
-    let legacy = PathBuf::from(workspace_dir).join(".browser_profile");
-    if !legacy.is_dir() || profile_dir.exists() {
-        return;
-    }
-    let Some(parent) = profile_dir.parent() else { return };
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        warn!("Browser CDP: cannot create {}: {}", parent.display(), e);
-        return;
-    }
-    match std::fs::rename(&legacy, profile_dir) {
-        Ok(()) => info!(
-            "Browser CDP: moved the browser profile {} -> {}",
-            legacy.display(),
-            profile_dir.display()
-        ),
-        Err(e) => warn!(
-            "Browser CDP: an old in-workspace profile exists at {} but could not be moved ({}); \
-             leaving it in place, so the new profile at {} starts logged out.",
-            legacy.display(),
-            e,
-            profile_dir.display()
-        ),
-    }
+    PathBuf::from(workspace_dir).join(".browser_profile")
 }
 
 impl BrowserSession {
@@ -373,8 +337,7 @@ impl BrowserSession {
         Self::with_profile_dir(workspace_dir, headless, executable_override, profile_dir)
     }
 
-    /// 指定 profile 目录的构造器。`new` 之外还要一个，是因为测试不能往
-    /// `%LOCALAPPDATA%` 里种真实 profile。
+    /// 指定 profile 目录的构造器：测试要能把 profile 圈在自己的临时目录里。
     pub(crate) fn with_profile_dir(
         workspace_dir: String,
         headless: Arc<AtomicBool>,
@@ -447,8 +410,15 @@ impl BrowserSession {
     async fn lock_ready(&self, key: &str) -> Result<MutexGuard<'_, Option<BrowserInner>>, String> {
         let mut guard = self.inner.lock().await;
         if !self.is_alive() || guard.is_none() {
-            // Slow path: clear stale state and (re-)launch while holding the lock
-            guard.take();
+            // Slow path. `is_alive()==false` only means the handler stream ended — the
+            // child can still be draining and holding the profile directory, so this is
+            // the one place a plain `guard.take()` (drop without waiting) reintroduces
+            // the failure this whole handshake exists to kill: the re-launch sees the
+            // dir still owned, hands the request to the dying instance and exits 0.
+            // Lock stays held across the handshake, so nobody launches in between.
+            if let Some(inner) = guard.take() {
+                shutdown_browser(inner.browser).await;
+            }
             self.launch_locked(&mut guard, key).await?;
         }
         Ok(guard)
@@ -618,7 +588,6 @@ impl BrowserSession {
             headless
         );
 
-        migrate_legacy_profile(&self.workspace_dir, &self.profile_dir);
         if let Err(e) = std::fs::create_dir_all(&self.profile_dir) {
             warn!(
                 "Browser CDP: cannot create profile dir {}: {}",
@@ -880,8 +849,8 @@ impl Tool for BrowserCdpTool {
         "Browser automation via CDP (Chrome DevTools Protocol). \
          Runs hidden by default (no visible window); a visible window can be enabled in Settings. \
          Use this for: screenshots, web scraping, checking URLs, extracting page content. \
-         It drives its own browser profile kept in the local application-data directory \
-         (one per workspace), so it does not start with the cookies of an everyday browser; \
+         It drives its own browser profile inside the case directory (one per workspace), so it \
+         does not start with the cookies of an everyday browser; \
          a site signed into once in this profile stays signed in for later sessions.\n\
          A login that needs a password, 2FA or a QR scan must be done once in the \
          visible-window mode available in Settings; headless runs then inherit that state.\n\
@@ -1206,20 +1175,7 @@ impl BrowserCdpTool {
             }
 
             "screenshot" => {
-                let filename = format!("screenshot_{}.png", stamp());
-                // Always save into the run's output dir — if the caller provides 'path',
-                // only use its file_name component (discard any directory portion).
-                let file_name = if let Some(p) = args["path"].as_str() {
-                    let pb = PathBuf::from(p);
-                    pb.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or(filename)
-                } else {
-                    filename
-                };
-                let out = PathBuf::from(output_dir);
-                let _ = std::fs::create_dir_all(&out);
-                let path = out.join(&file_name);
+                let path = screenshot_target(output_dir, args["path"].as_str());
                 let params = CaptureScreenshotParams {
                     format: Some(CaptureScreenshotFormat::Png),
                     capture_beyond_viewport: args["full_page"].as_bool().filter(|b| *b).map(|_| true),
@@ -1363,8 +1319,7 @@ impl BrowserCdpTool {
 mod tests {
     use super::*;
 
-    /// 测试专用：profile 显式指到 workspace 里面的临时目录，绝不往
-    /// `%LOCALAPPDATA%` 里种真实 profile（那是 `default_profile_dir` 的去处）。
+    /// 测试专用：profile 指到被测 workspace 下的临时目录，不碰真实 profile。
     fn session_in(dir: &str, headless: bool) -> Arc<BrowserSession> {
         BrowserSession::with_profile_dir(
             dir.to_string(),
@@ -1389,11 +1344,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// profile 不能再住在 workspace 里：`/workspace/{*path}` 是免鉴权的静态文件路由，
-    /// 而 profile 里装的是登录后的 cookie；case 目录本身还要打包、移交。
-    /// 同时每个 workspace 必须各拿一份目录——Chromium 的单实例互斥按 user-data-dir 划分。
+    /// profile 就在 case 目录里（本机工具，不做网络暴露面设计）：案件目录自包含、
+    /// 拷走案子带着登录态、删案即清。但每个 workspace 必须各拿一份目录——Chromium 的
+    /// 单实例互斥按 user-data-dir 划分，两个案子共用一份会直接起不来。
     #[test]
-    fn each_workspace_gets_its_own_profile_outside_itself() {
+    fn profile_lives_in_the_case_dir_and_is_per_case() {
         let base = std::env::temp_dir().join(format!("foxir_ws_{}", std::process::id()));
         let case_a = base.join("case-a");
         let case_b = base.join("case-b");
@@ -1402,17 +1357,12 @@ mod tests {
 
         let a = default_profile_dir(&case_a.to_string_lossy());
         let b = default_profile_dir(&case_b.to_string_lossy());
-        assert!(!a.starts_with(&case_a), "profile must live outside the workspace: {a:?}");
-        assert_ne!(a, b, "two cases must not share one user-data-dir");
-        assert!(a.to_string_lossy().contains("browser_profiles"), "{a:?}");
-        assert!(
-            a.file_name().unwrap().to_string_lossy().starts_with("case-a-"),
-            "the directory name must still say which case it belongs to: {a:?}"
-        );
+        assert_eq!(a, case_a.join(".browser_profile"), "profile 要跟着案子走: {a:?}");
+        assert_ne!(a, b, "两个案子不能共用一份 user-data-dir");
         assert_eq!(
             a,
             default_profile_dir(&case_a.to_string_lossy()),
-            "the same workspace must resolve to the same profile across restarts"
+            "同一个 workspace 每次都要解析到同一份 profile（登录态才留得住）"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1424,10 +1374,7 @@ mod tests {
         let first = default_profile_dir(&absent.to_string_lossy());
         let second = default_profile_dir(&absent.to_string_lossy());
         assert_eq!(first, second);
-        assert!(
-            first.file_name().unwrap().to_string_lossy().starts_with("foxir_absent_"),
-            "{first:?}"
-        );
+        assert_eq!(first.file_name().unwrap(), ".browser_profile", "{first:?}");
     }
 
 
@@ -1463,6 +1410,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    /// 模型传进来的是绝对路径也不能把截图带出案件目录。
+    ///
+    /// 现场那次是 `shell_exec` 绕开本工具写到 `C:\workspace\output`，但本工具自己这条
+    /// 路径必须守得住：证据散在案件目录之外就进不了证据包，也服务不出去。
+    #[test]
+    fn a_screenshot_never_leaves_the_runs_output_dir() {
+        let ws = std::env::temp_dir().join(format!("foxir_shot_{}", std::process::id()));
+        let out = ws.join("output");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        for asked in [
+            r"C:\workspace\output\baidu_home.png",
+            "../../Windows/temp/evil.png",
+            "/etc/passwd.png",
+        ] {
+            let p = screenshot_target(&out.to_string_lossy(), Some(asked));
+            assert_eq!(p.parent().unwrap(), out, "{asked} -> {p:?}");
+            assert!(p.to_string_lossy().ends_with(".png"), "{asked} -> {p:?}");
+        }
+
+        // 纯目录参数没有文件名 → 回落到自动命名；不传 path 也一样
+        for asked in ["..", "output/", ""] {
+            let p = screenshot_target(&out.to_string_lossy(), Some(asked));
+            assert_eq!(p.parent().unwrap(), out, "{asked} -> {p:?}");
+        }
+        let auto = screenshot_target(&out.to_string_lossy(), None);
+        assert_eq!(auto.parent().unwrap(), out, "{auto:?}");
+        std::fs::write(&auto, b"png").unwrap();
+        let url = display_url(&auto, &ws.to_string_lossy()).replace('\\', "/");
+        assert!(url.starts_with("/workspace/output/screenshot_"), "{url}");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
