@@ -411,15 +411,22 @@ pub fn describe_profile(dir: &Path) -> String {
 /// 一样，处理方向却相反（一个要等/要清残留进程，另一个要换可执行文件），所以必须点名。
 fn silent_immediate_exit(raw: &str) -> bool {
     let low = raw.to_ascii_lowercase();
-    if !low.contains("before websocket url could be resolved") {
+    let handoff_phase = low.contains("before websocket url could be resolved")
+        || low.contains("while resolving websocket url from browser process");
+    if !handoff_phase {
         return false;
     }
-    match low.rsplit_once("stderr:") {
-        // 空 stderr 才是这个签名。有内容时 Chromium 已经自己说明了原因（profile 被锁、
-        // 沙箱起不来、缺 dll），这条诊断不能盖在它上面。
-        Some((_, tail)) => tail.trim().trim_matches('"').trim().is_empty(),
-        None => true,
-    }
+    // 空 stderr 才是这个签名。有内容时 Chromium 已经自己说明了原因（profile 被锁、沙箱
+    // 起不来、缺 dll），这条诊断不能盖在它上面。
+    //
+    // 三种真实形态都要认：库的 Display（`stderr: ""`）、Debug 包了一层类型名
+    // （`stderr: BrowserStderr("")`，运行时日志里的原文）、以及我们自己日志被截断时
+    // 只剩的那个开引号。用包含判断而不是"截到段尾"，因为 LaunchIoError 会把 io 文本
+    // 排在 stderr 之后（`stderr: BrowserStderr(""): unexpected end of stream`）。
+    let empty_stderr = low.contains("stderr: \"\"")
+        || low.contains("stderr: browserstderr(\"\"")
+        || low.trim_end().ends_with("stderr: \"");
+    empty_stderr
 }
 
 /// Compose the actionable launch-failure message.
@@ -466,10 +473,10 @@ pub fn describe_failure(ctx: &LaunchContext, raw_error: &str, waited_secs: u64) 
             ctx.profile_dir.display(),
             if ctx.headless { "headless" } else { "visible window" }
         ));
-        s.push_str("\n  What to do: (1) close the leftover msedge/chrome window or process that uses \
-            this profile and retry; (2) if it is mid-shutdown, retry in a few seconds — this agent now \
-            waits for its own browser to exit before re-launching; (3) do not switch browsers, this is \
-            not a missing-or-old executable.");
+        s.push_str("\n  What to do: (1) this tool already tries to adopt that surviving browser via \
+            <profile>/DevToolsActivePort — if you are reading this, adoption failed, so (2) close the \
+            leftover msedge/chrome process that was started with this --user-data-dir and retry; (3) do \
+            not switch browsers, this is not a missing-or-old executable.");
     } else {
         s.push_str("\n  Likely causes, in order: (1) a previous browser instance is still \
             shutting down and holds the profile — close any leftover msedge/chrome windows \
@@ -617,8 +624,12 @@ mod tests {
             profile_dir: PathBuf::from(r"C:\case\.browser_profile"),
             headless: true,
         };
+        // 后两条是运行时日志里的**原文**（含包装类型名 BrowserStderr("")），
+        // 第一条是库里 Display 的直接形态。
         for raw in [
             "Browser process exited with status ExitStatus(ExitStatus(0)) before websocket URL could be resolved, stderr: \"\"",
+            "Browser process exited with status ExitStatus(ExitStatus(0)) before websocket URL could be resolved, stderr: BrowserStderr(\"\")",
+            "Input/Output error while resolving websocket URL from browser process, stderr: BrowserStderr(\"\"): unexpected end of stream",
             // 我们自己日志里被截断的样子（引号没收住），同一个意思
             "browser exited with status: ExitStatus(0) before websocket URL could be resolved, stderr: \"",
         ] {

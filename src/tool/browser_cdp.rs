@@ -26,7 +26,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
 };
 use chromiumoxide::cdp::browser_protocol::target::{GetTargetsParams, TargetId, TargetInfo};
 use chromiumoxide::page::Page;
-use chromiumoxide::Element;
+use chromiumoxide::{Element, Handler};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,9 @@ use crate::error::AgentResult;
 
 /// 关闭会话时等待浏览器进程真正退出的宽限，超时才强杀。
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// 收养交接浏览器时，一次 CDP 探活的等待上限。
+const ADOPT_WAIT: Duration = Duration::from_secs(4);
 
 /// selector 等待上限。chromiumoxide 0.9 没有 `wait_for_selector`（只有
 /// `wait_for_navigation`），所以"元素还没渲染"只能自己轮询。
@@ -291,6 +294,87 @@ pub(crate) async fn shutdown_browser(mut browser: chromiumoxide::browser::Browse
                 CLOSE_GRACE.as_secs()
             );
             let _ = browser.kill().await;
+        }
+    }
+}
+
+/// `<profile>/DevToolsActivePort` 的首行 = 这台浏览器实际监听的调试端口。
+/// 我们传的是 `--remote-debugging-port=0`（chromiumoxide 的缺省），端口由浏览器自己挑，
+/// 这个文件是唯一能把端口找回来的线索。
+fn parse_devtools_active_port(txt: &str) -> Option<u16> {
+    txt.lines().next().and_then(|l| l.trim().parse().ok())
+}
+
+/// 收养"交接之后真正活下来的那台浏览器"。
+///
+/// 真机证据（Edge 153 + `--no-startup-window`，运行时日志 10:03:42 / 10:03:55）：
+/// `msedge.exe` 的启动进程把请求移交给真正干活的浏览器进程后**自己以 0 退出**，而
+/// chromiumoxide 的 pipe 传输只看见 "Browser process exited with status 0 before
+/// websocket URL could be resolved"。接手的那台浏览器是活的、也在监听 CDP，并且会长期
+/// 占住 user-data-dir —— 于是从这一次之后，**每一次**启动都以同样的方式失败，看起来就
+/// 是"内置浏览器起不来"。
+///
+/// 收养必须验明正身：这个文件在浏览器退出后不会被删，端口号也可能被别的浏览器拿去用。
+/// 接上用户正在浏览的窗口、又在收尾时把它关掉，对取证工具是不可接受的代价。所以要求
+/// 我们这次是无头启动、且端点自报是同一家族的无头浏览器（UA 里有 Headless）。
+/// 可见窗口模式下不收养——那种情况下用户看得见、也关得掉。
+pub(crate) async fn adopt_handoff_browser(
+    profile_dir: &Path,
+    exe: &Path,
+    headless: bool,
+) -> Option<(Browser, Handler)> {
+    if !headless {
+        return None;
+    }
+    let port = std::fs::read_to_string(profile_dir.join("DevToolsActivePort"))
+        .ok()
+        .and_then(|t| parse_devtools_active_port(&t))?;
+    let url = format!("http://127.0.0.1:{}/json/version", port);
+    let client = match reqwest::Client::builder().timeout(ADOPT_WAIT).build() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let info: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+
+    let product = info.get("Browser").and_then(|v| v.as_str()).unwrap_or("");
+    let ua = info.get("User-Agent").and_then(|v| v.as_str()).unwrap_or("");
+    let exe_name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let family_ok = if exe_name.contains("edge") {
+        product.starts_with("Edg/")
+    } else if exe_name.contains("chrome") {
+        product.starts_with("Chrome/")
+    } else {
+        false
+    };
+    if !family_ok || !ua.contains("Headless") {
+        if !product.is_empty() {
+            warn!(
+                "Browser CDP: port {} answered but is not our headless browser ({}), not adopting",
+                port, product
+            );
+        }
+        return None;
+    }
+
+    let ws = info.get("webSocketDebuggerUrl").and_then(|v| v.as_str())?;
+    match tokio::time::timeout(ADOPT_WAIT, Browser::connect(ws)).await {
+        Ok(Ok((browser, handler))) => {
+            info!(
+                "Browser CDP: launcher handed off (exit 0); adopted the live browser on port {} ({})",
+                port, product
+            );
+            Some((browser, handler))
+        }
+        Ok(Err(e)) => {
+            warn!("Browser CDP: adopting {} failed: {}", ws, e);
+            None
+        }
+        Err(_) => {
+            warn!("Browser CDP: adopting {} timed out after {}s", ws, ADOPT_WAIT.as_secs());
+            None
         }
     }
 }
@@ -638,11 +722,20 @@ impl BrowserSession {
         let (browser, mut handler) = match Browser::launch(config).await {
             Ok(v) => v,
             Err(e) => {
-                return Err(self.launch_failed(
-                    diag_ctx,
-                    &format!("{}", e),
-                    started.elapsed().as_secs(),
-                ));
+                // Edge/Chrome 的启动进程可能在把活儿交给真正的浏览器进程后就以 0 退出了
+                // （pipe 传输因此拿不到端点），而那台浏览器活得好好的、还占着 profile。
+                // 先把它接回来，接不回来才算真的启动失败。
+                let raw = format!("{}", e);
+                match adopt_handoff_browser(&self.profile_dir, &chosen.path, headless).await {
+                    Some(v) => v,
+                    None => {
+                        return Err(self.launch_failed(
+                            diag_ctx,
+                            &raw,
+                            started.elapsed().as_secs(),
+                        ));
+                    }
+                }
             }
         };
 
@@ -1342,6 +1435,130 @@ mod tests {
 
         assert!(cookie.exists(), "close() must never delete the persistent profile");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `parse_devtools_active_port` 的形状：首行端口，第二行 ws 路径，可能带 \r\n。
+    #[test]
+    fn devtools_active_port_is_parsed_from_the_first_line() {
+        assert_eq!(parse_devtools_active_port("12129\n/devtools/browser/fdc592aa"), Some(12129));
+        assert_eq!(parse_devtools_active_port("9333\r\n"), Some(9333));
+        assert_eq!(parse_devtools_active_port(""), None);
+        assert_eq!(parse_devtools_active_port("not-a-port\n/x"), None);
+        // 端口必须能塞进 u16：>65535 的垃圾不该被当成端点
+        assert_eq!(parse_devtools_active_port("70000\n/x"), None);
+    }
+
+    /// 真机回归：profile 被**另一个还活着的浏览器**占着时（现场就是 Edge 的启动进程把请求
+    /// 交给真正干活的浏览器进程后自己以 0 退出，chromiumoxide 的 pipe 只看到 exit 0），
+    /// 我们必须把那一台接回来继续干活，而不是每次都失败。
+    ///
+    /// 这条测试自己造那个状态：先手工起一台无头浏览器占住一个临时 profile，再让
+    /// BrowserSession 用同一个 profile 起，走 launch 失败 → 收养这条路径。
+    #[tokio::test]
+    #[ignore = "launches two real browsers to reproduce the launcher handoff"]
+    async fn a_profile_owned_by_a_live_browser_is_adopted_not_refused() {
+        let tag = format!("foxir_adopt_{}_{}", std::process::id(), stamp());
+        let tmp = std::env::temp_dir().join(&tag);
+        let profile = tmp.join(".browser_profile");
+        std::fs::create_dir_all(&profile).unwrap();
+
+        let exe = browser_launch::discover("")
+            .chosen
+            .map(|c| c.path)
+            .expect("this test needs a browser installed");
+        // 故意用 std::process::Command 起第一台：它不是 chromiumoxide 的孩子，
+        // 也不会被我们的 Drop 回收 —— 就是现场那个"活着的占位者"。
+        let _first = std::process::Command::new(&exe)
+            .arg("--headless")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--remote-debugging-port=0")
+            // Chromium 只认 `--switch=value` 这种带等号的形式；分成两个参数时它会
+            // 把路径当成位置参数，profile 就落到别处去了（真机踩过一次，测试因此空跑）。
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .spawn()
+            .expect("spawn the first browser");
+
+        let port = wait_for_devtools_port(&profile).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let seen: Value = client
+            .get(format!("http://127.0.0.1:{}/json/version", port))
+            .send()
+            .await
+            .expect("first browser must serve /json/version")
+            .json()
+            .await
+            .unwrap();
+        println!(
+            "leftover browser: {} on port {}",
+            seen["Browser"], port
+        );
+
+        // 第二台（我们的工具）：profile 已被占，launch 必然以交接的方式失败，
+        // 失败路径应当收养上面那一台，而不是把错误抛给调用方。
+        let s = BrowserSession::with_profile_dir(
+            tmp.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(String::new())),
+            profile.clone(),
+        );
+        let page = s
+            .get_or_init("a")
+            .await
+            .expect("adopting the live browser must beat 'launch failed'");
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: "data:text/html,<title>adopted</title>".to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .expect("a command over the adopted connection must work");
+        let st = s.status(Some("a")).await;
+        println!(
+            "after adoption: running={} pages={} our_page={}",
+            st["running"], st["pages_in_browser"], st["url"].as_str().unwrap_or("?")
+        );
+        assert_eq!(st["running"], json!(true));
+
+        // 收尾：收养来的那台没有子进程句柄，close() 走 CDP Browser.close 把它带走。
+        s.close().await.unwrap();
+        let gone = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let ok = client
+                    .get(format!("http://127.0.0.1:{}/json/version", port))
+                    .send()
+                    .await
+                    .is_ok();
+                if !ok {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(gone, "the adopted browser was still listening 15s after close");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 等第一台浏览器把端口写进 profile（`--remote-debugging-port=0` 下由它自己挑）。
+    async fn wait_for_devtools_port(profile: &Path) -> u16 {
+        for _ in 0..60 {
+            if let Ok(txt) = std::fs::read_to_string(profile.join("DevToolsActivePort")) {
+                if let Some(p) = parse_devtools_active_port(&txt) {
+                    return p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("the first browser never wrote DevToolsActivePort");
     }
 
     /// profile 就在 case 目录里（本机工具，不做网络暴露面设计）：案件目录自包含、

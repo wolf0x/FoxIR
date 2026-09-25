@@ -98,7 +98,7 @@ async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
     };
     let _ = std::fs::create_dir_all(&profile_dir);
 
-    let (browser, mut handler) = Browser::launch(
+    let (browser, mut handler) = match Browser::launch(
         BrowserConfig::builder()
             .no_sandbox()
             .chrome_executable(&chosen.path)
@@ -108,7 +108,14 @@ async fn render_to_pdf_standalone(html_content: &str) -> AgentResult<Vec<u8>> {
             ))
             .build()
             .map_err(|e| format!("Failed to build browser config: {}", e))?
-    ).await.map_err(|e| format!("Failed to launch browser: {}", e))?;
+    ).await {
+        Ok(v) => v,
+        // 固定的临时 profile 目录同样会撞上"上一个实例还占着目录"的那次交接；
+        // 那台浏览器是活的，接过来用比报"Failed to launch browser"好。
+        Err(e) => browser_cdp::adopt_handoff_browser(&profile_dir, &chosen.path, true)
+            .await
+            .ok_or_else(|| format!("Failed to launch browser: {}", e))?,
+    };
 
     // Spawn handler to process browser events
     tokio::spawn(async move {
