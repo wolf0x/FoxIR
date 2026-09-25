@@ -968,7 +968,8 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
         // 只会让模型去调一个不存在的工具，白烧轮次还会给用户编出“浏览器坏了”的理由。
         let browser_line = if self.browser_enabled.load(std::sync::atomic::Ordering::SeqCst) {
             "  - `browser_cdp` — Browser automation via CDP: navigate, screenshot, get text/HTML, execute JS, \
-             one page per agent inside one shared browser (sub-agents never navigate each other's \
+             one page per agent inside one shared browser, one page per chat session while a \
+             visible window is open (sub-agents never navigate each other's \
              page; a page the site opens is counted but not drivable - `navigate` brings its url over), \
              plus `probe` (reports which browser executable was detected and the session state, without launching). \
              Runs hidden by default; Settings can enable a visible window for a one-time interactive login. \

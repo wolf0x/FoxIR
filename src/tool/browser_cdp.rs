@@ -12,12 +12,15 @@
 //! - `find_element`: Find element and return its attributes
 //! - `list_tabs`: read-only inventory of every page the browser has
 //! - `probe`: Report which browser would be used + current session state
-//! - `close`: Close the browser session
+//! - `close`: Release this agent's page (the browser itself stays; in visible-window mode the
+//!   window is deliberately left for the user)
 //!
 //! One page per caller: each agent (main session or sub-agent) gets its own page inside
 //! one shared browser process, so nobody can navigate somebody else's page. Pages opened
 //! by a site are counted but not drivable (chromiumoxide 0.9 gives no reliable handle for
 //! a target we did not create) — bring the URL back with `navigate` instead.
+//! In visible-window mode the key is the *chat session* instead: the human is looking at
+//! one window, and one new tab per turn buries the page they are signing into.
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -544,6 +547,25 @@ impl BrowserSession {
         Ok(inner.claim(key, page))
     }
 
+    /// 现在设置里是"可见窗口"吗（不是"活着的这台浏览器"的模式，那个在 `BrowserInner` 里）。
+    pub(crate) fn visible_window(&self) -> bool {
+        !self.headless.load(Ordering::Relaxed)
+    }
+
+    /// 该用哪个 key 去拿页。
+    ///
+    /// 无头（默认）：按调用者分片，一个 agent 一页，互不干扰。
+    /// 可见窗口模式：按**会话**收敏 —— 那个窗口是人正在看的那扇，每轮对话再开一个标签，
+    /// 人就得以"刚才那个标签是哪个"的方式去找自己登录到一半的页面（真机反馈：每次操作都
+    /// 多一个 tab）。同一个人对同一扇窗口的操作本来就是串行的。
+    pub(crate) fn page_key(&self, session_id: &str, invocation_id: &str) -> String {
+        if self.headless.load(Ordering::Relaxed) || session_id.is_empty() {
+            invocation_id.to_string()
+        } else {
+            format!("window:{session_id}")
+        }
+    }
+
     /// 一个 agent 结束（或显式 `close`）：只交回自己那一页，绝不动别人的，也不关浏览器。
     /// 可见窗口模式下连页都不交回 —— 那一页就是人正在用的窗口。
     pub async fn release(&self, key: &str) {
@@ -555,6 +577,11 @@ impl BrowserSession {
             // 这个模式的存在意义就是"人来登一次"，所以窗口归人自己关，或显式调 `close`。
             return;
         }
+        Self::close_page_locked(inner, key).await;
+    }
+
+    /// 关掉 `key` 那一页。这一页必须是我们自己创建的（见 `OwnedPage`）。
+    async fn close_page_locked(inner: &mut BrowserInner, key: &str) {
         if let Some(owned) = inner.take_page(key) {
             // 这一页是我们自己创建的，句柄也是自己拿的那个，关它是安全的路径；
             // 不可靠的是"按 target id 现取句柄再驱动"（见 `OwnedPage`）。
@@ -847,8 +874,13 @@ impl BrowserSession {
     }
 
     /// 导出结束，交回那一页。
+    /// `ir_report` 导完 PDF 交回它那一页。这一页跟人在看的窗口无关，可见窗口模式下**也**要关，
+    /// 否则每导一次就多留一个标签页。
     pub async fn release_scratch(&self, key: &str) {
-        self.release(key).await;
+        let mut guard = self.inner.lock().await;
+        if let Some(inner) = guard.as_mut() {
+            Self::close_page_locked(inner, key).await;
+        }
     }
 
     /// 列出"我这一页 + 浏览器里还有几页"（`list_tabs` 动作，只读）。
@@ -985,10 +1017,12 @@ impl Tool for BrowserCdpTool {
          signing in there and stop - the page stays open when your run ends, and you must not `close` it.\n\
          One page per caller: this tool keeps its own page for each agent (main session or \
          sub-agent) inside one shared browser, so concurrent agents never navigate each other's \
-         page while the signed-in profile stays shared. 'list_tabs' shows your page plus how many \
+         page while the signed-in profile stays shared. In visible-window mode it is one page per \
+         chat session instead - the human watches one window, and a new tab every turn buries the \
+         page they are signing into. 'list_tabs' shows your page plus how many \
          pages exist - other agents' urls are deliberately not listed. A page the site opens is \
          counted but cannot be driven; take its url and 'navigate' instead. 'close' releases only \
-         your page; a browser nobody holds gets shut down on its own.\n\
+         your page (and keeps the window in visible mode); a browser nobody holds gets shut down on its own.\n\
          Selectors are waited for (up to 8s), so 'Element not found' means the element really is \
          absent, not 'not rendered yet'. Long texts come back capped: continue with 'offset' (see \
          'next_offset'), or open 'full_text_path', which holds the whole page.\n\
@@ -1005,7 +1039,8 @@ impl Tool for BrowserCdpTool {
          - 'list_tabs': Your page (url, title) plus how many pages exist and how many we own.\n\
          - 'probe': Report the detected browser executable, mode, page list and session state \
            without launching anything. Use it first when a launch fails.\n\
-         - 'close': Close the browser session."
+         - 'close': Release our page and leave the browser running for the other agents (visible
+           mode: the window is left open for the user to sign in or close)."
     }
 
     fn is_builtin(&self) -> bool { true }
@@ -1069,8 +1104,10 @@ impl Tool for BrowserCdpTool {
         let action = args["action"].as_str()
             .ok_or_else(|| "Missing 'action'".to_string())?;
         // 状态按调用者分片：一个 agent（父会话或某个子代理）拥有自己那一页，
-        // 谁结束都不影响别人。
-        let key = ctx.base.base.invocation_id.clone();
+        // 谁结束都不影响别人。可见窗口模式例外 —— 见 `page_key`。
+        let key = self
+            .session
+            .page_key(&ctx.base.base.session_id, &ctx.base.base.invocation_id);
 
         // Probe does not need (and must not trigger) a browser launch
         if action == "probe" {
@@ -1090,10 +1127,20 @@ impl Tool for BrowserCdpTool {
         // 进程退出来收。
         if action == "close" {
             self.session.release(&key).await;
+            let msg = if self.session.visible_window() {
+                "The window stays open on purpose: in visible-window mode that page is the \
+                 user's (closing it would end the login they are typing into). The user closes \
+                 the window, or turns off 'Browser: Visible Window' in Settings."
+                    .to_string()
+            } else {
+                "Released this agent's page; the browser itself stays for other sessions and is \
+                 shut down once nothing holds a page for long enough"
+                    .to_string()
+            };
             return Ok(json!({
                 "success": true,
                 "action": "close",
-                "message": "Released this agent's page; the browser itself stays for other                             sessions and is shut down when it has been idle"
+                "message": msg
             }));
         }
 
@@ -1639,6 +1686,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 无头按调用分片；可见窗口按会话收敏（否则每轮对话多一个标签页）；
+    /// 拿不到 session id 的路径（`ToolContext::simple`）退回按调用，不给它编一个。
+    #[test]
+    fn page_key_is_per_call_headless_and_per_session_in_the_window() {
+        let headless_flag = |h: bool| {
+            BrowserSession::with_profile_dir(
+                "w".to_string(),
+                Arc::new(AtomicBool::new(h)),
+                Arc::new(RwLock::new(String::new())),
+                PathBuf::from("p"),
+            )
+        };
+        let h = headless_flag(true);
+        assert_eq!(h.page_key("sess-1", "inv-2"), "inv-2", "无头：一个 agent 一页");
+        assert_eq!(h.page_key("", "inv-2"), "inv-2");
+
+        let v = headless_flag(false);
+        assert_eq!(v.page_key("sess-1", "inv-2"), "window:sess-1");
+        assert_eq!(
+            v.page_key("sess-1", "inv-9"),
+            v.page_key("sess-1", "inv-2"),
+            "同一个会话的下一轮要落在同一页，不再多开标签"
+        );
+        assert_ne!(v.page_key("sess-1", "i"), v.page_key("sess-2", "i"), "两个会话各一页");
+        assert_eq!(v.page_key("", "inv-2"), "inv-2", "没有 session id 就退回按调用");
+    }
+
     /// 真机回归：可见窗口模式下 `release` 不许把人正在用的那一页关掉。
     ///
     /// 现场（运行时日志 11:54）：用户开可见模式去登 126 邮箱，run 一收尾窗口就空了 ——
@@ -1651,17 +1725,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let s = session_in(tmp.to_str().unwrap(), false);
 
-        let page = s.get_or_init("a").await.expect("visible launch must work");
-        let before = s.status(Some("a")).await;
+        let page = s.get_or_init(&s.page_key("sess-t", "inv-1")).await.expect("visible launch must work");
+        let before = s.status(Some(&s.page_key("sess-t", "inv-1"))).await;
         assert_eq!(before["pages_we_own"], json!(1));
 
-        s.release("a").await;
-        let after = s.status(Some("a")).await;
+        s.release(&s.page_key("sess-t", "inv-1")).await;
+        let after = s.status(Some(&s.page_key("sess-t", "inv-1"))).await;
         assert_eq!(
             after["pages_in_browser"], before["pages_in_browser"],
             "可见模式下 release 不该关任何页: before={before} after={after}"
         );
         assert_eq!(after["pages_we_own"], json!(1), "页要留着给人用: {after}");
+
+        // 同一个会话的下一轮（新 invocation id）必须回到同一页，而不是再多开一个标签
+        let again = s.get_or_init(&s.page_key("sess-t", "inv-2")).await.expect("reuse");
+        assert_eq!(again.target_id(), page.target_id(), "同一会话同一页");
+        let after2 = s.status(Some(&s.page_key("sess-t", "inv-2"))).await;
+        assert_eq!(
+            after2["pages_in_browser"], before["pages_in_browser"],
+            "第二轮不该多出标签页: {after2}"
+        );
+        assert_eq!(after2["pages_we_own"], json!(1), "{after2}");
 
         page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
             url: "data:text/html,<title>still mine</title>".to_string(),
