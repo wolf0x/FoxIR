@@ -545,9 +545,16 @@ impl BrowserSession {
     }
 
     /// 一个 agent 结束（或显式 `close`）：只交回自己那一页，绝不动别人的，也不关浏览器。
+    /// 可见窗口模式下连页都不交回 —— 那一页就是人正在用的窗口。
     pub async fn release(&self, key: &str) {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else { return };
+        if !inner.launched_headless {
+            // 可见窗口模式下不关页：关的就是人正在用的那一页。真机现场——run 一收尾，
+            // 用户登录还没输完，窗口就空了（probe 报 running=true、pages_in_browser=0）。
+            // 这个模式的存在意义就是"人来登一次"，所以窗口归人自己关，或显式调 `close`。
+            return;
+        }
         if let Some(owned) = inner.take_page(key) {
             // 这一页是我们自己创建的，句柄也是自己拿的那个，关它是安全的路径；
             // 不可靠的是"按 target id 现取句柄再驱动"（见 `OwnedPage`）。
@@ -620,6 +627,9 @@ impl BrowserSession {
         let idle = {
             let guard = self.inner.lock().await;
             match guard.as_ref() {
+                // 可见窗口模式下永不按空闲回收：这台是人正在用的，收它只能由人来收。
+                // （正常情况下这条走不到 —— 可见模式不会交回页，pages 从来不会空。）
+                Some(inner) if !inner.launched_headless => false,
                 Some(inner) => should_reap(
                     inner.pages.is_empty(),
                     inner.idle_since,
@@ -970,7 +980,9 @@ impl Tool for BrowserCdpTool {
          does not start with the cookies of an everyday browser; \
          a site signed into once in this profile stays signed in for later sessions.\n\
          A login that needs a password, 2FA or a QR scan must be done once in the \
-         visible-window mode available in Settings; headless runs then inherit that state.\n\
+         visible-window mode available in Settings; headless runs then inherit that state. \
+         In that mode the window is the user's: navigate it to the login page, tell them to finish \
+         signing in there and stop - the page stays open when your run ends, and you must not `close` it.\n\
          One page per caller: this tool keeps its own page for each agent (main session or \
          sub-agent) inside one shared browser, so concurrent agents never navigate each other's \
          page while the signed-in profile stays shared. 'list_tabs' shows your page plus how many \
@@ -1624,6 +1636,46 @@ mod tests {
         assert_eq!(st["running"], json!(true));
 
         s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 真机回归：可见窗口模式下 `release` 不许把人正在用的那一页关掉。
+    ///
+    /// 现场（运行时日志 11:54）：用户开可见模式去登 126 邮箱，run 一收尾窗口就空了 ——
+    /// probe 报 `running=true, pages_in_browser=0`，即浏览器还活着、页被我们收了。
+    /// 用相对量断言，不去数 Edge 自己会多开哪些 target。
+    #[tokio::test]
+    #[ignore = "opens a real browser window"]
+    async fn a_visible_page_survives_the_end_of_a_run() {
+        let tmp = std::env::temp_dir().join(format!("foxir_viskeep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = session_in(tmp.to_str().unwrap(), false);
+
+        let page = s.get_or_init("a").await.expect("visible launch must work");
+        let before = s.status(Some("a")).await;
+        assert_eq!(before["pages_we_own"], json!(1));
+
+        s.release("a").await;
+        let after = s.status(Some("a")).await;
+        assert_eq!(
+            after["pages_in_browser"], before["pages_in_browser"],
+            "可见模式下 release 不该关任何页: before={before} after={after}"
+        );
+        assert_eq!(after["pages_we_own"], json!(1), "页要留着给人用: {after}");
+
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: "data:text/html,<title>still mine</title>".to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .expect("the page must still be drivable after release");
+
+        // 反过来：显式 close 仍然把整台收掉（人说了要关，就真关）。
+        s.close().await.unwrap();
+        assert!(!s.is_alive());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
