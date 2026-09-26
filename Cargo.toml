@@ -1,6 +1,6 @@
 [package]
 name = "FoxIR"
-version = "1.0.15"
+version = "1.0.16"
 edition = "2021"
 description = "Local AI agent with WebSocket gateway, multi-model support, and Windows system tools"
 
