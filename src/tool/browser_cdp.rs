@@ -266,8 +266,23 @@ const SNAPSHOT_JS: &str = r#"((cap) => {
       + checked
       + (href ? ' href=' + href : '') + '/>');
   }
-  return JSON.stringify({ count: lines.length, skipped, snapshot: lines.join('\n') });
+  return JSON.stringify({ count: lines.length, skipped, snapshot: lines.join('\n'),
+    nodes: document.getElementsByTagName('*').length });
 })"#;
+
+/// 全树节点数。快照里"这一页长什么样"的便宜指纹：页面自己插/删节点（定时器、懒加载、
+/// execute_js 写 DOM）也会让它变，所以它比"只记我们自己动过页"准。
+async fn dom_node_count(page: &Page) -> u64 {
+    match page.evaluate_expression("document.getElementsByTagName('*').length").await {
+        Ok(r) => r.value().and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        Err(_) => u64::MAX,
+    }
+}
+
+/// 编号过期时说清下一步，而不是让它点错。
+const STALE_INDEX: &str = "Those indices are stale: the page changed since your last 'snapshot' \
+(an inserted or removed element shifts every later number, so an old index can still resolve — \
+onto the wrong element). Take a fresh 'snapshot' and use the numbers from it.";
 
 /// click / type_text 的两种点名方式。`index` 来自 `snapshot`；两个都给时 index 优先，
 /// 都不给就报错 —— 猜一个空 selector 去查 DOM 没有任何意义。
@@ -329,6 +344,13 @@ async fn find_element_wait(page: &Page, selector: &str, wait: Duration) -> Resul
 struct OwnedPage {
     id: TargetId,
     page: Page,
+    /// 这一页被"我们自己的动作"改过几次。
+    gen: u64,
+    /// 拍快照时记下 (全树节点数, 当时的 gen)。用节点数是因为**页面自己**也会改 DOM
+    /// （定时器、懒加载、execute_js），只看 gen 会漏；而节点数是一个便宜到可以每次动作
+    /// 都问一次的量（真机：一拍 ~1ms），比"猜哪个动作算写"准，也不会因为一次只读
+    /// execute_js 就误报作废。
+    snap: Option<(u64, u64)>,
 }
 
 /// Inner state holding the browser connection.
@@ -357,10 +379,38 @@ impl BrowserInner {
     fn claim(&mut self, key: &str, page: Page) -> Page {
         self.pages.insert(
             key.to_string(),
-            OwnedPage { id: page.target_id().clone(), page: page.clone() },
+            OwnedPage {
+                id: page.target_id().clone(),
+                page: page.clone(),
+                gen: 0,
+                snap: None,
+            },
         );
         self.idle_since = None;
         page
+    }
+
+    /// 页被我们自己的动作碰过：代际 +1，上一份快照里的编号就此作废。
+    fn bump_gen(&mut self, key: &str) {
+        if let Some(p) = self.pages.get_mut(key) {
+            p.gen += 1;
+        }
+    }
+
+    /// 刚拍过快照：记下 (节点数, 代际)。
+    fn mark_snapshot(&mut self, key: &str, nodes: u64) {
+        if let Some(p) = self.pages.get_mut(key) {
+            let gen = p.gen;
+            p.snap = Some((nodes, gen));
+        }
+    }
+
+    /// 上一份快照的编号还算不算数：我们没动过页，且页面自己也没长/缩节点。
+    fn snapshot_is_current(&self, key: &str, nodes: u64) -> bool {
+        self.pages
+            .get(key)
+            .and_then(|p| p.snap.map(|(n, g)| n == nodes && g == p.gen))
+            .unwrap_or(false)
     }
 
     /// 一个 agent 交回自己那一页；空了才开始计空闲。
@@ -464,37 +514,23 @@ fn parse_devtools_active_port(txt: &str) -> Option<u16> {
     txt.lines().next().and_then(|l| l.trim().parse().ok())
 }
 
-/// 收养"交接之后真正活下来的那台浏览器"。
-///
-/// 真机证据（Edge 153 + `--no-startup-window`，运行时日志 10:03:42 / 10:03:55）：
-/// `msedge.exe` 的启动进程把请求移交给真正干活的浏览器进程后**自己以 0 退出**，而
-/// chromiumoxide 的 pipe 传输只看见 "Browser process exited with status 0 before
-/// websocket URL could be resolved"。接手的那台浏览器是活的、也在监听 CDP，并且会长期
-/// 占住 user-data-dir —— 于是从这一次之后，**每一次**启动都以同样的方式失败，看起来就
-/// 是"内置浏览器起不来"。
-///
-/// 收养必须验明正身：这个文件在浏览器退出后不会被删，端口号也可能被别的浏览器拿去用。
-/// 接上用户正在浏览的窗口、又在收尾时把它关掉，对取证工具是不可接受的代价。所以要求
-/// 我们这次是无头启动、且端点自报是同一家族的无头浏览器（UA 里有 Headless）。
-/// 可见窗口模式下不收养——那种情况下用户看得见、也关得掉。
-pub(crate) async fn adopt_handoff_browser(
-    profile_dir: &Path,
-    exe: &Path,
-    headless: bool,
-) -> Option<(Browser, Handler)> {
-    if !headless {
-        return None;
-    }
+/// 连 `<profile>/DevToolsActivePort` 说的端口之前，先问一次 `/json/version` 验明正身：
+/// 那个文件在浏览器退出后不会被删，端口号也可能被别的浏览器拿去复用。
+/// `require_headless` 只有收养要（可见窗口下那台可能是人正在看的）；关孤儿不需要 ——
+/// 关之前还会再确认它一个页面都没有。
+async fn own_endpoint(profile_dir: &Path, exe: &Path, require_headless: bool) -> Option<(u16, String)> {
     let port = std::fs::read_to_string(profile_dir.join("DevToolsActivePort"))
         .ok()
         .and_then(|t| parse_devtools_active_port(&t))?;
-    let url = format!("http://127.0.0.1:{}/json/version", port);
-    let client = match reqwest::Client::builder().timeout(ADOPT_WAIT).build() {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let info: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-
+    let client = reqwest::Client::builder().timeout(ADOPT_WAIT).build().ok()?;
+    let info: Value = client
+        .get(format!("http://127.0.0.1:{}/json/version", port))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let product = info.get("Browser").and_then(|v| v.as_str()).unwrap_or("");
     let ua = info.get("User-Agent").and_then(|v| v.as_str()).unwrap_or("");
     let exe_name = exe
@@ -508,31 +544,100 @@ pub(crate) async fn adopt_handoff_browser(
     } else {
         false
     };
-    if !family_ok || !ua.contains("Headless") {
+    if !family_ok || (require_headless && !ua.contains("Headless")) {
         if !product.is_empty() {
             warn!(
-                "Browser CDP: port {} answered but is not our headless browser ({}), not adopting",
-                port, product
+                "Browser CDP: port {} answered but is not our {}browser ({}), leaving it alone",
+                port,
+                if require_headless { "headless " } else { "" },
+                product
             );
         }
         return None;
     }
+    Some((port, info.get("webSocketDebuggerUrl").and_then(|v| v.as_str())?.to_string()))
+}
 
-    let ws = info.get("webSocketDebuggerUrl").and_then(|v| v.as_str())?;
+/// 这个端点现在有哪些**页面**（按 type 过滤：`/json` 还会列扩展、service worker 之类，
+/// 数条目总数会把"其实一扇窗都没有"的浏览器误判成有人在用）。None = 端口已无人应答。
+async fn endpoint_page_urls(port: u16) -> Option<Vec<String>> {
+    let client = reqwest::Client::builder().timeout(ADOPT_WAIT).build().ok()?;
+    let list: Value = client
+        .get(format!("http://127.0.0.1:{}/json", port))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(
+        list.as_array()?
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+            .map(|t| t.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect(),
+    )
+}
+
+/// 一扇页面算不算"不是人在用的"：浏览器自己的启动页。真机在一台零页面的残留上
+/// 测到交接式启动先后开出 `edge://newtab/`（479ms）与 `edge://sync-confirmation-dialog/`
+/// （584ms，2.6s 后自己关掉）。除此之外的 URL 都可能是人的窗口，一律不接。
+fn is_startup_page(url: &str) -> bool {
+    matches!(
+        url.trim_end_matches('/'),
+        "about:blank" | "edge://newtab" | "chrome://newtab" | "about:newtab"
+            | "edge://sync-confirmation-dialog"
+    )
+}
+
+/// 收养"交接之后真正活下来的那台浏览器"。
+///
+/// 真机证据（Edge 153/154 + `--no-startup-window`，运行时日志 10:03:42 / 10:03:55）：
+/// `msedge.exe` 的启动进程把请求移交给真正干活的浏览器进程后**自己以 0 退出**，而
+/// chromiumoxide 的 pipe 传输只看见 "Browser process exited with status 0 before websocket
+/// URL could be resolved"。接手的那台浏览器活着、也在监听 CDP，并且会长期占住
+/// user-data-dir —— 于是从那次起每一次启动都以同样方式失败，看起来就是"内置浏览器起不来"。
+/// 找回它的唯一线索就是 `<profile>/DevToolsActivePort`（见 `own_endpoint`）。
+///
+/// 无头模式下要求端点自报是 Headless（那种情况下不可能有人的窗口）。可见窗口模式下反过来：
+/// 只有**没有一扇真页面**的那台才接 —— 有人的页面就说明那可能是人正在敲的窗口，接过来替他
+/// 操作、收尾时再关掉是不可接受的代价。空壳则相反：那是上一台被硬杀后留下的，占着 profile，
+/// 既不显示也不属于任何人，接住它比让它把启动堵死好（真机：这种状态下 Browser.close 不回包，
+/// 所以"关掉它"不成立，而 connect 是通的）。
+///
+/// 判据看的是**页面 URL** 而不是页面数：交接式启动本身会让那台已在跑的浏览器开出
+/// `edge://newtab/`（真机测得：147ms 时还是 0 页，479ms 出现 newtab，584ms 再多一个同步
+/// 确认框）。用"零页面"当条件就等于把自己的残留误判成有人在用，然后回到"内置浏览器起不来"。
+pub(crate) async fn adopt_handoff_browser(
+    profile_dir: &Path,
+    exe: &Path,
+    headless: bool,
+) -> Option<(Browser, Handler)> {
+    let (port, ws) = own_endpoint(profile_dir, exe, headless).await?;
+    if !headless {
+        let urls = endpoint_page_urls(port).await.unwrap_or_default();
+        if urls.iter().any(|u| !is_startup_page(u)) {
+            warn!(
+                "Browser CDP: port {} is a visible browser with real pages ({:?}) — leaving it to the user",
+                port, urls
+            );
+            return None;
+        }
+    }
     match tokio::time::timeout(ADOPT_WAIT, Browser::connect(ws)).await {
         Ok(Ok((browser, handler))) => {
             info!(
-                "Browser CDP: launcher handed off (exit 0); adopted the live browser on port {} ({})",
-                port, product
+                "Browser CDP: launcher handed off (exit 0); adopted the live browser on port {}",
+                port
             );
             Some((browser, handler))
         }
         Ok(Err(e)) => {
-            warn!("Browser CDP: adopting {} failed: {}", ws, e);
+            warn!("Browser CDP: adopting port {} failed: {}", port, e);
             None
         }
         Err(_) => {
-            warn!("Browser CDP: adopting {} timed out after {}s", ws, ADOPT_WAIT.as_secs());
+            warn!("Browser CDP: adopting port {} timed out", port);
             None
         }
     }
@@ -1038,6 +1143,29 @@ impl BrowserSession {
         }
     }
 
+    /// 拍下快照时记.stamp（节点数 + 当前代际）。
+    async fn note_snapshot(&self, key: &str, nodes: u64) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            inner.mark_snapshot(key, nodes);
+        }
+    }
+
+    async fn bump_page_gen(&self, key: &str) {
+        if let Some(inner) = self.inner.lock().await.as_mut() {
+            inner.bump_gen(key);
+        }
+    }
+
+    /// 上一份快照里的编号还能不能用（拿当前节点数来问）。
+    pub(crate) async fn snapshot_is_current(&self, key: &str, nodes: u64) -> bool {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|i| i.snapshot_is_current(key, nodes))
+            .unwrap_or(false)
+    }
+
     /// 列出"我这一页 + 浏览器里还有几页"（`list_tabs` 动作，只读）。
     ///
     /// 不列别人的页 URL：并发取证时 A 能从列表里读到 B 正在看哪个页面，属于我们不该
@@ -1234,7 +1362,7 @@ impl Tool for BrowserCdpTool {
                 },
                 "index": {
                     "type": "integer",
-                    "description": "'click' / 'type_text': the Nth entry of the last 'snapshot' (takes precedence over 'selector'). Indices drift when the page changes — on 'no longer on the page', re-snapshot, do not guess another index"
+                    "description": "'click' / 'type_text': the Nth entry of the last 'snapshot' (takes precedence over 'selector'). Numbers are voided as soon as the page changes — if refused, take a fresh 'snapshot' and use the new numbers; never guess another index"
                 },
                 "cap": {
                     "type": "integer",
@@ -1391,6 +1519,15 @@ impl BrowserCdpTool {
             || err.contains("Not connected")
     }
 
+    /// `index` 指的是**上一份快照**里的编号。那之后这一页变过（我们的动作，或站点自己
+    /// 插/删节点）就当场拒绝：旧编号往往还解析得动，但指的是别的元素（真机实测：前插一个
+    /// 按钮后 [3] 漂到 [5]，旧 [0] 仍然"成功"点到新元素）。静默错点比报错贵得多。
+    async fn index_still_fresh(&self, key: &str, page: &Page) -> bool {
+        self.session
+            .snapshot_is_current(key, dom_node_count(page).await)
+            .await
+    }
+
     /// Execute a single browser action (called by execute, may be retried).
     async fn execute_action(
         &self,
@@ -1411,7 +1548,7 @@ impl BrowserCdpTool {
         let asked = args["max_chars"].as_u64().unwrap_or(0) as usize;
         let max_chars = if asked == 0 { max_text_len } else { asked.min(max_text_len) };
 
-        match action {
+        let outcome = match action {
             "navigate" => {
                 let url = args["url"].as_str()
                     .ok_or_else(|| "Missing 'url' for navigate".to_string())?;
@@ -1512,6 +1649,8 @@ impl BrowserCdpTool {
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(Value::Null);
                 let count = payload["count"].as_u64().unwrap_or(0);
+                let nodes = payload["nodes"].as_u64().unwrap_or(u64::MAX);
+                self.session.note_snapshot(key, nodes).await;
                 let skipped = payload["skipped"].as_u64().unwrap_or(0);
                 let list = payload["snapshot"].as_str().unwrap_or_default().to_string();
                 // 和 get_text 同一套上限/续读：大页面不能一次整份灌进上下文
@@ -1526,6 +1665,8 @@ impl BrowserCdpTool {
                     "success": true,
                     "action": "snapshot",
                     "marked": count,
+                    // 编号绑的是这一页的这份"形状"；页面自己长了/缩了节点，编号就会漂。
+                    "dom_nodes": json!(nodes),
                     "snapshot": s.window,
                     "offset": s.offset,
                     "total_chars": s.total,
@@ -1573,6 +1714,9 @@ impl BrowserCdpTool {
 
             "click" => {
                 let (selector, index) = target_of(args).map_err(|e| -> crate::error::AgentError { e.into() })?;
+                if index.is_some() && !self.index_still_fresh(key, &page).await {
+                    return Err(STALE_INDEX.into());
+                }
                 let elem = find_element_wait(&page, &selector, index.map(|_| INDEX_WAIT).unwrap_or(SELECTOR_WAIT))
                     .await
                     .map_err(|e| target_error(index, &selector, &e))?;
@@ -1634,6 +1778,9 @@ impl BrowserCdpTool {
 
             "type_text" => {
                 let (selector, index) = target_of(args).map_err(|e| -> crate::error::AgentError { e.into() })?;
+                if index.is_some() && !self.index_still_fresh(key, &page).await {
+                    return Err(STALE_INDEX.into());
+                }
                 let text = args["text"].as_str()
                     .ok_or_else(|| "Missing 'text' for type_text".to_string())?;
                 let elem = find_element_wait(&page, &selector, index.map(|_| INDEX_WAIT).unwrap_or(SELECTOR_WAIT))
@@ -1802,7 +1949,13 @@ impl BrowserCdpTool {
                  screenshot, get_url, get_html, execute_js, find_element, list_tabs, probe, close",
                 action
             ).into())
+        };
+        // 成功改过这一页的动作，让它上面那份快照的编号作废（失败不作废：DOM 没动）。
+        // 放在做动作的这个函数里而不是调用方，是因为自动重试路径也会直接调到这里。
+        if outcome.is_ok() && matches!(action, "click" | "type_text" | "navigate") {
+            self.session.bump_page_gen(key).await;
         }
+        outcome
     }
 }
 
@@ -1867,6 +2020,32 @@ mod tests {
         // 端口必须能塞进 u16：>65535 的垃圾不该被当成端点
         assert_eq!(parse_devtools_active_port("70000\n/x"), None);
     }
+
+    /// 收养条件的唯一护栏：可见窗口模式下，只有"没有一扇真页面"的残留才允许接。
+    /// 字符串全部来自真机（一台零页面残留被交接式启动唤醒后 `/json` 里出现的那些）。
+    #[test]
+    fn only_a_browser_without_real_pages_can_be_adopted() {
+        // 交接式启动自己开出来的那些：仍然是空壳，可以接
+        for s in [
+            "edge://newtab/",
+            "chrome://newtab/",
+            "about:newtab",
+            "about:blank",
+            "edge://sync-confirmation-dialog/",
+        ] {
+            assert!(is_startup_page(s), "{s} 是浏览器启动页，不该挡住收养");
+        }
+        // 任何有内容的 URL 都可能是人正在敲的窗口
+        for s in [
+            "https://baidu.com/",
+            "edge://settings/profile",
+            "file:///C:/x/y.html",
+            "",
+        ] {
+            assert!(!is_startup_page(s), "{s} 不是启动页，不能接");
+        }
+    }
+
 
     /// 真机回归：profile 被**另一个还活着的浏览器**占着时（现场就是 Edge 的启动进程把请求
     /// 交给真正干活的浏览器进程后自己以 0 退出，chromiumoxide 的 pipe 只看到 exit 0），
@@ -1984,6 +2163,93 @@ mod tests {
         assert!(missing.starts_with("Element not found"), "{missing}");
     }
 
+    /// 真机回归：上一台被硬杀后留下的"活着、零页面、还占着我们 profile"的浏览器，在可见窗口
+    /// 模式下应当被**接住**，而不是让每次启动都以 exit 0 失败。
+    ///
+    /// 前提就在这台机器上：6 个 msedge 进程占着 profile，`/json/version` 应答、页面数 0。
+    /// 试过另一条路 —— 启动前用 CDP `Browser.close` 把它收掉：实测八秒不回包（零页面的
+    /// 浏览器 close 不应答），所以"关"不成立、"接"成立（connect 实测可通）。有真页面的可见
+    /// 浏览器仍然一律不碰。
+    #[tokio::test]
+    #[ignore = "launches a real headful browser without a window"]
+    async fn a_pageless_leftover_is_adopted_in_visible_mode() {
+        let tmp = std::env::temp_dir().join(format!("foxir_lefty_{}_{}", std::process::id(), stamp()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let profile = tmp.join(".browser_profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let exe = browser_launch::discover("")
+            .chosen
+            .map(|c| c.path)
+            .expect("this test needs a browser installed");
+
+        // 故意不经 chromiumoxide 起一台：可见模式 + 不开启动窗口 => 活着，但一扇窗都没有
+        let _first = std::process::Command::new(&exe)
+            .arg("--no-startup-window")
+            .arg("--no-sandbox")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--remote-debugging-port=0")
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .spawn();
+
+        let port = wait_for_devtools_port(&profile).await;
+        let pages = endpoint_page_urls(port).await.unwrap_or_default();
+        println!("leftover: port {} page_targets={:?}", port, pages);
+        assert!(
+            pages.iter().all(|u| is_startup_page(u)),
+            "残留应当没有真页面，否则测试前提不对: {pages:?}"
+        );
+        // ws 路径里的 GUID 是这台浏览器的身份证；重起一台一定会换端口、换 GUID。
+        let guid_before = std::fs::read_to_string(profile.join("DevToolsActivePort"))
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        assert!(guid_before.starts_with("/devtools/browser/"), "{guid_before}");
+
+        // 可见窗口模式的会话：旧行为是 handoff → exit 0 → 启动失败；现在应该接住那一台
+        let s = BrowserSession::with_profile_dir(
+            tmp.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(String::new())),
+            profile.clone(),
+        );
+        s.get_or_init("a").await.expect("must adopt the page-less leftover, not fail to launch");
+        let st = s.status(Some("a")).await;
+        println!(
+            "after adoption: running={} pages_in_browser={} pages_we_own={}",
+            st["running"], st["pages_in_browser"], st["pages_we_own"]
+        );
+        assert_eq!(st["running"], json!(true));
+        assert_eq!(st["pages_we_own"], json!(1), "我们自己只能有一页");
+
+        // 断言"还是同一台"，不断言"浏览器里只有一页"：那次交接式启动本身会让已在跑的浏览器
+        // 开出窗口（真机 147ms 时 0 页 → 479ms 出现 edge://newtab/ → 584ms 再多一个
+        // edge://sync-confirmation-dialog/），而 DevToolsActivePort 一直是同一个。
+        // 再起一台才是错的，那会同时换掉端口和 GUID。
+        let after = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap();
+        let (port_after, guid_after) = after
+            .split_once('\n')
+            .map(|(p, g)| (p.trim().to_string(), g.trim().to_string()))
+            .unwrap_or_default();
+        println!("after adoption: port {port_after} guid {guid_after}");
+        assert_eq!(port_after, port.to_string(), "接的应该就是原来那一台，不是又起一台");
+        assert_eq!(guid_after, guid_before, "同一台浏览器的 ws GUID 不会变");
+
+        // 我们那一页确实开在接住的这台里：status 是向"接住的那台"列的页，能按 target id
+        // 对上才算数（对不上时 page 是 null）。
+        let my_page = &st["page"];
+        println!("our page in the adopted browser: {my_page}");
+        assert!(
+            my_page.get("url").and_then(|u| u.as_str()).is_some(),
+            "接住的浏览器里要能看到我们自己那一页"
+        );
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 真机回归，两条都是被现场日志证实过的：
     /// ① 页面永远加载不完时 `Page.navigate` 30s 超时，可导航其实已经落地 —— 旧代码把它报成
     ///   失败，调用方连发 4 次 navigate（每次 30s，共两分钟），最后一轮 get_url 显示页面早到了；
@@ -2042,6 +2308,18 @@ mod tests {
             "url 只能是浏览器说得出的一种: {v}"
         );
         assert!(v.get("note").is_some(), "还要告诉调用方别重发 navigate: {v}");
+
+        // 换一页"安静"的再量选择器：上面那页永远在加载，命令会被拖到 request_timeout，
+        // 那样测出来的就不是"语法错能不能立刻回来"。
+        tool.execute_action(
+            "navigate",
+            &json!({ "url": "data:text/html;charset=utf-8,<body><h1>calm</h1></body>" }),
+            &out_dir,
+            15_000,
+            "a",
+        )
+        .await
+        .expect("calm page");
 
         let t = Instant::now();
         let e = tool
@@ -2328,7 +2606,6 @@ mod tests {
 
             // ---------- A：今天的走法 ----------
             let t = Instant::now();
-            let mut a_ms = 0u128;
             let mut a_rt = 0usize;
             let mut a_chars = 0usize;
             let mut a_fail = 0usize;
@@ -2357,7 +2634,7 @@ mod tests {
             let c = page.evaluate_expression(&js_click).await;
             a_rt += 1;
             let a_clicked = c.ok().and_then(|x| x.value().cloned()).map(|v| v.as_str().unwrap_or("") == "OK").unwrap_or(false);
-            a_ms = t.elapsed().as_millis();
+            let a_ms = t.elapsed().as_millis();
 
             // ---------- B：索引走法 ----------
             let t = Instant::now();
@@ -2573,12 +2850,137 @@ mod tests {
         let took = t.elapsed();
         let msg = stale.to_string();
         println!("stale index after {:?} -> {}", took, msg);
-        assert!(msg.contains("no longer on the page"), "{msg}");
+        // 换页之后旧编号先撞上的是"编号已作废"那道守卫 —— 比 2s 轮询更早也更准：
+        // 换页后 [data-fx="0"] 可能仍然解析得动，但指的是别的元素。
+        assert!(msg.contains("stale"), "要说清是编号过期: {msg}");
         assert!(msg.contains("snapshot"), "要说出下一步是重新快照: {msg}");
         assert!(
-            took < Duration::from_secs(5),
+            took < Duration::from_secs(2),
             "编号失效不该按 8s 的 selector 轮询干等: {took:?}"
         );
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 度量**被动漂移**：没有人操作，1.5 秒前后两份快照会不会不一样。
+    /// 这决定 item 1 值不值得做：如果活页自己就会变，那"动作前重拍一次"是必须的；
+    /// 如果不变，问题只出在"我们自己刚点过"，那协议层面说清楚就够，不必引入比对。
+    #[tokio::test]
+    #[ignore = "visits real web pages"]
+    async fn measure_passive_snapshot_drift() {
+        let tmp = std::env::temp_dir().join(format!("foxir_pdrift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out_dir = tmp.join("output").to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        let page = s.get_or_init("a").await.expect("launch");
+
+        for url in [
+            "https://example.com/",
+            "https://www.baidu.com/",
+            "https://mail.126.com/",
+        ] {
+            page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+                url: url.to_string(),
+                referrer: None,
+                transition_type: None,
+                frame_id: None,
+                referrer_policy: None,
+            })
+            .await
+            .ok();
+            let _ = tokio::time::timeout(Duration::from_secs(5), page.wait_for_navigation()).await;
+            let a = tool.execute_action("snapshot", &json!({}), &out_dir, 15_000, "a").await.expect("snap a");
+            let t0 = Instant::now();
+            let al = a["snapshot"].as_str().unwrap().lines().map(str::to_string).collect::<Vec<_>>();
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let b = tool.execute_action("snapshot", &json!({}), &out_dir, 15_000, "a").await.expect("snap b");
+            let bl = b["snapshot"].as_str().unwrap().lines().map(str::to_string).collect::<Vec<_>>();
+            // 只比"第 N 行的文字"，忽略 href 里会变的 sid/token
+            let label = |v: &str| v.split(" href=").next().unwrap_or(v).to_string();
+            let moved = al.iter().zip(bl.iter()).filter(|(x, y)| label(x) != label(y)).count();
+            println!(
+                "PD {} n1={} n2={} 行数变了={} 同序号内容不同={} ({}ms/拍)",
+                url,
+                al.len(),
+                bl.len(),
+                al.len() != bl.len(),
+                moved,
+                t0.elapsed().as_millis()
+            );
+        }
+
+        s.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 度量编号漂移：点击让 DOM 变了之后，旧编号是"报错"还是会**静默指到别的元素**。
+    /// 页面故意做成"点一下就往前面插一个按钮"，于是每个后续编号都会整体后移。
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn measure_index_drift_after_a_page_changes() {
+        let shifting = "data:text/html;charset=utf-8,<body><div id=t></div><script>function add(){var \
+            b=document.createElement('button');b.textContent='新按钮 '+document.getElementById('t').\
+            childElementCount;b.onclick=add;document.getElementById('t').appendChild(b);}\
+            add();add();add();document.body.onclick=add;</script><button onclick=\"void 0\">目标按钮</button></body>";
+        let tmp = std::env::temp_dir().join(format!("foxir_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out_dir = tmp.join("output").to_string_lossy().to_string();
+        let s = session_in(tmp.to_str().unwrap(), true);
+        let tool = BrowserCdpTool::new(s.clone());
+        let page = s.get_or_init("a").await.expect("launch");
+        page.goto(chromiumoxide::cdp::browser_protocol::page::NavigateParams {
+            url: shifting.to_string(),
+            referrer: None,
+            transition_type: None,
+            frame_id: None,
+            referrer_policy: None,
+        })
+        .await
+        .expect("nav");
+
+        let snap = tool.execute_action("snapshot", &json!({}), &out_dir, 15_000, "a").await.expect("snap1");
+        let before: Vec<String> = snap["snapshot"].as_str().unwrap().lines().map(str::to_string).collect();
+        println!("DRIFT snapshot#1 ({} 行, dom_nodes={:?})", before.len(), snap["dom_nodes"]);
+        for l in &before { println!("   {l}"); }
+
+        // 点 body 一次 → 页面前插一个按钮 → 编号整体后移
+        tool.execute_action("click", &json!({ "index": 0 }), &out_dir, 15_000, "a")
+            .await
+            .expect("click index 0");
+
+        // 危险的是紧接着这一步：旧编号仍然解析得动，但指的是**别的元素**。
+        // 编号绑的是"拍快照时那一页的形状"，上面那个点击已经把它作废了。
+        let e = tool
+            .execute_action("click", &json!({ "index": 0 }), &out_dir, 15_000, "a")
+            .await
+            .expect_err("a stale index must be refused, not clicked");
+        let msg = e.to_string();
+        println!("DRIFT 用旧 index 再点一次 -> {}", msg);
+        assert!(msg.contains("stale"), "要说是编号过期: {msg}");
+        assert!(msg.contains("snapshot"), "要说出下一步是重拍: {msg}");
+
+        // 只读地用旧把手仍然可以（那是显式的 CSS，不是"我以为的编号"）—— 这正说明
+        // 必须由编号这条路来拦住静默错点，光靠"选择器可用"看不出问题。
+        let resolvable = tool
+            .execute_action("find_element", &json!({ "selector": "[data-fx=\"0\"]" }), &out_dir, 15_000, "a")
+            .await
+            .expect("the attribute selector still resolves");
+        println!("DRIFT 旧把手仍可解析 -> {}", resolvable);
+
+        let snap2 = tool.execute_action("snapshot", &json!({}), &out_dir, 15_000, "a").await.expect("snap2");
+        let after: Vec<String> = snap2["snapshot"].as_str().unwrap().lines().map(str::to_string).collect();
+        println!("DRIFT snapshot#2 ({} 行, dom_nodes={:?})", after.len(), snap2["dom_nodes"]);
+        for l in &after { println!("   {l}"); }
+
+        // 重拍之后同一个编号又能用
+        let ok = tool
+            .execute_action("click", &json!({ "index": 0 }), &out_dir, 15_000, "a")
+            .await
+            .expect("after re-snapshot the index works again");
+        println!("DRIFT 重拍后再点 -> {}", ok);
+        assert_ne!(before, after, "页面变了快照就该不同，否则这条测试没有意义");
 
         s.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
