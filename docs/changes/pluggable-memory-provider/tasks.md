@@ -1,6 +1,6 @@
 # Tasks — 可插拔记忆后端（MemoryProvider）
 
-> **状态**: 未实施，等待 spec.md 审核。审核通过后按 P0→P3 顺序执行。
+> **状态**: 未实施，等待 specs/pluggable-memory-provider-spec.md 审核。审核通过后按 P0→P3 顺序执行。
 > 每个 P 完成后更新本文件打勾并跑对应测试。
 
 ## P0 — 接入口骨架（回归安全基线）
