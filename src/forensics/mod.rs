@@ -83,6 +83,7 @@ mod live_tests {
     use std::path::Path;
 
     #[test]
+    #[ignore = "reads C:\\Windows\\Prefetch, which needs an elevated shell (os error 5)"]
     fn test_prefetch_parse() {
         let dir = Path::new("C:\\Windows\\Prefetch");
         if !dir.exists() {
@@ -98,6 +99,7 @@ mod live_tests {
     }
 
     #[test]
+    #[ignore = "asserts on the real user's Recent folder, which is empty of parseable .lnk on a clean profile"]
     fn test_lnk_parse() {
         let recent_path = format!(
             "C:\\Users\\{}\\AppData\\Roaming\\Microsoft\\Windows\\Recent",
