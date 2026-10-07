@@ -936,6 +936,10 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let tool_permissions = config.as_ref()
         .map(|c| serde_json::to_value(&c.agent.tool_permissions).unwrap_or(json!({})))
         .unwrap_or(json!({}));
+    // The third state: categories where no skill grant may bypass the prompt.
+    let permission_locks = config.as_ref()
+        .map(|c| serde_json::to_value(&c.agent.permission_locks).unwrap_or_else(|_| json!([])))
+        .unwrap_or(json!([]));
 
     // 当前机器上实际会选用的浏览器：自动探测选错时这一行就能看出来，
     // 不用先跑一次任务拿不到结果才知道。
@@ -967,6 +971,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "expert_role_models": serde_json::to_value(state.expert_role_models.read().unwrap().clone()).unwrap_or(json!({})),
         "timezone_offset": *state.timezone_offset.read().unwrap(),
         "tool_permissions": tool_permissions,
+        "permission_locks": permission_locks,
     }))
 }
 
@@ -3923,6 +3928,13 @@ async fn agent_settings_extended_save_handler(
         .map(|obj| obj.iter().filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b))).collect())
         .unwrap_or_default();
 
+    // Absent means "this payload says nothing about locks" -- an older client
+    // must not be able to clear what the user locked.
+    let permission_locks: Option<Vec<String>> = body.get("permission_locks")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    let locks_echo = serde_json::to_value(permission_locks.clone().unwrap_or_default()).unwrap_or(json!([]));
+
     let workspace_dir = &state.workspace_dir;
     match crate::config::Config::save_extended_settings(
         workspace_dir,
@@ -3930,6 +3942,7 @@ async fn agent_settings_extended_save_handler(
         fallback_model.clone(),
         timezone_offset,
         tool_permissions.clone(),
+        permission_locks,
     ) {
         Ok(()) => {
             // Hot-reload in-memory values
@@ -3949,6 +3962,7 @@ async fn agent_settings_extended_save_handler(
                 "fallback_model": fallback_model,
                 "timezone_offset": timezone_offset,
                 "tool_permissions": tool_permissions,
+                "permission_locks": locks_echo,
             }))
         }
         Err(e) => {

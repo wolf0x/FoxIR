@@ -1773,15 +1773,8 @@ impl Agent for LlmAgent {
         // derived from this list, so they cannot outlive the run.
         let skill_manager_for_grants = self.skill_manager.clone();
         let audit_session = ctx.base.session_id.clone();
-        // Third state, read once per run: categories the user locked, where no
-        // skill grant (bare name or narrowed arm) may bypass the prompt.
-        let grant_locked = match crate::config::Config::load(&self.workspace_dir) {
-            Ok(cfg) => cfg.agent.permission_locks,
-            Err(e) => {
-                tracing::warn!("Could not read permission_locks from config: {}; no category is locked", e);
-                Vec::new()
-            }
-        };
+        // Where the locked categories live (config.toml of this workspace).
+        let grants_workspace = self.workspace_dir.clone();
         let knowledge_reminder: Option<String> = if knowledge_pre_retrieval && !minimal_tier {
             self.build_knowledge_reminder(&user_message)
         } else {
@@ -2675,6 +2668,14 @@ impl Agent for LlmAgent {
                                 (!ledger.is_empty()).then(|| std::sync::Arc::new(ledger))
                             }
                             _ => None,
+                        };
+                        // Locked categories are re-read only when this run actually
+                        // holds grants, so the Settings card takes effect on the next
+                        // iteration without costing a config parse on every call.
+                        let grant_locked = if loaded_skills.is_empty() {
+                            Vec::new()
+                        } else {
+                            crate::permission::permission_locks_for(&grants_workspace)
                         };
                         let checker = PermissionChecker::new(
                             permission_pending.clone(),

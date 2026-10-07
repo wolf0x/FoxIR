@@ -1067,12 +1067,16 @@ orchestration = "off"
     }
 
     /// Save extended agent settings (model selection, timezone, permissions) to config.toml.
+    /// `permission_locks` is `Option`: `None` means "this payload says nothing about
+    /// locks", so a client that predates the third state must not clear what the user
+    /// already locked.
     pub fn save_extended_settings(
         workspace_dir: &str,
         primary_model: Option<String>,
         fallback_model: Option<String>,
         timezone_offset: i8,
         tool_permissions: HashMap<String, bool>,
+        permission_locks: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = Self::load(workspace_dir).unwrap_or_default();
 
@@ -1080,6 +1084,9 @@ orchestration = "off"
         config.agent.fallback_model = fallback_model;
         config.agent.timezone_offset = timezone_offset;
         config.agent.tool_permissions = tool_permissions;
+        if let Some(locks) = permission_locks {
+            config.agent.permission_locks = locks;
+        }
 
         config.save(workspace_dir)
     }
@@ -1180,7 +1187,7 @@ mod tests {
         );
 
         // GUI 的扩展设置保存走 load-then-mutate：它不碰这一行，也就不许把它抹掉
-        Config::save_extended_settings(&ws, Some("m".to_string()), None, 8, HashMap::new()).unwrap();
+        Config::save_extended_settings(&ws, Some("m".to_string()), None, 8, HashMap::new(), None).unwrap();
         let after = Config::load(&ws).unwrap();
         assert_eq!(
             after.agent.permission_locks, cfg.agent.permission_locks,
@@ -1189,6 +1196,43 @@ mod tests {
         assert_eq!(after.agent.max_iterations, 7, "sibling settings must survive");
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&ws2);
+    }
+
+    /// GUI 的三态选择器要能把锁写进同一份 config.toml；而**没带这个键的保存
+    /// （旧客户端、别的卡片）不许把它清空** —— 那是静默丢用户设置。
+    #[test]
+    fn extended_save_writes_locks_and_keeps_them_when_the_payload_carries_none() {
+        let ws = tmp_ws("locks_write");
+        std::fs::write(
+            Path::new(&ws).join("config.toml"),
+            "[server]\n[agent]\nmax_iterations = 7\n",
+        )
+        .unwrap();
+
+        Config::save_extended_settings(
+            &ws,
+            None,
+            None,
+            8,
+            HashMap::new(),
+            Some(vec!["execute".to_string()]),
+        )
+        .unwrap();
+        let cfg = Config::load(&ws).unwrap();
+        assert_eq!(
+            cfg.agent.permission_locks,
+            vec!["execute".to_string()],
+            "the lock must land on disk"
+        );
+
+        Config::save_extended_settings(&ws, None, None, 8, HashMap::new(), None).unwrap();
+        let after = Config::load(&ws).unwrap();
+        assert_eq!(
+            after.agent.permission_locks, cfg.agent.permission_locks,
+            "None must mean keep, not clear"
+        );
+        assert_eq!(after.agent.max_iterations, 7, "sibling settings must survive");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

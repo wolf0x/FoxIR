@@ -39,6 +39,29 @@ pub fn tool_category(name: &str) -> &'static str {
     }
 }
 
+/// Locked categories, read straight from `config.toml` so a Settings change is
+/// honoured by the next iteration without threading another shared map through
+/// every caller. Missing/unreadable config means "nothing locked" -- said once
+/// in the log rather than once per iteration.
+pub fn permission_locks_for(workspace_dir: &str) -> Vec<String> {
+    if workspace_dir.is_empty() {
+        return Vec::new(); // no workspace resolved (programmatic runs): nothing locked
+    }
+    match crate::config::Config::load(workspace_dir) {
+        Ok(cfg) => cfg.agent.permission_locks,
+        Err(e) => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "Could not read permission_locks from config for {workspace_dir}: {e}; no category is locked"
+                );
+            }
+            Vec::new()
+        }
+    }
+}
+
 /// Default permissions: read/write/modify allowed, delete/execute require endorsement.
 pub fn default_permissions() -> HashMap<String, bool> {
     let mut m = HashMap::new();
@@ -832,6 +855,28 @@ mod tests {
         assert_eq!(asked.len(), 1, "a locked category must go back to asking");
         assert!(!allowed, "the lock wins over the consent");
         assert!(!audit.exists(), "no bypass, so no audit line may be written");
+    }
+
+    /// 锁的读取口要自己扛住"没有 config.toml"和"读坏了"：不 panic、不静默 ——
+    /// 静默会让用户以为锁生效了。
+    #[test]
+    fn permission_locks_for_reads_config_and_tolerates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("rs_locks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.to_str().unwrap();
+
+        assert!(permission_locks_for(ws).is_empty(), "no config.toml means nothing is locked");
+
+        std::fs::write(
+            dir.join("config.toml"),
+            "[server]\n[agent]\npermission_locks = [\"execute\", \"delete\"]\n",
+        )
+        .unwrap();
+        let mut got = permission_locks_for(ws);
+        got.sort();
+        assert_eq!(got, vec!["delete".to_string(), "execute".to_string()], "{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
