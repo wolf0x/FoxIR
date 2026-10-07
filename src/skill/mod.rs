@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod schema;
 pub mod grants;
 pub mod install;
+pub mod unpack;
 pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};
@@ -395,7 +396,7 @@ impl SkillManager {
         let requested = name
             .map(str::to_string)
             .or_else(|| {
-                schema::parse_frontmatter(text, "probe")
+                schema::parse_frontmatter(&frontmatter_of(text), "probe")
                     .ok()
                     .map(|doc| doc.metadata.name)
             })
@@ -422,6 +423,79 @@ impl SkillManager {
         self.finish_staged_install(&staging, &dir_name)
     }
 
+    /// Install a fetched zip package (P4b, user-initiated).
+    ///
+    /// The archive lands in the quarantine area, is unpacked under the streaming
+    /// caps, and is screened a second time from the tree that actually reached
+    /// disk. A refused package leaves nothing in `skills/` and no scratch behind.
+    pub fn install_from_archive(
+        &self,
+        bytes: &[u8],
+        name: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<install::InstallOutcome, String> {
+        let quarantine = self.quarantine_root();
+        std::fs::create_dir_all(&quarantine)
+            .map_err(|e| format!("create {}: {}", quarantine.display(), e))?;
+        let stamp = uuid::Uuid::new_v4();
+        let archive = quarantine.join(format!("package-{stamp}.zip"));
+        let staging = quarantine.join(format!("incoming-{stamp}"));
+        std::fs::write(&archive, bytes).map_err(|e| format!("write {}: {}", archive.display(), e))?;
+
+        let landed = self.unpack_and_name(&archive, &staging, name).and_then(|dir_name| {
+            let provenance = install::Provenance {
+                source: Some(schema::Source::Url),
+                url: url.map(str::to_string),
+                package_sha256: Some(schema::sha256_hex(bytes)),
+            };
+            self.finish_staged_install_with(&staging, &dir_name, provenance)
+        });
+
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&archive);
+        let _ = std::fs::remove_dir(&quarantine); // only succeeds once it is empty
+        landed
+    }
+
+    /// Unpack into `staging` and decide the directory name: an explicit name wins,
+    /// then the package's single top-level folder, then its frontmatter name.
+    fn unpack_and_name(
+        &self,
+        archive: &Path,
+        staging: &Path,
+        name: Option<&str>,
+    ) -> Result<String, String> {
+        unpack::unpack_zip(archive, staging).map_err(|e| install::errors_text(&e))?;
+        let entries = install::walk_staged(staging).map_err(|e| install::errors_text(&e))?;
+        let layout = install::plan_entries(&entries).map_err(|e| install::errors_text(&e))?;
+
+        let requested = match name {
+            Some(given) => given.to_string(),
+            None => match &layout.root {
+                Some(dir) => dir.clone(),
+                None => {
+                    let text = std::fs::read_to_string(staging.join("SKILL.md"))
+                        .map_err(|e| format!("read staged SKILL.md: {e}"))?;
+                    schema::parse_frontmatter(&frontmatter_of(&text), "probe")
+                        .map(|doc| doc.metadata.name)
+                        .map_err(|findings| {
+                            format!("the package carries no usable name: {findings:?}")
+                        })?
+                }
+            },
+        };
+        let dir_name = sanitize_dir_name(&requested);
+        if dir_name.is_empty() {
+            return Err(format!("'{requested}' has no characters usable as a directory name"));
+        }
+        if self.recycle_bin_holds(&dir_name) {
+            return Err(format!(
+                "'{dir_name}' is in skills/_deleted; restore it from the recycle bin instead of installing over it"
+            ));
+        }
+        Ok(dir_name)
+    }
+
     /// Land a staged tree and refresh the catalog; our own scratch copy is always
     /// cleaned up, and a refused install never reaches `skills/`.
     fn finish_staged_install(
@@ -429,7 +503,16 @@ impl SkillManager {
         staging: &Path,
         dir_name: &str,
     ) -> Result<install::InstallOutcome, String> {
-        match install::install_staged(&self.skills_dir, staging, dir_name) {
+        self.finish_staged_install_with(staging, dir_name, install::Provenance::default())
+    }
+
+    fn finish_staged_install_with(
+        &self,
+        staging: &Path,
+        dir_name: &str,
+        provenance: install::Provenance,
+    ) -> Result<install::InstallOutcome, String> {
+        match install::install_staged_with(&self.skills_dir, staging, dir_name, provenance) {
             Ok(outcome) => {
                 let _ = std::fs::remove_dir_all(staging);
                 self.reload();
@@ -1054,6 +1137,15 @@ fn parse_skill_frontmatter(
         },
         warnings,
     ))
+}
+
+/// The frontmatter block of a whole SKILL.md. `parse_frontmatter` takes the inner
+/// block, not the file, so callers that only have file text must strip the fences
+/// first -- and an unfenced fragment is passed through unchanged.
+fn frontmatter_of(text: &str) -> String {
+    split_frontmatter(text)
+        .map(|(frontmatter, _)| frontmatter)
+        .unwrap_or_else(|| text.to_string())
 }
 
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
@@ -1992,6 +2084,98 @@ mod tests {
             "an edited SKILL.md must not keep the old approval"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 用 zip 写手造一个真包（只在测试里用：产品侧只读不写）。
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            w.start_file(name.to_string(), stored).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    const ZIP_SKILL_MD: &[u8] = b"---\nname: ZipSkill\ndescription: from a zip\n---\n# Z\n";
+
+    /// P4b 端到端：zip 装成一个可被发现的技能，清单记的是**包哈希**与来源 URL
+    /// （P4a 的目录导入没有包可哈希，那条留 null）。
+    #[test]
+    fn an_archive_install_lands_the_tree_and_records_the_package_hash() {
+        let root = std::env::temp_dir().join(format!("rs_archive_mgr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let skills = root.join("skills");
+        let bytes = zip_of(&[
+            ("ZipSkill/SKILL.md", ZIP_SKILL_MD),
+            ("ZipSkill/assets/n.txt", b"hi"),
+        ]);
+
+        let mgr = SkillManager::new(skills.to_str().unwrap());
+        let outcome = mgr
+            .install_from_archive(&bytes, None, Some("https://example.test/zip-skill.zip"))
+            .expect("a plain archive package must install");
+        assert_eq!(outcome.dir, skills.join("ZipSkill"), "{outcome:?}");
+        assert!(skills.join("ZipSkill/assets/n.txt").is_file(), "nested entries must land");
+        assert!(
+            mgr.list().into_iter().any(|m| m.name == "ZipSkill"),
+            "an installed skill must be discoverable"
+        );
+
+        let manifest = schema::read_manifest(&outcome.dir)
+            .unwrap()
+            .expect("an archive install carries provenance");
+        assert_eq!(manifest.source, schema::Source::Url, "{manifest:?}");
+        assert_eq!(
+            manifest.url.as_deref(),
+            Some("https://example.test/zip-skill.zip"),
+            "{manifest:?}"
+        );
+        assert_eq!(
+            manifest.package_sha256.as_deref(),
+            Some(schema::sha256_hex(&bytes).as_str()),
+            "the package bytes must be hashed, not the SKILL.md"
+        );
+        assert_eq!(
+            manifest.skill_md_hash.as_deref(),
+            Some(outcome.skill_md_hash.as_str()),
+            "{manifest:?}"
+        );
+        assert!(
+            !root.join("skills/.skill-quarantine").exists(),
+            "quarantine must never live inside the scanned tree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 被拒的包不许在 `skills/` 里留下任何东西，也不许留下隔离区残渣。
+    #[test]
+    fn a_refused_archive_leaves_the_skills_tree_untouched() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file("Bad/SKILL.md", stored).unwrap();
+        w.write_all(ZIP_SKILL_MD).unwrap();
+        w.add_symlink("Bad/innocent.md", "/etc/passwd", stored).unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        let root = std::env::temp_dir().join(format!("rs_archive_bad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let skills = root.join("skills");
+        let mgr = SkillManager::new(skills.to_str().unwrap());
+        let err = mgr
+            .install_from_archive(&bytes, None, Some("https://example.test/bad.zip"))
+            .expect_err("a symlink entry must refuse the package");
+        assert!(err.contains("symlink"), "{err}");
+        let left: Vec<String> = std::fs::read_dir(&skills)
+            .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing may land in skills/: {left:?}");
+        assert!(!root.join(".skill-quarantine").exists(), "our own scratch must be cleaned");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

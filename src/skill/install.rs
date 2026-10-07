@@ -43,6 +43,15 @@ pub enum InstallError {
     /// The staged tree itself could not be read or moved — an I/O fact, reported
     /// rather than swallowed.
     Unreadable { path: String, reason: String },
+    /// P4b: an entry carries the encryption flag. FoxIR never prompts for a
+    /// password, so such a package cannot be installed at all.
+    Encrypted { path: String },
+    /// P4b: the archive itself is not one we can read (split/spanned, truncated,
+    /// or not a zip).
+    UnsupportedArchive { reason: String },
+    /// P4b: declared sizes imply a zip bomb, so the package is refused before
+    /// anything is expanded.
+    ZipBomb { path: String, expanded: u64, compressed: u64 },
 }
 
 impl fmt::Display for InstallError {
@@ -79,6 +88,16 @@ impl fmt::Display for InstallError {
             InstallError::Unreadable { path, reason } => {
                 write!(f, "cannot handle {path}: {reason}")
             }
+            InstallError::Encrypted { path } => {
+                write!(f, "encrypted entries are not installed: {path}")
+            }
+            InstallError::UnsupportedArchive { reason } => {
+                write!(f, "unsupported archive: {reason}")
+            }
+            InstallError::ZipBomb { path, expanded, compressed } => write!(
+                f,
+                "{path} expands {compressed} bytes to {expanded}, over the ratio limit"
+            ),
         }
     }
 }
@@ -197,16 +216,20 @@ pub fn plan_entries(entries: &[EntrySpec]) -> Result<Layout, Vec<InstallError>> 
     };
 
     // Everything must live under that same root: a package that also carries a
-    // second top-level directory is not one skill.
+    // second top-level directory is not one skill. With `SKILL.md` at the package
+    // root there is no root to compare against — every other entry, file or
+    // folder, is a child of that package.
     let mut roots: Vec<String> = Vec::new();
-    for entry in entries {
-        let rel = entry.rel.replace('\\', "/");
-        let head = match rel.split_once('/') {
-            Some((head, _)) => head,
-            None => "",
-        };
-        if !head.is_empty() && !roots.iter().any(|known| known == head) {
-            roots.push(head.to_string());
+    if root.is_some() {
+        for entry in entries {
+            let rel = entry.rel.replace('\\', "/");
+            let head = match rel.split_once('/') {
+                Some((head, _)) => head,
+                None => "",
+            };
+            if !head.is_empty() && !roots.iter().any(|known| known == head) {
+                roots.push(head.to_string());
+            }
         }
     }
     if let Some(root) = &root {
@@ -294,6 +317,15 @@ pub fn walk_staged(root: &std::path::Path) -> Result<Vec<EntrySpec>, Vec<Install
     Ok(out)
 }
 
+/// Where a package came from, written next to it once it lands. `Default` is
+/// today's folder-import shape: local provenance, nothing to hash.
+#[derive(Debug, Clone, Default)]
+pub struct Provenance {
+    pub source: Option<crate::skill::schema::Source>,
+    pub url: Option<String>,
+    pub package_sha256: Option<String>,
+}
+
 /// Move a validated, already-staged skill folder into `skills_dir`.
 ///
 /// Nothing inside `skills_dir` is created before the package is screened, and the
@@ -304,6 +336,18 @@ pub fn install_staged(
     skills_dir: &std::path::Path,
     staging_root: &std::path::Path,
     name: &str,
+) -> Result<InstallOutcome, Vec<InstallError>> {
+    install_staged_with(skills_dir, staging_root, name, Provenance::default())
+}
+
+/// The same landing step, recording where the package came from. An archive
+/// install has a package to hash; a folder import does not, and says so with
+/// `package_sha256: None` rather than a guessed value.
+pub fn install_staged_with(
+    skills_dir: &std::path::Path,
+    staging_root: &std::path::Path,
+    name: &str,
+    provenance: Provenance,
 ) -> Result<InstallOutcome, Vec<InstallError>> {
     let entries = walk_staged(staging_root)?;
     let layout = plan_entries(&entries)?;
@@ -331,10 +375,10 @@ pub fn install_staged(
         }]
     })?;
     let hash = crate::skill::schema::skill_md_hash(&skill_md);
-    // A folder import has no package to hash; `package_sha256` stays null and the
-    // content binding is the SKILL.md hash alone.
     let manifest = crate::skill::schema::SourceManifest {
-        package_sha256: None,
+        source: provenance.source.unwrap_or_default(),
+        url: provenance.url,
+        package_sha256: provenance.package_sha256,
         ..crate::skill::schema::SourceManifest::local(&skill_md)
     };
     crate::skill::schema::write_manifest(&source, &manifest).map_err(|e| {
@@ -365,6 +409,55 @@ pub fn install_staged(
 /// HTTP semantics, not content guessing.
 const SINGLE_FILE_TYPES: [&str; 3] = ["text/markdown", "text/plain", "application/octet-stream"];
 
+/// P4b: media types accepted for an archive install (spec §4.3 step 3). A separate
+/// list on purpose — `text/markdown` must never route into the unpacker, and
+/// `application/zip` must never be written out as a `SKILL.md`.
+const ARCHIVE_TYPES: [&str; 3] = [
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+];
+
+/// Which of the two install paths a fetched payload belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageShape {
+    SingleFile,
+    Archive,
+}
+
+/// The zip local file header is the only evidence that routes to `Archive`. An
+/// end-of-central-directory alone (`PK\x05\x06`) carries no entries, so it is not
+/// a package and goes to the single-file path, where it will be refused.
+pub fn package_shape(bytes: &[u8]) -> PackageShape {
+    if bytes.starts_with(b"PK\x03\x04") {
+        PackageShape::Archive
+    } else {
+        PackageShape::SingleFile
+    }
+}
+
+/// Strip parameters and lowercase: `text/markdown; charset=utf-8` -> `text/markdown`.
+fn media_type(header: &str) -> String {
+    header
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+}
+
+/// Media type whitelist for a single-file install.
+pub fn content_type_ok(header: &str) -> bool {
+    let media = media_type(header);
+    !media.is_empty() && SINGLE_FILE_TYPES.contains(&media.as_str())
+}
+
+/// Media type whitelist for an archive install.
+pub fn archive_content_type_ok(header: &str) -> bool {
+    let media = media_type(header);
+    !media.is_empty() && ARCHIVE_TYPES.contains(&media.as_str())
+}
+
 /// True for every address a download must never reach: loopback, the RFC1918
 /// ranges, link-local (including the cloud metadata address), unique-local,
 /// unspecified, multicast and broadcast.
@@ -388,20 +481,6 @@ pub fn ip_is_denied(ip: &std::net::IpAddr) -> bool {
                 || (first & 0xff00) == 0xff00 // ff00::/8 multicast
         }
     }
-}
-
-/// Media type whitelist for a single-file install.
-pub fn content_type_ok(header: &str) -> bool {
-    let media = header
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
-    if media.is_empty() {
-        return false;
-    }
-    SINGLE_FILE_TYPES.contains(&media.as_str())
 }
 
 /// Render a rejection list as one message (for callers whose error type is text).
@@ -501,14 +580,21 @@ fn deny_private_target(host: &str, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Fetch one `SKILL.md` over https, screening the target address and every
-/// redirect hop before it is contacted.
+/// Fetch a package and report which install path it belongs to. The declared
+/// media type decides whether the response is accepted at all; the bytes decide
+/// the shape, because `application/octet-stream` is on both whitelists.
 ///
 /// Residual risk, stated rather than hidden: resolution is checked before the
 /// request, so a DNS name that answers differently on the second lookup
 /// (rebinding) can still move between check and connect. Callers that need that
 /// closed should pin the resolved address on the client.
-pub async fn download_single_file(url: &str) -> Result<Vec<u8>, String> {
+pub async fn download_package(url: &str) -> Result<(Vec<u8>, PackageShape), String> {
+    let bytes = fetch_capped(url, "package").await?;
+    let shape = package_shape(&bytes);
+    Ok((bytes, shape))
+}
+
+async fn fetch_capped(url: &str, what: &str) -> Result<Vec<u8>, String> {
     let (host, port) = host_and_port(url)?;
     deny_private_target(&host, port)?;
 
@@ -541,10 +627,13 @@ pub async fn download_single_file(url: &str) -> Result<Vec<u8>, String> {
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    if !content_type_ok(&media) {
-        return Err(format!("unexpected content type '{media}'; refusing to install it"));
+        .map(media_type)
+        .unwrap_or_default();
+    // The union of the two whitelists, derived from them rather than a third
+    // copy: `octet-stream` sits on both, which is why the shape is decided by
+    // the bytes below rather than by the header.
+    if !(content_type_ok(&media) || archive_content_type_ok(&media)) {
+        return Err(format!("unexpected content type '{media}'; refusing to install the {what}"));
     }
     if let Some(len) = response.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
         if len > MAX_DOWNLOAD_BYTES {
@@ -698,16 +787,60 @@ mod tests {
         );
     }
 
+    /// `SKILL.md` 在包根时，同级的 `assets/` 是这个技能的子目录，不是"第二个顶层根"。
+    /// P4b 的正对照夹具第一次暴露这条不对称：同级**文件**放行、同级**目录**被拒。
+    /// P4b 的白名单是另一张表：zip 的类型不能拿去当单文件装，反之亦然。
+    #[test]
+    fn archive_and_single_file_content_types_stay_on_separate_lists() {
+        assert!(archive_content_type_ok("application/zip"));
+        assert!(archive_content_type_ok("application/x-zip-compressed"));
+        assert!(
+            archive_content_type_ok("application/octet-stream; charset=binary"),
+            "parameters are HTTP semantics, not content guessing"
+        );
+        assert!(!archive_content_type_ok("text/markdown"), "a markdown type is not an archive");
+        assert!(!archive_content_type_ok(""));
+        assert!(
+            !content_type_ok("application/zip"),
+            "and the single-file list must not accept an archive type"
+        );
+    }
+
+    /// 走哪条安装路径由本地头签名决定，不由服务器声明决定：octet-stream 两种形状
+    /// 都可能，签名才是"这堆字节里有没有内容"的证据。
+    #[test]
+    fn only_a_zip_local_header_routes_to_the_archive_shape() {
+        assert_eq!(package_shape(b"PK\x03\x04\x14\x00"), PackageShape::Archive);
+        assert_eq!(package_shape(b"---\nname: x\n---\n"), PackageShape::SingleFile);
+        assert_eq!(
+            package_shape(b"PK\x05\x06\x00\x00\x00\x00"),
+            PackageShape::SingleFile,
+            "an end-of-central-directory alone carries no entries; it is not an installable package"
+        );
+    }
+
+    #[test]
+    fn a_root_skill_md_with_sibling_directories_is_one_package() {
+        let layout = plan_entries(&[
+            file("SKILL.md", 10),
+            file("assets/notes.txt", 20),
+            file("reference.md", 30),
+        ])
+        .expect("a root SKILL.md package that also carries a folder is a normal shape");
+        assert_eq!(layout.root, None, "nothing to strip from a root package");
+        assert_eq!(layout.staged.len(), 3, "{:?}", layout.staged);
+    }
+
     /// 门在网络上碰之前就拒掉私网目标（端口 1 是开不着的：如果守卫没生效，
     /// 报错会是"连不上"而不是"拒绝访问私网地址"）。
     #[tokio::test]
     async fn downloading_refuses_a_private_target_before_touching_the_network() {
-        let err = download_single_file("http://127.0.0.1:1/SKILL.md")
+        let err = download_package("http://127.0.0.1:1/SKILL.md")
             .await
             .expect_err("plaintext must be refused");
         assert!(err.contains("https"), "{err}");
 
-        let err = download_single_file("https://127.0.0.1:1/SKILL.md")
+        let err = download_package("https://127.0.0.1:1/SKILL.md")
             .await
             .expect_err("loopback must be refused");
         assert!(

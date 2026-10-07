@@ -79,6 +79,7 @@ prefetch-core = "0.1"
 # Cross-platform user information retrieval (replaces PowerShell for name detection)
 whoami = "1"
 winrm-rs = "=1.1.2"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [build-dependencies]
 winresource = "0.1"

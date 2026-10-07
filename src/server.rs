@@ -1197,9 +1197,16 @@ async fn skills_install_url_handler(State(state): State<Arc<AppState>>, Json(bod
         None => return Json(json!({ "success": false, "error": "missing 'url'" })),
     };
     let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string);
-    let outcome = match crate::skill::install::download_single_file(&url).await {
+    // One fetch, two shapes: the declared media type gates the response, the bytes
+    // decide whether it is unpacked as a package or written out as a SKILL.md.
+    let outcome = match crate::skill::install::download_package(&url).await {
         Err(e) => Err(e),
-        Ok(bytes) => state.skill_manager.install_single_file(&bytes, name.as_deref()),
+        Ok((bytes, crate::skill::install::PackageShape::Archive)) => {
+            state.skill_manager.install_from_archive(&bytes, name.as_deref(), Some(&url))
+        }
+        Ok((bytes, crate::skill::install::PackageShape::SingleFile)) => {
+            state.skill_manager.install_single_file(&bytes, name.as_deref())
+        }
     };
     match outcome {
         Ok(landed) => Json(json!({

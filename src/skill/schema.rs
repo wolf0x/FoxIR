@@ -283,10 +283,8 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
     std::fs::rename(&tmp, path).map_err(|e| format!("rename onto {}: {}", path.display(), e))
 }
 
-/// SHA-256 of a whole SKILL.md, over its raw bytes — frontmatter and body, with
-/// no newline normalization. Resource files are deliberately out of scope here
-/// (that is what `tree_hash` is reserved for).
-pub fn skill_md_hash(bytes: &[u8]) -> String {
+/// SHA-256 as lowercase hex, over the exact bytes given (no normalization).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher
@@ -294,6 +292,13 @@ pub fn skill_md_hash(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// SHA-256 of a whole SKILL.md, over its raw bytes — frontmatter and body, with
+/// no newline normalization. Resource files are deliberately out of scope here
+/// (that is what `tree_hash` is reserved for).
+pub fn skill_md_hash(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
 }
 
 /// A validation outcome that carries its own fields, so a report can be acted on
