@@ -3,9 +3,9 @@ pub mod types;
 pub mod verify;
 pub mod self_improve;
 pub mod metrics;
+pub mod schema;
 pub use self::types::SkillListingStrategy;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,6 +93,14 @@ fn strip_frontmatter(content: &str) -> &str {
 
 pub struct SkillManager {
     skills: Arc<RwLock<Vec<Skill>>>,
+    /// Skills discovered but refused by validation, with the blocking findings.
+    rejected: Arc<RwLock<Vec<(String, Vec<schema::Finding>)>>>,
+    /// Case-folded name collisions resolved at load time (Warn, not rejection).
+    duplicates: Arc<RwLock<Vec<schema::Finding>>>,
+    /// Warn-level findings per registered skill.
+    warnings: Arc<RwLock<Vec<(String, Vec<schema::Finding>)>>>,
+    /// Source manifests that exist but cannot be read.
+    manifest_issues: Arc<RwLock<Vec<String>>>,
     skills_dir: PathBuf,
     state_path: PathBuf,
     skill_self_improve: Arc<AtomicBool>,
@@ -109,6 +117,10 @@ impl SkillManager {
         let state_path = dir.join("skills_state.json");
         let mgr = Self {
             skills: Arc::new(RwLock::new(Vec::new())),
+            rejected: Arc::new(RwLock::new(Vec::new())),
+            duplicates: Arc::new(RwLock::new(Vec::new())),
+            warnings: Arc::new(RwLock::new(Vec::new())),
+            manifest_issues: Arc::new(RwLock::new(Vec::new())),
             skills_dir: dir,
             state_path,
             skill_self_improve: Arc::new(AtomicBool::new(false)),
@@ -126,6 +138,10 @@ impl SkillManager {
     pub fn reload(&self) {
         let mut skills = self.skills.write().unwrap();
         skills.clear();
+        self.rejected.write().unwrap().clear();
+        self.duplicates.write().unwrap().clear();
+        self.warnings.write().unwrap().clear();
+        self.manifest_issues.write().unwrap().clear();
 
         if !self.skills_dir.exists() {
             let _ = std::fs::create_dir_all(&self.skills_dir);
@@ -133,7 +149,10 @@ impl SkillManager {
         }
 
         // Load enabled state
-        let state = self.load_state();
+        let store = self.read_store();
+        for note in store.notes() {
+            warn!("{}", note);
+        }
 
         // Canonical base once so dir_depth can strip the prefix reliably
         // (Windows path casing / 8.3 aliases won't break the comparison).
@@ -142,6 +161,7 @@ impl SkillManager {
         // Scan directory-based skills recursively (skills/*/*/SKILL.md) so nested
         // child skills are discovered and can be loaded via skill_read_file.
         let dir_pattern = format!("{}/**/SKILL.md", self.skills_dir.display());
+        let mut duplicate_findings: Vec<schema::Finding> = Vec::new();
         for entry in glob::glob(&dir_pattern).ok().into_iter().flatten() {
             match entry {
                 Ok(path) => {
@@ -154,9 +174,19 @@ impl SkillManager {
                         .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_string())
                         .unwrap_or_default();
                     match parse_skill_frontmatter(&path, skill_dir) {
-                        Ok(mut skill) => {
-                            if let Some(enabled) = state.get(&skill.metadata.name) {
-                                skill.metadata.enabled = *enabled;
+                        Ok((mut skill, warns)) => {
+                            if !warns.is_empty() {
+                                self.warnings
+                                    .write()
+                                    .unwrap()
+                                    .push((skill.metadata.name.clone(), warns));
+                            }
+                            if let Err(e) = schema::read_manifest(Path::new(&skill.skill_dir)) {
+                                warn!("{}", e);
+                                self.manifest_issues.write().unwrap().push(e);
+                            }
+                            if let Some(enabled) = store.enabled_flag(&skill.metadata.name) {
+                                skill.metadata.enabled = enabled;
                             }
                             // Availability gate (agentskills.io): a skill whose
                             // `platforms` excludes this OS, or whose `deps` are
@@ -169,17 +199,51 @@ impl SkillManager {
                                 continue;
                             }
                             info!("Loaded skill: {} from {} (enabled={})", skill.metadata.name, path.display(), skill.metadata.enabled);
-                            insert_skill_unique(&mut skills, &canon_base, skill);
+                            if let Some(finding) = insert_skill_unique(&mut skills, &canon_base, skill) {
+                                duplicate_findings.push(finding);
+                            }
                         }
-                        Err(e) => {
+                        Err(findings) => {
                             metrics::record_load_failure();
-                            warn!("{}", e);
+                            warn!("Skill at {} is not registered: {:?}", path.display(), findings);
+                            self.rejected
+                                .write()
+                                .unwrap()
+                                .push((path.display().to_string(), findings));
                         }
                     }
                 }
                 Err(e) => warn!("Glob error: {}", e),
             }
         }
+
+        drop(skills);
+        for finding in duplicate_findings {
+            warn!("Duplicate skill name claim resolved: {:?}", finding);
+            self.duplicates.write().unwrap().push(finding);
+        }
+    }
+
+    /// Skills found on disk but refused by validation: `(SKILL.md path, blocking
+    /// findings)`. Surfaced so a rejected skill is visible instead of silently absent.
+    pub fn rejected(&self) -> Vec<(String, Vec<schema::Finding>)> {
+        self.rejected.read().unwrap().clone()
+    }
+
+    /// Case-folded name collisions seen at load time: the loser of each pair,
+    /// resolved deterministically by directory depth.
+    pub fn duplicate_claims(&self) -> Vec<schema::Finding> {
+        self.duplicates.read().unwrap().clone()
+    }
+
+    /// Warn-level findings grouped by the skill that triggered them.
+    pub fn validation_warnings(&self) -> Vec<(String, Vec<schema::Finding>)> {
+        self.warnings.read().unwrap().clone()
+    }
+
+    /// Human-readable problems reading a skill's source manifest.
+    pub fn manifest_issue_reports(&self) -> Vec<String> {
+        self.manifest_issues.read().unwrap().clone()
     }
 
     pub fn list(&self) -> Vec<SkillMetadata> {
@@ -219,8 +283,8 @@ impl SkillManager {
     /// - Name match:         ×4.0
     /// - Description match:  ×2.5
     ///
-    /// The raw score is normalized by `sqrt(body_token_count)` to prevent
-    /// large documents (e.g. 33KB VPS skill) from dominating via sheer token volume.
+    /// Matching is metadata-only: no body term and no length normalization, so
+    /// ranking never forces a lazy body load. Returns `(name, score)` pairs.
     pub fn find_matching_with(&self, user_message: &str, policy: &SelectionPolicy) -> Vec<(String, f32)> {
         let skills = self.skills.read().unwrap();
         let query_tokens = Self::tokenize(user_message);
@@ -401,6 +465,7 @@ impl SkillManager {
             .map_err(|e| format!("Failed to create skill dir: {}", e))?;
         std::fs::write(skill_dir.join("SKILL.md"), &md_content)
             .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
+        schema::write_manifest(&skill_dir, &schema::SourceManifest::local(md_content.as_bytes()))?;
 
         // Write optional extra files
         if let Some(extra_files) = files {
@@ -500,6 +565,10 @@ impl SkillManager {
     pub fn skill_tool_names() -> Vec<String> {
         let dummy = SkillManager {
             skills: Arc::new(RwLock::new(Vec::new())),
+            rejected: Arc::new(RwLock::new(Vec::new())),
+            duplicates: Arc::new(RwLock::new(Vec::new())),
+            warnings: Arc::new(RwLock::new(Vec::new())),
+            manifest_issues: Arc::new(RwLock::new(Vec::new())),
             skills_dir: PathBuf::new(),
             state_path: PathBuf::new(),
             skill_self_improve: Arc::new(AtomicBool::new(false)),
@@ -520,37 +589,24 @@ impl SkillManager {
 
     // --- State persistence ---
 
-    fn load_state(&self) -> HashMap<String, bool> {
-        if !self.state_path.exists() {
-            return HashMap::new();
-        }
-        match std::fs::read_to_string(&self.state_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        }
-    }
-
-    fn save_state(&self, state: &HashMap<String, bool>) {
-        match serde_json::to_string_pretty(state) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.state_path, json) {
-                    warn!("Failed to save skills state: {}", e);
-                }
-            }
-            Err(e) => warn!("Failed to serialize skills state: {}", e),
-        }
+    /// Read `skills_state.json` through the two-stage store: a schema change or a
+    /// corrupt file can no longer silently wipe the user's enable/disable flags.
+    fn read_store(&self) -> schema::SkillStateStore {
+        schema::SkillStateStore::load(&self.state_path)
     }
 
     fn save_state_entry(&self, name: &str, enabled: bool) {
-        let mut state = self.load_state();
-        state.insert(name.to_string(), enabled);
-        self.save_state(&state);
+        let mut store = self.read_store();
+        if let Err(e) = store.set_enabled(name, enabled) {
+            warn!("{}", e);
+        }
     }
 
     fn remove_from_state(&self, name: &str) {
-        let mut state = self.load_state();
-        state.remove(name);
-        self.save_state(&state);
+        let mut store = self.read_store();
+        if let Err(e) = store.remove(name) {
+            warn!("{}", e);
+        }
     }
 }
 
@@ -568,11 +624,53 @@ fn dir_depth(dir: &str, base: &std::path::Path) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The `/api/skills` payload: registered skills plus the two ways a skill on
+/// disk can be missing from that list (blocked by validation, or lost to a
+/// case-folded name collision). Silence here is what makes a vanished skill
+/// look like a bug.
+pub fn catalog_report(manager: &SkillManager) -> Value {
+    let skills = manager.list();
+    json!({
+        "skills": skills,
+        "count": skills.len(),
+        "rejected": manager
+            .rejected()
+            .iter()
+            .map(|(path, findings)| json!({ "path": path, "findings": findings }))
+            .collect::<Vec<Value>>(),
+        "duplicates": Value::Array(
+            manager
+                .duplicate_claims()
+                .iter()
+                .map(|finding| json!({ "finding": finding }))
+                .collect(),
+        ),
+        "warnings": Value::Array(
+            manager
+                .validation_warnings()
+                .iter()
+                .map(|(name, findings)| json!({ "skill": name, "findings": findings }))
+                .collect(),
+        ),
+        "manifest_issues": Value::Array(
+            manager
+                .manifest_issue_reports()
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    })
+}
+
 /// Insert a skill, de-duplicating by (case-insensitive) name so the skills
 /// list never shows two cards with the same name. When the same name is found
 /// in several directories (e.g. a versioned copy nested inside the skill
 /// folder), keep the shallowest / canonical directory as the single source.
-fn insert_skill_unique(skills: &mut Vec<Skill>, skills_dir: &std::path::Path, skill: Skill) {
+fn insert_skill_unique(
+    skills: &mut Vec<Skill>,
+    skills_dir: &std::path::Path,
+    skill: Skill,
+) -> Option<schema::Finding> {
     let name_lower = skill.metadata.name.to_lowercase();
     let skill_depth = dir_depth(&skill.skill_dir, skills_dir);
     if let Some(existing) = skills
@@ -580,11 +678,21 @@ fn insert_skill_unique(skills: &mut Vec<Skill>, skills_dir: &std::path::Path, sk
         .find(|s| s.metadata.name.to_lowercase() == name_lower)
     {
         if skill_depth < dir_depth(&existing.skill_dir, skills_dir) {
-            *existing = skill;
+            let displaced = std::mem::replace(existing, skill);
+            return Some(schema::Finding::DuplicateNameFolded {
+                name: displaced.metadata.name,
+                kept: existing.skill_dir.clone(),
+                dropped: displaced.skill_dir,
+            });
         }
-        return;
+        return Some(schema::Finding::DuplicateNameFolded {
+            name: existing.metadata.name.clone(),
+            kept: existing.skill_dir.clone(),
+            dropped: skill.skill_dir,
+        });
     }
     skills.push(skill);
+    None
 }
 
 /// Current host OS platform token (agentskills.io platform name).
@@ -639,23 +747,38 @@ pub fn unavailable_reason(meta: &SkillMetadata) -> Option<String> {
     None
 }
 
-fn parse_skill_frontmatter(path: &Path, skill_dir: String) -> Result<Skill, String> {
+fn parse_skill_frontmatter(
+    path: &Path,
+    skill_dir: String,
+) -> Result<(Skill, Vec<schema::Finding>), Vec<schema::Finding>> {
     let content = read_until_frontmatter_end(path)
-        .ok_or_else(|| format!("Failed to read frontmatter of {}: no closing '---' fence", path.display()))?;
-    let (frontmatter, _body) = split_frontmatter(&content)
-        .ok_or_else(|| format!("No valid frontmatter (--- delimiters) in {}", path.display()))?;
-    let metadata: SkillMetadata = serde_yaml::from_str(&frontmatter)
-        .map_err(|e| format!("YAML parse error in {}: {} | frontmatter: {}", path.display(), e, frontmatter.chars().take(200).collect::<String>()))?;
+        .ok_or_else(|| vec![schema::Finding::InvalidYaml {
+            error: format!("{}: no closing '---' fence", path.display()),
+        }])?;
+    let (frontmatter, _body) = split_frontmatter(&content).ok_or_else(|| {
+        vec![schema::Finding::InvalidYaml {
+            error: format!("{}: no valid frontmatter (--- delimiters)", path.display()),
+        }]
+    })?;
+    let dir_name = Path::new(&skill_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let doc = schema::parse_frontmatter(&frontmatter, &dir_name)?;
+    let warnings = doc.warnings;
 
-    Ok(Skill {
-        metadata,
-        content: SkillContent::Lazy {
-            path: path.to_path_buf(),
-            cell: Arc::new(OnceLock::new()),
+    Ok((
+        Skill {
+            metadata: doc.metadata,
+            content: SkillContent::Lazy {
+                path: path.to_path_buf(),
+                cell: Arc::new(OnceLock::new()),
+            },
+            skill_dir,
+            contract: Arc::new(OnceLock::new()),
         },
-        skill_dir,
-        contract: Arc::new(OnceLock::new()),
-    })
+        warnings,
+    ))
 }
 
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
@@ -890,6 +1013,9 @@ impl Tool for InstallSkillTool {
         let skill_md = skill_dir.join("SKILL.md");
         std::fs::write(&skill_md, &md_content)
             .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
+        if let Err(e) = schema::write_manifest(&skill_dir, &schema::SourceManifest::local(md_content.as_bytes())) {
+            warn!("{}", e);
+        }
 
         // Write optional extra files (inline content or read from source_path)
         let mut file_count = 0usize;
@@ -919,8 +1045,13 @@ impl Tool for InstallSkillTool {
         // Reload skills
         let mut skills = self.skills.write().unwrap();
         let dir_str = skill_dir.to_string_lossy().to_string();
-        if let Ok(skill) = parse_skill_frontmatter(&skill_md, dir_str) {
-            insert_skill_unique(&mut skills, &self.skills_dir, skill);
+        if let Ok((skill, warns)) = parse_skill_frontmatter(&skill_md, dir_str) {
+            if !warns.is_empty() {
+                warn!("Skill '{}' registered with warnings: {:?}", skill.metadata.name, warns);
+            }
+            if let Some(finding) = insert_skill_unique(&mut skills, &self.skills_dir, skill) {
+                warn!("Duplicate skill name claim resolved: {:?}", finding);
+            }
         }
 
         Ok(json!({
@@ -1192,6 +1323,224 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_report_carries_warn_findings_for_registered_skills() {
+        // Warn 级必须"照注册 + 说出来"。Quiet 少了 description、Good 干净，
+        // 所以恰好一条告警 —— 数量断言同时是"没误报"的正对照。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_warns_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Quiet")).unwrap();
+        std::fs::create_dir_all(tmp.join("Good")).unwrap();
+        std::fs::write(tmp.join("Quiet/SKILL.md"), "---\nname: Quiet\n---\n# Q\n").unwrap();
+        std::fs::write(tmp.join("Good/SKILL.md"), "---\nname: Good\ndescription: g\n---\n# G\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let report = catalog_report(&mgr);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(report["count"], 1 + 1, "both skills register despite the warning: {}", report);
+        let warnings = report["warnings"].as_array().expect("warnings is an array");
+        assert_eq!(warnings.len(), 1, "only the name-only skill warns: {}", report);
+        assert!(
+            warnings[0]["findings"].to_string().contains("description"),
+            "the warning must name the missing key: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn unreadable_source_manifest_is_reported_not_swallowed() {
+        // 清单读失败如果退成"没有清单"，一个被改过的技能就会伪装成 local。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_badmanifest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        mgr.create_skill_with_files("Manifested", "d", "# Body\n", None)
+            .expect("skill created");
+        std::fs::write(tmp.join("Manifested").join(schema::MANIFEST_FILE), "{ broken")
+            .expect("manifest clobbered");
+        mgr.reload();
+
+        let report = catalog_report(&mgr);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(report["count"], 1, "the skill itself still registers: {}", report);
+        let issues = report["manifest_issues"].as_array().expect("manifest_issues is an array");
+        assert_eq!(issues.len(), 1, "one unreadable manifest must surface: {}", report);
+        assert!(
+            issues[0].to_string().contains(".foxir-source.json"),
+            "the report must point at the file: {}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn created_skill_records_a_manifest_hashing_the_written_bytes() {
+        // P3 的内容绑定读这份清单；哈希算错一位（只算正文、或换行被归一化）就会
+        // 让"文件一改即撤权"失效。期望值用 sha2 直接算，走的是与 skill_md_hash
+        // 不同的调用路径，所以"算错了字节范围"这种变异会被抓到。
+        use sha2::{Digest, Sha256};
+        let tmp = std::env::temp_dir().join(format!("rs_skill_manifest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        mgr.create_skill_with_files("Manifested", "d", "# Body\n", None)
+            .expect("skill created");
+
+        let dir = tmp.join("Manifested");
+        let raw = std::fs::read(dir.join("SKILL.md")).expect("SKILL.md written");
+        let manifest = schema::read_manifest(&dir)
+            .expect("manifest read must not error")
+            .expect("a created skill must carry a source manifest");
+        let mut hasher = Sha256::new();
+        hasher.update(&raw);
+        let expected: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            manifest.skill_md_hash.as_deref(),
+            Some(expected.as_str()),
+            "the recorded hash must cover the whole file as written"
+        );
+        assert_eq!(manifest.source, schema::Source::Local);
+        assert!(manifest.installed_at.is_some(), "install time is known at creation");
+    }
+
+    #[test]
+    fn catalog_report_exposes_registered_rejected_and_duplicated() {
+        // /api/skills 必须把"被拒"与"落选"说出来，否则用户只看到技能不见了。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_report_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Good")).unwrap();
+        std::fs::write(tmp.join("Good/SKILL.md"), "---\nname: Good\ndescription: g\n---\n# G\n").unwrap();
+        std::fs::create_dir_all(tmp.join("NoName")).unwrap();
+        std::fs::write(tmp.join("NoName/SKILL.md"), "---\ndescription: none\n---\n# N\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let report = catalog_report(&mgr);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(report["count"], 1, "registered skills: {}", report);
+        let rejected = report["rejected"].as_array().expect("rejected is an array");
+        assert_eq!(rejected.len(), 1, "{:}", report);
+        assert!(
+            rejected[0]["findings"].to_string().contains("name"),
+            "the finding must say which key is missing: {}",
+            rejected[0]
+        );
+        assert_eq!(
+            report["duplicates"].as_array().expect("duplicates is an array").len(),
+            0,
+            "no collision here, so nothing may be reported: {}",
+            report
+        );
+    }
+
+    #[test]
+    fn folded_name_collision_keeps_shallowest_and_reports_the_loser() {
+        // insert_skill_unique 早就把这类冲突决定性地解掉了（最浅目录胜），所以它是
+        // "Warn + 上报落选者"，不是规格里我先前裁的"双方全拒"—— 后者会在升级时
+        // 凭空删掉今天能正常工作的技能。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Dup/nested")).unwrap();
+        std::fs::write(tmp.join("Dup/SKILL.md"), "---\nname: dup\ndescription: shallow\n---\n# S\n").unwrap();
+        std::fs::write(
+            tmp.join("Dup/nested/SKILL.md"),
+            "---\nname: DUP\ndescription: deeper\n---\n# D\n",
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let loaded = mgr.list();
+        let reports = mgr.duplicate_claims();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(loaded.len(), 1, "shallowest copy must win: {:?}", loaded.iter().map(|m| m.name.clone()).collect::<Vec<_>>());
+        assert_eq!(loaded[0].name, "dup");
+        assert_eq!(reports.len(), 1, "the dropped copy must be reported: {:?}", reports);
+        assert!(
+            matches!(&reports[0], crate::skill::schema::Finding::DuplicateNameFolded { name, dropped, .. }
+                if name == "dup" && dropped.contains("nested")),
+            "expected a DuplicateNameFolded naming the dropped dir, got {:?}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn distinct_skill_names_produce_no_duplicate_report() {
+        // 正对照：上面那条断"报了一条"，这条得断"没冲突时不报"。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_nodup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Alpha")).unwrap();
+        std::fs::create_dir_all(tmp.join("Beta")).unwrap();
+        std::fs::write(tmp.join("Alpha/SKILL.md"), "---\nname: alpha\ndescription: a\n---\n# A\n").unwrap();
+        std::fs::write(tmp.join("Beta/SKILL.md"), "---\nname: beta\ndescription: b\n---\n# B\n").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let reports = mgr.duplicate_claims();
+        let count = mgr.list().len();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(count, 2, "both distinct skills register");
+        assert!(reports.is_empty(), "no collision, no report: {:?}", reports);
+    }
+
+    #[test]
+    fn toggling_one_skill_does_not_re_enable_the_others() {
+        // 特征化测试（重构前必须先立住）：状态存储从 HashMap<String,bool> 换成结构体时，
+        // "写一条不能把别条刷回默认值"是用户数据的底线 —— Other 故意写成 false，
+        // 这样一旦读侧静默退成空表，它就会变成默认的 enabled=true 而被这条抓到。
+        let tmp = std::env::temp_dir().join(format!("rs_state_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Good")).unwrap();
+        std::fs::write(tmp.join("Good/SKILL.md"), "---\nname: Good\ndescription: g\n---\n# G\n").unwrap();
+        std::fs::create_dir_all(tmp.join("Other")).unwrap();
+        std::fs::write(tmp.join("Other/SKILL.md"), "---\nname: Other\ndescription: o\n---\n# O\n").unwrap();
+        std::fs::write(tmp.join("skills_state.json"), "{\"Good\": false, \"Other\": false}").unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        assert!(!mgr.list().iter().any(|m| m.enabled), "both skills start disabled");
+        mgr.toggle_skill("Good");
+        drop(mgr);
+
+        let mgr2 = SkillManager::new(tmp.to_str().unwrap());
+        let got: Vec<(String, bool)> = mgr2.list().iter().map(|m| (m.name.clone(), m.enabled)).collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(got.contains(&("Good".to_string(), true)), "the toggled skill must be enabled: {:?}", got);
+        assert!(got.contains(&("Other".to_string(), false)), "writing one entry must not re-enable others: {:?}", got);
+    }
+
+    #[test]
+    fn reload_registers_named_skill_and_reports_the_nameless_one() {
+        let tmp = std::env::temp_dir().join(format!("rs_skill_reject_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Good")).unwrap();
+        std::fs::write(
+            tmp.join("Good/SKILL.md"),
+            "---\nname: Good\ndescription: fine\n---\n# Good\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("NoName")).unwrap();
+        std::fs::write(
+            tmp.join("NoName/SKILL.md"),
+            "---\ndescription: no name at all\n---\n# Orphan\n",
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let loaded: Vec<String> = mgr.list().iter().map(|m| m.name.clone()).collect();
+        let rejected = mgr.rejected();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(loaded, vec!["Good".to_string()], "only a named skill registers");
+        assert_eq!(rejected.len(), 1, "the blocked skill must be reported: {:?}", rejected);
+        assert!(
+            matches!(&rejected[0].1[..], [crate::skill::schema::Finding::MissingField { key: "name" }]),
+            "expected a missing-name blocking finding, got {:?}",
+            rejected[0].1
+        );
+    }
+
+    #[test]
     fn recursive_discovery_loads_nested_child_skills() {
         let tmp = std::env::temp_dir().join(format!("rs_skill_discover_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1286,6 +1635,9 @@ mod tests {
                 platforms: vec![],
                 deps: vec![],
                 allowed_tools: vec![],
+                compatibility: None,
+                triggers: vec![],
+                metadata: Default::default(),
                 enabled: true,
             },
             content: SkillContent::Eager("# Eager Body\n".to_string()),

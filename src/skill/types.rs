@@ -2,13 +2,19 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// Skill metadata following the agentskills.io open schema (no FoxIR-private
-/// `x-foxir` extension fields).
+/// Skill metadata.
 ///
-/// Required: `name`. Optional (agentskills.io): `description`, `license`,
-/// `version`, `platforms`, `deps`, `allowed-tools`. `enabled` is a *runtime*
-/// switch managed via `skills_state.json` and is not part of the YAML
-/// frontmatter contract.
+/// Implements the agentskills.io frontmatter keys `name`, `description`,
+/// `license`, `compatibility`, `metadata` and `allowed-tools` (verified against
+/// the specification on 2026-10-07). `version`, `platforms`, `deps` and
+/// `triggers` are **FoxIR-private top-level fields** — the standard has no such
+/// keys, and its own home for extensions is `metadata:` (`foxir.*`). They stay
+/// top level because FoxIR's writers and existing SKILL.md files put them there.
+///
+/// `name` is required; `description` is required by the standard but only
+/// warn-checked here (an empty description degrades to "discoverable by name").
+/// `enabled` is a *runtime* switch persisted in `skills_state.json`, not part of
+/// the YAML contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
     /// Skill identifier (kebab/lower-case is conventional but not enforced).
@@ -32,6 +38,19 @@ pub struct SkillMetadata {
     /// Pre-approved tool names the skill may use (kebab-case key `allowed-tools`).
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Vec<String>,
+    /// Environment prerequisites (agentskills.io `compatibility`, optional, <=500 chars).
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    /// Trigger phrases for ranking. The standard has no `triggers` key, so the
+    /// canonical home is `metadata.foxir.triggers`; a top-level `triggers:` is
+    /// read as a legacy alias (existing SKILL.md files use it).
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// The agentskills.io `metadata` map — the standard's home for private
+    /// extension keys. FoxIR keeps it verbatim so a spec-shaped skill does not
+    /// lose data; `foxir.*` entries are ours, anything else is another client's.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, serde_yaml::Value>,
     /// Runtime on/off switch, managed via `skills_state.json` (not part of the
     /// YAML frontmatter contract).
     #[serde(default = "default_enabled")]
@@ -43,10 +62,10 @@ fn default_version() -> String { "1.0.0".to_string() }
 
 /// Controls skill ranking and filtering during matching.
 ///
-/// Skills are scored via weighted token overlap (name ×4.0, description ×2.5,
-/// triggers ×2.0, body ×1.0), normalized by `sqrt(body_tokens)` to prevent
-/// large documents from dominating. Only skills scoring >= `min_score` are
-/// returned, up to `top_k` results.
+/// Scoring is metadata-only and currently uses weighted token overlap over
+/// `name` (x4.0) and `description` (x2.5). There is no body term and no length
+/// normalization: `score_skill` reads neither. Only skills scoring >= `min_score`
+/// are returned, up to `top_k`.
 #[derive(Debug, Clone)]
 pub struct SelectionPolicy {
     pub top_k: usize,

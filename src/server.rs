@@ -1102,9 +1102,7 @@ async fn providers_test_handler(
 }
 
 async fn skills_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
-
-    let skills = state.skill_manager.list();
-    Json(json!({ "skills": skills, "count": skills.len() }))
+    Json(crate::skill::catalog_report(&state.skill_manager))
 }
 
 async fn skills_metrics_handler() -> Json<Value> {
