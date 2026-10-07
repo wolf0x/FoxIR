@@ -281,18 +281,20 @@ impl SkillManager {
                 declined_hash: state.and_then(|s| s.grants.declined_hash.as_deref()),
                 tools: skill.metadata.allowed_tools.clone(),
             };
-            if let grants::GrantState::Consent { actions } = grants::grant_state(&facts) {
-                if actions.is_empty() {
+            if let grants::GrantState::Consent { actions, names } = grants::grant_state(&facts) {
+                if actions.is_empty() && names.is_empty() {
                     continue;
                 }
                 let plan = grants::GrantPlan {
                     actions,
+                    names: names.clone(),
                     findings: Vec::new(),
                 };
                 ledger.add(grants::SkillGrant {
                     skill: name.clone(),
                     full_hash: current_hash,
                     session: session.to_string(),
+                    names,
                     profile: grants::fragment(name, &plan),
                 });
             }

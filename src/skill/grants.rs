@@ -1,9 +1,18 @@
-//! P3 — `allowed-tools` → 意图窄化的 run 局部授权。
+//! P3 — `allowed-tools` → run 局部免审批。
 //!
-//! 天花板不是"名单长短"的审美问题：现有匹配器只为三个工具准备了意图臂
-//! （`sys_process` 的 `action=="kill"`、`ir_persistence` 的 `remove|delete`、
-//! `shell_exec` 的 kill/service 命令头）。放开别的名字必须先新写一条臂，
-//! 那是在扩大旁路面，属独立决策，不在本期。
+//! 免审批的词汇表是**工具名**：声明里除"任意代码执行"之外的任何名字都可以被
+//! 授权，包括外设化之后的 `ext_*` 和 MCP 名字（名字必须先存在于注册表才会被
+//! 调用，所以拼错的声明只是不生效，不会放大射程）。
+//!
+//! 两类例外不走裸名：
+//! - `sys_process` / `ir_persistence` / `shell_exec` 已有意图臂，按臂窄化授权
+//!   （`check_preauthorization`），裸名不会比臂更宽。
+//! - `app_launch` / `winrm` 的射程由命令文本决定，而兜底只有 Delete/Format 两个
+//!   动词可用，不足以覆盖任意代码执行 ⇒ 声明被拒并上报。
+//!
+//! 最终判定仍归五类：`PermissionChecker` 在采用任何技能授权之前先查
+//! [`crate::permission::grant_blocked_by_category`]，意图落进用户已关掉的类别
+//! 就不使用授权（也不写台账）。
 //!
 //! frontmatter 层的键名是 `allowed-tools`；Rust 侧字段是 `allowed_tools`。
 
@@ -15,20 +24,21 @@ use super::schema::Finding;
 pub struct GrantPlan {
     /// 能安全落地的动作类（喂给 `PermissionProfile`）。
     pub actions: Vec<PreauthorizedAction>,
+    /// 按名字免审批的工具（`PermissionChecker` 逐名比对）。
+    pub names: Vec<String>,
     /// 声明里被拒/被忽略的条目，带原因。
     pub findings: Vec<Finding>,
 }
 
-/// The only tool names that have an intent-narrowed arm in
-/// `check_preauthorization`. Granting anything else would mean granting an
-/// unbounded tool name, so it stays inert until a narrow arm exists for it —
-/// and adding one is a separate decision, not this phase.
-pub fn plan_grants(allowed_tools: &[String]) -> GrantPlan {
-    const SYS_PROCESS: &str = "sys_process";
-    const IR_PERSISTENCE: &str = "ir_persistence";
-    const SHELL_EXEC: &str = "shell_exec";
+/// 有意图臂的三个名字：授权按臂生效，裸名不再额外放宽。
+const NARROWED_TOOLS: [&str; 3] = ["sys_process", "ir_persistence", "shell_exec"];
+/// 任意代码执行，且没有可用的窄臂：裸名绝不生效。
+const ARBITRARY_CODE_TOOLS: [&str; 2] = ["app_launch", "winrm"];
 
+/// Turn a skill's declared `allowed-tools` into the grants it may actually hold.
+pub fn plan_grants(allowed_tools: &[String]) -> GrantPlan {
     let mut actions: Vec<PreauthorizedAction> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -41,29 +51,35 @@ pub fn plan_grants(allowed_tools: &[String]) -> GrantPlan {
             findings.push(Finding::UnsupportedGrantSyntax { raw });
             continue;
         }
-        let mapped: Vec<PreauthorizedAction> = match raw.as_str() {
-            SYS_PROCESS => vec![PreauthorizedAction::KillProcess],
-            IR_PERSISTENCE => vec![PreauthorizedAction::RemovePersistence],
-            SHELL_EXEC => vec![
-                PreauthorizedAction::KillProcess,
-                PreauthorizedAction::StopService,
-            ],
-            tool => {
-                findings.push(Finding::GrantUnsupported {
-                    tool: tool.to_string(),
-                    reason: "no intent-narrowed arm; a bare name grant is unbounded",
-                });
-                Vec::new()
+        if ARBITRARY_CODE_TOOLS.contains(&raw.as_str()) {
+            findings.push(Finding::GrantUnsupported {
+                tool: raw,
+                reason: "arbitrary code execution: a bare name has no bound",
+            });
+            continue;
+        }
+        if NARROWED_TOOLS.contains(&raw.as_str()) {
+            let mapped: Vec<PreauthorizedAction> = match raw.as_str() {
+                "sys_process" => vec![PreauthorizedAction::KillProcess],
+                "ir_persistence" => vec![PreauthorizedAction::RemovePersistence],
+                _ => vec![
+                    PreauthorizedAction::KillProcess,
+                    PreauthorizedAction::StopService,
+                ],
+            };
+            for action in mapped {
+                if !actions.contains(&action) {
+                    actions.push(action);
+                }
             }
-        };
-        for action in mapped {
-            if !actions.contains(&action) {
-                actions.push(action);
-            }
+            continue;
+        }
+        if !names.contains(&raw) {
+            names.push(raw);
         }
     }
 
-    GrantPlan { actions, findings }
+    GrantPlan { actions, names, findings }
 }
 
 /// The run-scoped profile fragment for one loaded skill. Field obligations are
@@ -100,8 +116,11 @@ pub enum GrantState {
     Unbound,
     /// The file changed since the manifest was written: revoke and re-ask.
     Drifted { recorded: String, current: String },
-    /// Approved for exactly this content: these actions may be pre-authorized.
-    Consent { actions: Vec<PreauthorizedAction> },
+    /// Approved for exactly this content: these grants may be active.
+    Consent {
+        actions: Vec<PreauthorizedAction>,
+        names: Vec<String>,
+    },
     /// Never asked about this content yet: ask once, activate nothing for now.
     Pending { tools: Vec<String> },
     /// Refused for exactly this content: do not ask again, do not activate.
@@ -124,8 +143,10 @@ pub fn grant_state(facts: &GrantFacts) -> GrantState {
         };
     }
     if facts.consented_hash == Some(facts.current_hash) {
+        let plan = plan_grants(&facts.tools);
         return GrantState::Consent {
-            actions: plan_grants(&facts.tools).actions,
+            actions: plan.actions,
+            names: plan.names,
         };
     }
     if facts.declined_hash == Some(facts.current_hash) {
@@ -212,7 +233,8 @@ pub fn loaded_skill_name(tool_name: &str, result: &serde_json::Value) -> Option<
 }
 
 /// One skill's live grant inside a single run: which skill, which content,
-/// which session, and the intent-narrowed actions it may take.
+/// which session, and the two shapes of what it may take — intent-narrowed
+/// actions and bare tool names.
 #[derive(Debug)]
 pub struct SkillGrant {
     pub skill: String,
@@ -221,6 +243,10 @@ pub struct SkillGrant {
     pub full_hash: String,
     pub session: String,
     pub profile: PermissionProfile,
+    /// Tool names this skill exempts, verbatim from its declaration. A name
+    /// that is not in the registry can never be called, so a wrong declaration
+    /// is inert rather than dangerous.
+    pub names: Vec<String>,
 }
 
 /// Outcome of asking the ledger to honour a call without prompting.
@@ -262,14 +288,19 @@ impl SkillGrantLedger {
         self.grants.is_empty()
     }
 
-    /// Audit first, effect after. The narrowing lives in the profile's own
-    /// intent arms, so `sys_process(action="suspend")` is not covered by a
-    /// `sys_process` kill grant.
+    /// Audit first, effect after. A call is covered either by a bare name from
+    /// the declaration, or by one of the intent arms — `sys_process(action =
+    /// "suspend")` is still not covered by a `sys_process` kill grant.
     pub fn authorize_with_audit(&self, tool: &str, args: &serde_json::Value, intent: &str) -> AuditOutcome {
         let Some(grant) = self
             .grants
             .iter()
-            .find(|grant| crate::managed::permission_profile::check_preauthorization(&grant.profile, tool, args))
+            .find(|grant| {
+                grant.names.iter().any(|name| name == tool)
+                    || crate::managed::permission_profile::check_preauthorization(
+                        &grant.profile, tool, args,
+                    )
+            })
         else {
             return AuditOutcome::NoGrant;
         };
@@ -331,6 +362,7 @@ mod tests {
             full_hash: hash.to_string(),
             session: session.to_string(),
             profile: fragment(skill, &plan),
+            names: plan.names,
         });
         ledger
     }
@@ -355,20 +387,41 @@ mod tests {
         );
     }
 
-    /// 天花板外：解析、上报、保持惰性 —— 绝不因为"技能声明了"就放宽。
+    /// 免审批的词汇表就是工具名：`ext_ir_scan` 这类外设化之后的 IR 工具、
+    /// `file_delete` 这类整组动作都可接受的工具，都靠名字进名单。
     #[test]
-    fn tools_without_an_intent_arm_stay_inert_and_are_reported() {
-        let plan = plan_grants(&names(&["file_delete", "winrm", "cu_process_kill", "file_write"]));
+    fn any_declared_name_becomes_a_live_grant_except_the_code_exec_trio() {
+        let plan = plan_grants(&names(&["ir_memdump", "file_delete", "ext_ir_scan", "winrm"]));
+        assert_eq!(
+            plan.names,
+            names(&["ir_memdump", "file_delete", "ext_ir_scan"]),
+            "declared names are the grant vocabulary: {:?}",
+            plan.names
+        );
         assert!(
-            plan.actions.is_empty(),
-            "a bare tool-name grant is unbounded: {:?}",
+            !plan.names.contains(&"winrm".to_string()),
+            "winrm runs arbitrary remote code, so a bare name must not grant it"
+        );
+        assert!(
+            plan.findings.iter().any(
+                |finding| matches!(finding, Finding::GrantUnsupported { tool, .. } if tool == "winrm")
+            ),
+            "a refused declaration must be reported, not swallowed: {:?}",
+            plan.findings
+        );
+    }
+
+    /// 三件套的射程由命令文本决定，而五类兜底只认 Delete/Format 两个动词，
+    /// 不足以覆盖任意代码执行 —— 所以它们只走窄臂。
+    #[test]
+    fn code_execution_tools_are_never_granted_by_a_bare_name() {
+        let plan = plan_grants(&names(&["shell_exec", "app_launch", "winrm"]));
+        assert!(plan.names.is_empty(), "{:?}", plan.names);
+        assert!(
+            plan.actions.contains(&Act::KillProcess) && plan.actions.contains(&Act::StopService),
+            "shell_exec keeps its narrowed arms: {:?}",
             plan.actions
         );
-        assert_eq!(plan.findings.len(), 4, "{:?}", plan.findings);
-        assert!(plan
-            .findings
-            .iter()
-            .all(|finding| matches!(finding, Finding::GrantUnsupported { .. })));
     }
 
     /// `Bash(...)` 那类外部方言不是我们的语法，别猜它的意思。
@@ -448,8 +501,9 @@ mod tests {
             tools: names(&["sys_process", "winrm"]),
         });
         match state {
-            GrantState::Consent { actions } => {
+            GrantState::Consent { actions, names } => {
                 assert_eq!(actions, vec![PreauthorizedAction::KillProcess], "only what the ceiling allows");
+                assert!(names.is_empty(), "winrm is refused, so it cannot be a live name grant: {names:?}");
             }
             other => panic!("expected a consented grant, got {other:?}"),
         }
@@ -581,6 +635,27 @@ mod tests {
         assert_eq!(first["tool"], "sys_process");
         assert_eq!(first["session"], "sess-9");
         assert_eq!(first["decision"], "auto-granted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 名字级授权同样"先落审计再放行"，而且作用域只到声明的那个名字。
+    #[test]
+    fn a_name_level_grant_bypasses_only_its_own_tool_and_leaves_an_audit_line() {
+        let dir = temp_grants_dir("name_bypass");
+        let ledger = ledger_with(&dir, "TriageFlow", HASH, &["ext_ir_scan"], "sess-9");
+
+        match ledger.authorize_with_audit("ext_ir_scan", &serde_json::json!({ "args": "-s" }), "外部扫描") {
+            AuditOutcome::Bypassed { ref skill } if skill == "TriageFlow" => {}
+            other => panic!("expected a name-level bypass, got {other:?}"),
+        }
+        assert!(matches!(
+            ledger.authorize_with_audit("ext_other_tool", &serde_json::json!({}), "别的工具"),
+            AuditOutcome::NoGrant
+        ), "the grant is scoped to the declared name");
+
+        let text = std::fs::read_to_string(dir.join("grants.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1, "one bypass, one audit line: {text}");
+        assert!(text.contains("\"tool\":\"ext_ir_scan\""), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

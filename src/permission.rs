@@ -123,22 +123,30 @@ impl PermissionChecker {
     pub async fn check(&self, tool_name: &str, args: &Value) -> bool {
         // Skill-derived grants: audit first, effect after. If the record cannot
         // be written the call is asked of the user instead of going through.
+        // The category check above this runs *before* the ledger, so a call whose
+        // intent reaches a denied category never spends a grant.
         if let Some(ledger) = &self.skill_grants {
-            let intent = explain_tool_call(tool_name, args);
-            match ledger.authorize_with_audit(tool_name, args, &intent) {
-                crate::skill::grants::AuditOutcome::Bypassed { skill } => {
-                    crate::skill::metrics::record_grant_activated();
-                    info!("Skill '{skill}' pre-authorized '{tool_name}' (audited)");
-                    return true;
+            let escaped = {
+                let perms = self.permissions.lock().await;
+                grant_blocked_by_category(tool_name, args, &perms)
+            };
+            if escaped.is_none() {
+                let intent = explain_tool_call(tool_name, args);
+                match ledger.authorize_with_audit(tool_name, args, &intent) {
+                    crate::skill::grants::AuditOutcome::Bypassed { skill } => {
+                        crate::skill::metrics::record_grant_activated();
+                        info!("Skill '{skill}' pre-authorized '{tool_name}' (audited)");
+                        return true;
+                    }
+                    crate::skill::grants::AuditOutcome::AuditFailed { skill, error } => {
+                        crate::skill::metrics::record_grant_audit_failure();
+                        info!(
+                            "Skill '{skill}' grant not used: audit record failed ({error}); asking the user"
+                        );
+                        return self.request_confirmation(tool_name, tool_category(tool_name), args).await;
+                    }
+                    crate::skill::grants::AuditOutcome::NoGrant => {}
                 }
-                crate::skill::grants::AuditOutcome::AuditFailed { skill, error } => {
-                    crate::skill::metrics::record_grant_audit_failure();
-                    info!(
-                        "Skill '{skill}' grant not used: audit record failed ({error}); asking the user"
-                    );
-                    return self.request_confirmation(tool_name, tool_category(tool_name), args).await;
-                }
-                crate::skill::grants::AuditOutcome::NoGrant => {}
             }
         }
 
@@ -273,6 +281,22 @@ fn detect_intent_category(tool_name: &str, args: &Value) -> Option<&'static str>
         // Format/disk operations bypass modify permission
         Verb::Format => Some("modify"),
         _ => None,
+    }
+}
+
+/// Whether a skill-derived bypass must be refused because the call's *intent*
+/// reaches a category the user has not allowed. This is what keeps the five
+/// categories the final authority over `allowed-tools`.
+pub(crate) fn grant_blocked_by_category(
+    tool_name: &str,
+    args: &Value,
+    perms: &HashMap<String, bool>,
+) -> Option<&'static str> {
+    let reached = detect_intent_category(tool_name, args)?;
+    if perms.get(reached).copied().unwrap_or(false) {
+        None
+    } else {
+        Some(reached)
     }
 }
 
@@ -556,6 +580,153 @@ mod tests {
         assert_eq!(record["tool"], "sys_process");
         assert_eq!(record["decision"], "auto-granted");
         assert_eq!(record["session"], "sess-gate");
+    }
+
+    /// 造一个"已同意"的技能：内容绑住（清单哈希）+ 状态里记着同一个哈希。
+    fn consented_fixture(dir: &std::path::Path, skill: &str, tools: &str) -> crate::skill::SkillManager {
+        use crate::skill::schema;
+        std::fs::create_dir_all(dir.join(skill)).unwrap();
+        let md = format!("---\nname: {skill}\ndescription: d\nallowed-tools: {tools}\n---\n# body\n");
+        std::fs::write(dir.join(skill).join("SKILL.md"), &md).unwrap();
+        schema::write_manifest(&dir.join(skill), &schema::SourceManifest::local(md.as_bytes()))
+            .unwrap();
+        let hash = schema::skill_md_hash(md.as_bytes());
+        std::fs::write(
+            dir.join("skills_state.json"),
+            format!(
+                "{{\"{skill}\":{{\"enabled\":true,\"grants\":{{\"consented_hash\":\"{hash}\",\"tools\":[\"{tools}\"]}}}}}}"
+            ),
+        )
+        .unwrap();
+        crate::skill::SkillManager::new(dir.to_str().unwrap())
+    }
+
+    /// 免审批按名字生效：`ext_ir_scan` 落进 `_ => execute`（默认要背书），
+    /// 技能同意后这个外置工具就不再逐次问。
+    #[tokio::test]
+    async fn a_name_level_grant_bypasses_a_tool_the_category_map_would_stop() {
+        let tmp = std::env::temp_dir().join(format!("rs_gate_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mgr = consented_fixture(&tmp, "ExtScan", "ext_ir_scan");
+        let ledger = mgr.grant_ledger(&["ExtScan".to_string()], "sess-name");
+        assert!(
+            !ledger.is_empty(),
+            "a declared name must produce a live grant"
+        );
+
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let checker = PermissionChecker::new(
+            pending,
+            tx,
+            Arc::new(Mutex::new(default_permissions())),
+            "inv-name".to_string(),
+            "FoxIR".to_string(),
+            None,
+            Some(Arc::new(ledger)),
+        );
+
+        let allowed = checker
+            .check("ext_ir_scan", &serde_json::json!({ "args": "-s" }))
+            .await;
+        let audit = tmp.join("_audit").join("grants.jsonl");
+        let text = std::fs::read_to_string(&audit).expect("one audit line must exist");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(allowed, "the consented name should go through without prompting");
+        assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    /// 观察到待审批队列里出现请求，立刻把 sender 丢掉：闸门会当作"用户侧断开"
+    /// 拒掉，测试因此不必等 30 秒超时，而且断言的是"它确实去问了"。
+    async fn watch_one_request(pending: PendingMap) -> Vec<String> {
+        for _ in 0..200 {
+            let mut queue = pending.lock().await;
+            if !queue.is_empty() {
+                return queue.drain().map(|(id, sender)| {
+                    drop(sender);
+                    id
+                }).collect();
+            }
+            drop(queue);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Vec::new()
+    }
+
+    /// 但最终判定仍归五类：窄臂命中 kill 的那条命令，意图里又落进用户已关掉的
+    /// delete 类 —— 授权不得使用，也不写台账。
+    #[tokio::test]
+    async fn an_intent_that_reaches_a_denied_category_overrides_an_active_grant() {
+        let tmp = std::env::temp_dir().join(format!("rs_gate_escape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mgr = consented_fixture(&tmp, "Contain", "shell_exec");
+        let ledger = mgr.grant_ledger(&["Contain".to_string()], "sess-escape");
+        assert!(!ledger.is_empty(), "the fixture must produce a live grant");
+
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut perms = default_permissions();
+        perms.insert("delete".to_string(), false);
+        let checker = PermissionChecker::new(
+            pending.clone(),
+            tx,
+            Arc::new(Mutex::new(perms)),
+            "inv-escape".to_string(),
+            "FoxIR".to_string(),
+            None,
+            Some(Arc::new(ledger)),
+        );
+
+        let watcher = tokio::spawn(watch_one_request(pending));
+        let allowed = checker
+            .check(
+                "shell_exec",
+                &serde_json::json!({
+                    "command": "taskkill /f /im evil.exe; Remove-Item C:\\evidence\\case01.log -Force"
+                }),
+            )
+            .await;
+        let asked = watcher.await.unwrap();
+        let audit = tmp.join("_audit").join("grants.jsonl");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(asked.len(), 1, "the gate must have asked the user");
+        assert!(
+            !allowed,
+            "a grant must not carry a call whose intent reaches the denied delete category"
+        );
+        assert!(
+            !audit.exists(),
+            "no bypass, so no audit line may be written"
+        );
+    }
+
+    /// 窄臂只看命令头，跨类检测要看整条命令行：`taskkill …; Remove-Item …` 的
+    /// 头是 kill，删除在后半段。
+    #[test]
+    fn intent_detection_covers_a_denied_category_anywhere_in_the_command() {
+        let compound = serde_json::json!({
+            "command": "taskkill /f /im evil.exe; Remove-Item C:\\evidence\\case01.log -Force"
+        });
+        assert_eq!(
+            detect_intent_category("shell_exec", &compound),
+            Some("delete"),
+            "the deletion in the second statement must still be seen"
+        );
+        // 正对照：纯 kill 不该被误判成跨类，否则免审批就废了
+        let clean = serde_json::json!({ "command": "taskkill /f /im evil.exe" });
+        assert_eq!(
+            detect_intent_category("shell_exec", &clean),
+            None,
+            "a command with no denied-category statement must not be flagged"
+        );
+        // 来源不是三件套的工具名不参与这套检测
+        assert_eq!(
+            detect_intent_category("ext_ir_scan", &compound),
+            None,
+            "ext_ tools take args, not a shell command line"
+        );
     }
 
     #[test]
