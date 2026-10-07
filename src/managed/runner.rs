@@ -25,7 +25,7 @@ use crate::memory::MemoryStore;
 use crate::model::openai::OpenAiProvider;
 use crate::permission::PendingMap;
 use crate::runner::Runner;
-use crate::skill::SkillManager;
+use crate::skill::{RankedSkill, SkillManager};
 
 use crate::tool::ToolRegistry;
 
@@ -175,20 +175,9 @@ pub struct ManagedRunner {
 ///
 /// Robust to FIFO caps on findings/leads: list lengths can saturate, but the
 /// round_index/id of the newest item still advances when real work happens.
-/// Cap for a single injected skill body (chars). Full skill bodies (e.g.
-/// multi-step templates) can be tens of KB and are often irrelevant to the
-/// subtask; the cap keeps the Executor brief bounded against inject bloat.
-const INJECT_SKILL_CHARS: usize = 3000;
-
-/// Up to `n` chars of `s`, truncating at a newline boundary when possible.
-fn take(n: usize, s: &str) -> &str {
-    let n = n.min(s.len());
-    let cut = &s[..n];
-    if let Some(back) = cut.rfind('\n') {
-        if back > n / 2 { return &s[..back]; }
-    }
-    &s[..n]
-}
+/// Round-numbered skill catalog for the Executor brief. `rank()` already
+/// truncates to `top_k`; this is the outer bound mirroring `skill_catalog_max`.
+const EXPERT_CATALOG_MAX: usize = 40;
 
 /// Resolves once the cancellation flag is set (polled every 200ms). Raced
 /// against long-horizon awaits with `tokio::select!` so a user STOP can always
@@ -773,28 +762,13 @@ impl ManagedRunner {
                 };
 
 
-                // Plan C: pre-match skills against brief + original task and inject
-                // matched skill content directly into the brief so the Executor
-                // has the skill workflow available without fuzzy matching.
+                // P2: the Executor gets a skill catalog + at most one suggestion
+                // line, never an inlined body — same invariant as Instant mode.
                 let brief = {
                     let matching_context = format!("{} {}", contract.original_task, plan.subtask);
-                    let matched = skill_manager.find_matching(&matching_context);
-                    if matched.is_empty() {
-                        brief
-                    } else {
-                        let mut enriched = brief;
-                        enriched.push_str("\n\n## Active Skills (pre-matched for this subtask)\n");
-                        enriched.push_str(
-                            "The following skill(s) matched this subtask. Follow their \
-                             workflows directly — ONLY follow a skill whose workflow is DIRECTLY relevant to THIS subtask; ignore pre-matched skills that do not apply (do not load them).\n\n"
-                        );
-                        for (content, score) in &matched {
-                            info!("[managed:{}] Injecting matched skill (score {:.3}) into Executor brief", session, score);
-                            enriched.push_str(&*take(INJECT_SKILL_CHARS, content));
-                            enriched.push('\n');
-                        }
-                        enriched
-                    }
+                    let ranked = skill_manager
+                        .rank(&matching_context, &crate::skill::types::SelectionPolicy::default());
+                    enrich_brief(&brief, &ranked, EXPERT_CATALOG_MAX)
                 };
 
                 // ── Channel routing: inject execution-channel guidance into the brief ──
@@ -1714,4 +1688,65 @@ fn html_escape(s: &str) -> String {
      .replace('>', "&gt;")
      .replace('"', "&quot;")
      .replace('\'', "&#39;")
+}
+
+/// P2: the Executor gets a skill *catalog* plus at most one suggestion line —
+/// never a body. Loading is the model's call via `skill_read_file`.
+fn enrich_brief(brief: &str, ranked: &[RankedSkill], catalog_max: usize) -> String {
+    if ranked.is_empty() {
+        return brief.to_string();
+    }
+    let mut out = String::from(brief);
+    out.push_str("\n\nSkills matched to this subtask (catalog only, no instructions inline):\n");
+    for skill in ranked.iter().take(catalog_max) {
+        out.push_str(&format!("- {}\n", skill.name));
+    }
+    if let Some(extra) = ranked.len().checked_sub(catalog_max) {
+        out.push_str(&format!("- ... and {} more (use list_skills)\n", extra));
+    }
+    out.push_str("Follow one only if its workflow is DIRECTLY relevant to this subtask; load it first.\n");
+    if let Some(top) = crate::skill::strong_hit(ranked) {
+        out.push_str(&format!(
+            "\nLikely applicable: \"{}\" — call skill_read_file(skill=\"{}\") before acting.\n",
+            top.name, top.name
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrich_brief;
+    use crate::skill::RankedSkill;
+
+    #[test]
+    fn expert_brief_lists_names_and_suggests_load_without_inlining_bodies() {
+        // 规格 §2.2 的 (b)：Expert 从此只拿目录 + 一行建议，正文一律按需。
+        // 阈值建议行只在 top-1 分数 ≥ min_score×2 (=0.2) 时出现。
+        let ranked = vec![RankedSkill { name: "TriageFlow".to_string(), score: 2.0 }];
+        let out = enrich_brief("BASE BRIEF", &ranked, 40);
+
+        assert!(out.starts_with("BASE BRIEF"), "the brief must be preserved: {out}");
+        assert!(out.contains("TriageFlow"), "the matched skill must be listed: {out}");
+        assert!(
+            out.contains("skill_read_file"),
+            "the executor must be told how to load it: {out}"
+        );
+        assert!(
+            out.contains("Likely applicable"),
+            "a strong hit must earn a suggestion line: {out}"
+        );
+        assert!(
+            !out.contains("# "),
+            "the brief must carry no skill body markdown: {out}"
+        );
+
+        let weak = vec![RankedSkill { name: "ColdOne".to_string(), score: 0.11 }];
+        let out2 = enrich_brief("B", &weak, 40);
+        assert!(out2.contains("ColdOne"), "weak hits still get catalog treatment: {out2}");
+        assert!(
+            !out2.contains("Likely applicable"),
+            "a weak hit must not earn a suggestion line: {out2}"
+        );
+    }
 }

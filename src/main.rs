@@ -573,9 +573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skill_listing_strategy = Arc::new(std::sync::atomic::AtomicUsize::new(
         crate::skill::SkillListingStrategy::from_str(&config.agent.skill_listing_strategy).index(),
     ));
-    let skill_max_inline_chars = Arc::new(std::sync::atomic::AtomicUsize::new(config.agent.skill_max_inline_chars));
     let skill_catalog_max = Arc::new(std::sync::atomic::AtomicUsize::new(config.agent.skill_catalog_max));
-    let skill_hot_top_k = Arc::new(std::sync::atomic::AtomicUsize::new(config.agent.skill_hot_top_k));
 
     // Build runner using builder pattern (ADK-RUST style)
     let runner = Runner::builder()
@@ -591,9 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_context_scaling(enable_context_scaling.clone())
         .max_inline_chars(max_inline_chars.clone())
         .skill_listing_strategy(skill_listing_strategy.clone())
-        .skill_max_inline_chars(skill_max_inline_chars.clone())
         .skill_catalog_max(skill_catalog_max.clone())
-        .skill_hot_top_k(skill_hot_top_k.clone())
         .with_can_spawn(orchestration_enabled)
         .with_mode(crate::context::AgentMode::Instant)
         .build()
@@ -751,9 +747,7 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         enable_context_scaling: enable_context_scaling.clone(),
         max_inline_chars: max_inline_chars.clone(),
         skill_listing_strategy: skill_listing_strategy.clone(),
-        skill_max_inline_chars: skill_max_inline_chars.clone(),
         skill_catalog_max: skill_catalog_max.clone(),
-        skill_hot_top_k: skill_hot_top_k.clone(),
         expert_max_iterations: Arc::new(AtomicUsize::new(config.agent.expert_max_iterations)),
         expert_tool_timeout_secs: Arc::new(AtomicUsize::new(config.agent.expert_tool_timeout_secs)),
         expert_max_tool_retries: Arc::new(AtomicUsize::new(config.agent.expert_max_tool_retries)),

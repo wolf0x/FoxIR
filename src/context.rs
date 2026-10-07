@@ -333,12 +333,8 @@ pub struct InvocationContext {
     pub max_inline_chars: usize,
     /// Skill catalog listing strategy used when building the system prompt.
     pub skill_listing_strategy: crate::skill::SkillListingStrategy,
-    /// Max chars of a single hot skill body inlined into the prompt.
-    pub skill_max_inline_chars: usize,
     /// Max number of cold skills listed (name:desc) in the skill catalog.
     pub skill_catalog_max: usize,
-    /// Top-K fuzzy-matched skills inlined (hot) per turn.
-    pub skill_hot_top_k: usize,
     /// Tool execution timeout in seconds
     pub tool_timeout_secs: u64,
     /// Per-TODO-item timeout in seconds: an item left 'in_progress' longer than
@@ -455,9 +451,7 @@ impl InvocationContext {
             enable_context_scaling: true,
             max_inline_chars: 120_000,
             skill_listing_strategy: crate::skill::SkillListingStrategy::Query,
-            skill_max_inline_chars: 6000,
             skill_catalog_max: 40,
-            skill_hot_top_k: 3,
             tool_timeout_secs: 300,
             todo_item_timeout_secs: 600,
             max_tool_retries: 2,
@@ -573,21 +567,9 @@ impl InvocationContext {
         self
     }
 
-    /// Set the max chars of a single hot skill body inlined into the prompt.
-    pub fn with_skill_max_inline_chars(mut self, chars: usize) -> Self {
-        self.skill_max_inline_chars = chars;
-        self
-    }
-
     /// Set the max number of cold skills listed in the catalog.
     pub fn with_skill_catalog_max(mut self, n: usize) -> Self {
         self.skill_catalog_max = n;
-        self
-    }
-
-    /// Set the top-K fuzzy-matched skills inlined (hot) per turn.
-    pub fn with_skill_hot_top_k(mut self, k: usize) -> Self {
-        self.skill_hot_top_k = k;
         self
     }
 

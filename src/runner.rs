@@ -41,9 +41,7 @@ pub struct Runner {
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
     skill_listing_strategy: Arc<AtomicUsize>,
-    skill_max_inline_chars: Arc<AtomicUsize>,
     skill_catalog_max: Arc<AtomicUsize>,
-    skill_hot_top_k: Arc<AtomicUsize>,
     /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
     can_spawn: bool,
     /// Operational mode for this run (Instant unlocks orchestration at depth 0).
@@ -65,9 +63,7 @@ pub struct RunnerBuilder {
     enable_context_scaling: Arc<AtomicBool>,
     max_inline_chars: Arc<AtomicUsize>,
     skill_listing_strategy: Arc<AtomicUsize>,
-    skill_max_inline_chars: Arc<AtomicUsize>,
     skill_catalog_max: Arc<AtomicUsize>,
-    skill_hot_top_k: Arc<AtomicUsize>,
     /// Whether the root run may spawn sub-agent workers (SDD v1.5 2.x).
     can_spawn: bool,
     /// Operational mode for this run (Instant unlocks orchestration at depth 0).
@@ -90,9 +86,7 @@ impl RunnerBuilder {
             enable_context_scaling: Arc::new(AtomicBool::new(true)),
             max_inline_chars: Arc::new(AtomicUsize::new(120_000)),
             skill_listing_strategy: Arc::new(AtomicUsize::new(0)),
-            skill_max_inline_chars: Arc::new(AtomicUsize::new(6000)),
             skill_catalog_max: Arc::new(AtomicUsize::new(40)),
-            skill_hot_top_k: Arc::new(AtomicUsize::new(3)),
             can_spawn: false,
             mode: crate::context::AgentMode::Instant,
         }
@@ -160,18 +154,8 @@ impl RunnerBuilder {
         self
     }
 
-    pub fn skill_max_inline_chars(mut self, v: Arc<AtomicUsize>) -> Self {
-        self.skill_max_inline_chars = v;
-        self
-    }
-
     pub fn skill_catalog_max(mut self, v: Arc<AtomicUsize>) -> Self {
         self.skill_catalog_max = v;
-        self
-    }
-
-    pub fn skill_hot_top_k(mut self, v: Arc<AtomicUsize>) -> Self {
-        self.skill_hot_top_k = v;
         self
     }
 
@@ -206,9 +190,7 @@ impl RunnerBuilder {
             enable_context_scaling: self.enable_context_scaling,
             max_inline_chars: self.max_inline_chars,
             skill_listing_strategy: self.skill_listing_strategy,
-            skill_max_inline_chars: self.skill_max_inline_chars,
             skill_catalog_max: self.skill_catalog_max,
-            skill_hot_top_k: self.skill_hot_top_k,
             can_spawn: self.can_spawn,
             mode: self.mode,
         })
@@ -238,9 +220,7 @@ impl Runner {
             enable_context_scaling: self.enable_context_scaling.clone(),
             max_inline_chars: self.max_inline_chars.clone(),
             skill_listing_strategy: self.skill_listing_strategy.clone(),
-            skill_max_inline_chars: self.skill_max_inline_chars.clone(),
             skill_catalog_max: self.skill_catalog_max.clone(),
-            skill_hot_top_k: self.skill_hot_top_k.clone(),
             can_spawn: false,
             mode: self.mode,
         }
@@ -299,9 +279,7 @@ impl Runner {
          .with_enable_context_scaling(self.enable_context_scaling.load(Ordering::SeqCst))
          .with_max_inline_chars(self.max_inline_chars.load(Ordering::SeqCst))
          .with_skill_listing_strategy(crate::skill::SkillListingStrategy::from_index(self.skill_listing_strategy.load(Ordering::SeqCst)))
-         .with_skill_max_inline_chars(self.skill_max_inline_chars.load(Ordering::SeqCst))
          .with_skill_catalog_max(self.skill_catalog_max.load(Ordering::SeqCst))
-         .with_skill_hot_top_k(self.skill_hot_top_k.load(Ordering::SeqCst))
          .with_tool_timeout_secs(tool_timeout_secs)
          .with_max_tool_retries(max_tool_retries)
          .with_can_spawn(self.can_spawn)

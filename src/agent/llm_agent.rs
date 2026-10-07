@@ -887,7 +887,7 @@ impl LlmAgent {
     /// dashboard) is deliberately kept OUT of this prompt and appended
     /// after history as a trailing state message, so this head stays
     /// byte-identical across runs.
-    fn build_system_prompt(&self, tier: PromptTier, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_max_inline_chars: usize, skill_catalog_max: usize, skill_hot_top_k: usize) -> (String, bool) {
+    fn build_system_prompt(&self, tier: PromptTier, user_message: &str, history: &[ChatMessage], skill_strategy: crate::skill::SkillListingStrategy, skill_catalog_max: usize) -> (String, bool) {
         // Determine user's preferred name: USER.md explicit > detected given name > Master
         let user_name = self.resolve_user_name();
 
@@ -1328,13 +1328,9 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
         // Agents built with `.without_skills()` have no SkillManager (B4.3) and
         // get no skill listing/body injection at all.
         if let Some(sm) = &self.skill_manager {
-            let (skills_opt, skill_activated) = sm.build_skills_prompt(
-                &matching_context,
-                skill_strategy,
-                skill_max_inline_chars,
-                skill_catalog_max,
-                skill_hot_top_k,
-            );
+            let ranked = sm.rank(&matching_context, &crate::skill::types::SelectionPolicy::default());
+            let (skills_opt, skill_activated) =
+                sm.build_skills_prompt(&ranked, skill_strategy, skill_catalog_max);
             if let Some(skills_section) = skills_opt {
                 task_skill_active = skill_activated;
                 prompt.push_str(&skills_section);
@@ -1607,9 +1603,7 @@ impl Agent for LlmAgent {
             }
         };
 
-        let skill_max_inline_chars = ctx.skill_max_inline_chars;
         let skill_catalog_max = ctx.skill_catalog_max;
-        let skill_hot_top_k = ctx.skill_hot_top_k;
 
         // Use an mpsc channel to produce events, then convert to a Stream
         let (tx, rx) = tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(200);
@@ -1629,9 +1623,7 @@ impl Agent for LlmAgent {
             user_message,
             &ctx.conversation_history,
             skill_strategy,
-            skill_max_inline_chars,
             skill_catalog_max,
-            skill_hot_top_k,
         );
         // Per-turn-volatile context (date, language rule, TODO/evidence
         // state, guidance pool, budget dashboard) is collected in
@@ -4007,11 +3999,11 @@ mod tests {
         let agent = LlmAgent::builder().provider(provider).tools(tools).build().expect("agent build");
         let (minimal, _) = agent.build_system_prompt(
             PromptTier::Minimal, "hi", &[],
-            crate::skill::SkillListingStrategy::Query, 6000, 40, 3,
+            crate::skill::SkillListingStrategy::Query, 40,
         );
         let (full, _) = agent.build_system_prompt(
             PromptTier::Full, "hi", &[],
-            crate::skill::SkillListingStrategy::Query, 6000, 40, 3,
+            crate::skill::SkillListingStrategy::Query, 40,
         );
         assert!(full.starts_with(&minimal), "Minimal must be a strict prefix of Full");
         assert!(full.len() > minimal.len());

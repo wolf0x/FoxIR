@@ -100,15 +100,9 @@ pub struct AgentConfig {
     /// (query | names-only | discover-tool-only).
     #[serde(default = "default_skill_listing_strategy")]
     pub skill_listing_strategy: String,
-    /// Max chars of a single hot skill body inlined into the prompt.
-    #[serde(default = "default_skill_max_inline_chars")]
-    pub skill_max_inline_chars: usize,
     /// Max number of cold skills listed (name:desc) in the catalog.
     #[serde(default = "default_skill_catalog_max")]
     pub skill_catalog_max: usize,
-    /// Top-K fuzzy-matched skills inlined (hot) per turn.
-    #[serde(default = "default_skill_hot_top_k")]
-    pub skill_hot_top_k: usize,
     /// Enable the skill self-improvement loop (default: false). When on, the
     /// model may patch a skill via `improve_skill`, guarded by cooldown + audit.
     #[serde(default = "default_skill_self_improve")]
@@ -518,9 +512,7 @@ impl Default for Config {
                 enable_context_scaling: default_enable_context_scaling(),
                 max_inline_chars: default_max_inline_chars(),
                 skill_listing_strategy: default_skill_listing_strategy(),
-                skill_max_inline_chars: default_skill_max_inline_chars(),
                 skill_catalog_max: default_skill_catalog_max(),
-                skill_hot_top_k: default_skill_hot_top_k(),
                 skill_self_improve: default_skill_self_improve(),
                 tool_timeout_secs: default_tool_timeout_secs(),
                 llm_read_timeout_secs: default_llm_read_timeout_secs(),
@@ -583,9 +575,7 @@ fn default_context_window_threshold() -> usize { 80 }
 fn default_enable_context_scaling() -> bool { true }
 fn default_max_inline_chars() -> usize { 120_000 }
 fn default_skill_listing_strategy() -> String { "query".to_string() }
-fn default_skill_max_inline_chars() -> usize { 6000 }
 fn default_skill_catalog_max() -> usize { 40 }
-fn default_skill_hot_top_k() -> usize { 3 }
 fn default_skill_self_improve() -> bool { false }
 fn default_tool_timeout_secs() -> usize { 300 }
 fn default_max_tool_retries() -> usize { 2 }
@@ -832,6 +822,12 @@ impl Config {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let mut config: Config = toml::from_str(&content)?;
+            for key in Self::stale_skill_keys(&content) {
+                tracing::warn!(
+                    "config.toml still sets `{}` (removed in P2, it never took effect); ignoring it",
+                    key
+                );
+            }
             config.agent.modes.validate_orchestration();
             Ok(config)
         } else {
@@ -880,12 +876,8 @@ enable_context_scaling = true
 max_inline_chars = 120000
 # Skill catalog listing strategy for the system prompt (query | names-only | discover-tool-only)
 skill_listing_strategy = "query"
-# Max chars of a single hot skill body inlined into the prompt (default: 6000)
-skill_max_inline_chars = 6000
 # Max number of cold skills listed (name:desc) in the catalog (default: 40)
 skill_catalog_max = 40
-# Top-K fuzzy-matched skills inlined (hot) per turn (default: 3)
-skill_hot_top_k = 3
 # Enable the skill self-improvement loop (default: false)
 skill_self_improve = false
 # browser_cdp: run hidden (true, default) or in a visible window (false, for one-time logins)
@@ -993,6 +985,25 @@ orchestration = "off"
         config.save(workspace_dir)
     }
 
+    /// Keys that P2 removed (`skill_max_inline_chars`, `skill_hot_top_k`) but that
+    /// may still sit in a user's config.toml. Serde ignores them; this exists so
+    /// the load path can say so out loud instead of silently dropping them.
+    /// Unparseable TOML returns nothing — that file fails earlier, in `load`.
+    pub fn stale_skill_keys(text: &str) -> Vec<String> {
+        const REMOVED: [&str; 2] = ["skill_max_inline_chars", "skill_hot_top_k"];
+        let Ok(value) = text.parse::<toml::Value>() else {
+            return Vec::new();
+        };
+        let Some(agent) = value.get("agent").and_then(|a| a.as_table()) else {
+            return Vec::new();
+        };
+        REMOVED
+            .iter()
+            .filter(|key| agent.contains_key(**key))
+            .map(|key| key.to_string())
+            .collect()
+    }
+
     pub fn save(&self, workspace_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = std::path::Path::new(workspace_dir).join("config.toml");
         let content = toml::to_string_pretty(self)?;
@@ -1018,9 +1029,7 @@ orchestration = "off"
         enable_context_scaling: bool,
         max_inline_chars: usize,
         skill_listing_strategy: String,
-        skill_max_inline_chars: usize,
         skill_catalog_max: usize,
-        skill_hot_top_k: usize,
         browser_headless: bool,
         browser_executable: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1041,9 +1050,7 @@ orchestration = "off"
         config.agent.enable_context_scaling = enable_context_scaling;
         config.agent.max_inline_chars = max_inline_chars;
         config.agent.skill_listing_strategy = skill_listing_strategy;
-        config.agent.skill_max_inline_chars = skill_max_inline_chars;
         config.agent.skill_catalog_max = skill_catalog_max;
-        config.agent.skill_hot_top_k = skill_hot_top_k;
         config.agent.browser_headless = browser_headless;
         config.agent.browser_executable = browser_executable.trim().to_string();
 
@@ -1109,6 +1116,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn config_with_removed_skill_keys_still_loads_and_keeps_other_settings() {
+        // 规格 §2.3 的启动保证：删字段不许让用户已有的 config.toml 加载失败。
+        // 夹具必须带 [server] —— `Config` 的 server 字段本身没有 #[serde(default)]，
+        // 缺整段会直接 "missing field `server`" 报错（既有行为，模板总会写出来）。
+        let ws = tmp_ws("stalekeys");
+        std::fs::write(
+            Path::new(&ws).join("config.toml"),
+            "[server]\n[agent]\nmax_iterations = 7\nskill_hot_top_k = 3\nskill_max_inline_chars = 6000\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load(&ws).expect("a config with removed keys must still load");
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(cfg.agent.max_iterations, 7, "sibling settings must survive: {cfg:?}");
+        assert_eq!(
+            cfg.agent.skill_catalog_max,
+            default_skill_catalog_max(),
+            "the kept key falls back to its documented default"
+        );
+    }
+
+    #[test]
+    fn stale_skill_keys_are_detected_without_touching_other_settings() {
+        // P2 删掉了两个从未生效的旋钮。用户 config.toml 里的残留键必须"忽略但说一声"，
+        // 而不是让启动失败，也不是悄悄什么都不报（那正是本仓另一处 unwrap_or_default 的老路）。
+        let stale = {
+            let mut v = Config::stale_skill_keys(
+                "[agent]\nmax_iterations = 7\nskill_hot_top_k = 3\nskill_max_inline_chars = 6000\n",
+            );
+            v.sort();
+            v
+        };
+        assert_eq!(
+            stale,
+            vec!["skill_hot_top_k".to_string(), "skill_max_inline_chars".to_string()],
+            "both removed keys must surface"
+        );
+
+        // 正对照：活着的键不许被误报
+        assert!(
+            Config::stale_skill_keys("[agent]\nmax_iterations = 7\nskill_catalog_max = 40\n").is_empty(),
+            "skill_catalog_max is still a real setting"
+        );
+        assert!(Config::stale_skill_keys("").is_empty(), "empty config has nothing to report");
     }
 
     /// Tools 页那一行开关必须存住：以前 computer_use / human_intervention 只改内存，

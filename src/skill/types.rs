@@ -60,12 +60,20 @@ pub struct SkillMetadata {
 fn default_enabled() -> bool { true }
 fn default_version() -> String { "1.0.0".to_string() }
 
+/// One skill's ranking result. The payload is the *name*, never the body: the
+/// body stays behind the lazy `OnceLock` until the model asks for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedSkill {
+    pub name: String,
+    pub score: f32,
+}
+
 /// Controls skill ranking and filtering during matching.
 ///
-/// Scoring is metadata-only and currently uses weighted token overlap over
-/// `name` (x4.0) and `description` (x2.5). There is no body term and no length
-/// normalization: `score_skill` reads neither. Only skills scoring >= `min_score`
-/// are returned, up to `top_k`.
+/// Scoring is metadata-only: weighted token overlap over `name` (x4.0),
+/// `description` (x2.5) and `triggers` (x2.0). There is no body term and no
+/// length normalization — `score_skill` reads neither, so ranking never forces
+/// a lazy body load. Skills scoring >= `min_score` are returned, up to `top_k`.
 #[derive(Debug, Clone)]
 pub struct SelectionPolicy {
     pub top_k: usize,
@@ -125,9 +133,9 @@ pub struct Skill {
 /// How the skill catalog is surfaced to the model on each turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SkillListingStrategy {
-    /// Inline top-K matched skills with full body; list the remaining cold
-    /// skills as name:description so the model can load them on demand via
-    /// `skill_read_file`.
+    /// Catalog of skills as `name: description` lines (matched ones listed first),
+    /// plus at most one "Likely applicable" suggestion line. No skill body is
+    /// inlined — the model loads it on demand via `skill_read_file`.
     #[default]
     Query,
     /// Only a compact list of skill names (no descriptions, no bodies).

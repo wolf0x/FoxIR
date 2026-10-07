@@ -235,9 +235,7 @@ pub struct AppState {
     pub enable_context_scaling: Arc<AtomicBool>,
     pub max_inline_chars: Arc<AtomicUsize>,
     pub skill_listing_strategy: Arc<AtomicUsize>,
-    pub skill_max_inline_chars: Arc<AtomicUsize>,
     pub skill_catalog_max: Arc<AtomicUsize>,
-    pub skill_hot_top_k: Arc<AtomicUsize>,
     pub context_window_threshold: Arc<AtomicUsize>,
     pub tool_timeout_secs: Arc<AtomicUsize>,
     pub max_tool_retries: Arc<AtomicUsize>,
@@ -958,9 +956,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "enable_context_scaling": state.enable_context_scaling.load(Ordering::SeqCst),
         "max_inline_chars": state.max_inline_chars.load(Ordering::SeqCst),
         "skill_listing_strategy": crate::skill::SkillListingStrategy::from_index(state.skill_listing_strategy.load(Ordering::SeqCst)).as_str().to_string(),
-        "skill_max_inline_chars": state.skill_max_inline_chars.load(Ordering::SeqCst),
         "skill_catalog_max": state.skill_catalog_max.load(Ordering::SeqCst),
-        "skill_hot_top_k": state.skill_hot_top_k.load(Ordering::SeqCst),
         "tool_timeout_secs": state.tool_timeout_secs.load(Ordering::SeqCst),
         "max_tool_retries": state.max_tool_retries.load(Ordering::SeqCst),
         "primary_model": state.primary_model.read().unwrap().clone(),
@@ -3756,18 +3752,10 @@ async fn agent_settings_save_handler(
         .and_then(|v| v.as_str())
         .map(crate::skill::SkillListingStrategy::from_str)
         .unwrap_or_else(|| crate::skill::SkillListingStrategy::from_index(state.skill_listing_strategy.load(Ordering::SeqCst)));
-    let skill_max_inline_chars = body.get("skill_max_inline_chars")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(state.skill_max_inline_chars.load(Ordering::SeqCst));
     let skill_catalog_max = body.get("skill_catalog_max")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(state.skill_catalog_max.load(Ordering::SeqCst));
-    let skill_hot_top_k = body.get("skill_hot_top_k")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(state.skill_hot_top_k.load(Ordering::SeqCst));
     let session_max = body.get("session_max")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
@@ -3790,9 +3778,7 @@ async fn agent_settings_save_handler(
         enable_context_scaling,
         max_inline_chars,
         skill_listing_strategy.as_str().to_string(),
-        skill_max_inline_chars,
         skill_catalog_max,
-        skill_hot_top_k,
         browser_headless,
         browser_executable.clone(),
     ) {
@@ -3816,9 +3802,7 @@ async fn agent_settings_save_handler(
             state.enable_context_scaling.store(enable_context_scaling, Ordering::SeqCst);
             state.max_inline_chars.store(max_inline_chars, Ordering::SeqCst);
             state.skill_listing_strategy.store(skill_listing_strategy.index(), Ordering::SeqCst);
-            state.skill_max_inline_chars.store(skill_max_inline_chars, Ordering::SeqCst);
             state.skill_catalog_max.store(skill_catalog_max, Ordering::SeqCst);
-            state.skill_hot_top_k.store(skill_hot_top_k, Ordering::SeqCst);
             state.session_max.store(session_max, Ordering::SeqCst);
 
             info!("Agent settings saved and hot-reloaded: max_iterations={}, rabbit_hole={}, ctx_threshold={}, tool_timeout={}, max_retries={}",
@@ -3839,9 +3823,7 @@ async fn agent_settings_save_handler(
                 "enable_context_scaling": enable_context_scaling,
                 "max_inline_chars": max_inline_chars,
                 "skill_listing_strategy": skill_listing_strategy.as_str().to_string(),
-                "skill_max_inline_chars": skill_max_inline_chars,
                 "skill_catalog_max": skill_catalog_max,
-                "skill_hot_top_k": skill_hot_top_k,
             }))
         }
         Err(e) => {

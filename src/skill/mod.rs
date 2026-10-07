@@ -4,7 +4,7 @@ pub mod verify;
 pub mod self_improve;
 pub mod metrics;
 pub mod schema;
-pub use self::types::SkillListingStrategy;
+pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};
 use std::borrow::Cow;
@@ -273,40 +273,34 @@ impl SkillManager {
             })
             .cloned()
     }
-    pub fn find_matching(&self, user_message: &str) -> Vec<(String, f32)> {
-        self.find_matching_with(user_message, &SelectionPolicy::default())
-    }
-
-    /// Score and rank skills by weighted token overlap with the user message.
+    /// Rank enabled skills against a message.
     ///
     /// Scoring weights (inspired by adk-skill's lexical overlap model):
-    /// - Name match:         ×4.0
-    /// - Description match:  ×2.5
-    ///
-    /// Matching is metadata-only: no body term and no length normalization, so
-    /// ranking never forces a lazy body load. Returns `(name, score)` pairs.
-    pub fn find_matching_with(&self, user_message: &str, policy: &SelectionPolicy) -> Vec<(String, f32)> {
+    /// name ×4.0, description ×2.5, triggers ×2.0. Matching is metadata-only —
+    /// the returned payload is the skill's **name**, so ranking never reads (or
+    /// caches) a skill body.
+    pub fn rank(&self, user_message: &str, policy: &SelectionPolicy) -> Vec<RankedSkill> {
         let skills = self.skills.read().unwrap();
         let query_tokens = Self::tokenize(user_message);
         if query_tokens.is_empty() {
             return Vec::new();
         }
 
-        let mut scored: Vec<(String, f32)> = skills
+        let mut scored: Vec<RankedSkill> = skills
             .iter()
             .filter(|s| s.metadata.enabled)
-            .filter_map(|s| {
-                let score = Self::score_skill(s, &query_tokens);
-                if score >= policy.min_score {
-                    Some((s.body().into_owned(), score))
-                } else {
-                    None
-                }
+            .map(|s| RankedSkill {
+                name: s.metadata.name.clone(),
+                score: Self::score_skill(s, &query_tokens),
             })
+            .filter(|ranked| ranked.score >= policy.min_score)
             .collect();
 
-        // Sort by score descending, take top-K
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(policy.top_k);
         scored
     }
@@ -324,6 +318,16 @@ impl SkillManager {
         let desc_tokens = Self::tokenize(&skill.metadata.description);
         let desc_hits = query_tokens.iter().filter(|t| desc_tokens.contains(t)).count();
         score += desc_hits as f32 * 2.5;
+
+        // Trigger-phrase token overlap (weight: 2.0)
+        let trigger_tokens: Vec<String> = skill
+            .metadata
+            .triggers
+            .iter()
+            .flat_map(|phrase| Self::tokenize(phrase))
+            .collect();
+        let trigger_hits = query_tokens.iter().filter(|t| trigger_tokens.contains(t)).count();
+        score += trigger_hits as f32 * 2.0;
 
         // (Body-token overlap and length normalization removed on purpose:
         // scoring is metadata-only so matching never forces a lazy body load.)
@@ -345,11 +349,9 @@ impl SkillManager {
     /// list; `DiscoverToolOnly`/`Disabled` emit nothing.
     pub fn build_skills_prompt(
         &self,
-        _matching_context: &str,
+        matching: &[RankedSkill],
         strategy: SkillListingStrategy,
-        _max_inline_chars: usize,
         catalog_max: usize,
-        _hot_top_k: usize,
     ) -> (Option<String>, bool) {
         if matches!(strategy, SkillListingStrategy::DiscoverToolOnly | SkillListingStrategy::Disabled) {
             return (None, false);
@@ -364,42 +366,68 @@ impl SkillManager {
         let mut out = String::new();
         out.push_str("## Active Skills Context\n");
         out.push_str(
-            "The following skill(s) are available. Review each name:description \
-             and decide whether any Skill directly applies to the current task. \
-             To use one, load it with `skill_read_file` (skill=\"<name>\", empty \
-             path lists its files) so its instructions are injected. Large \
-             supporting/reference files (e.g. 'reference.md') are never \
-             auto-injected; read them with `skill_read_file`. Do NOT use generic \
-             `file_read`/`shell` to locate skill files.\n\n",
+            "The skill catalog below is names and one-line descriptions only — no \
+             instructions are inlined. Review each name:description and decide whether \
+             any Skill directly applies to the current task. To use one, load it with \
+             `skill_read_file` (skill=\"<name>\", empty path lists its files; \
+             path=\"SKILL.md\" returns its instructions). Large supporting/reference \
+             files (e.g. 'reference.md') are never auto-injected; read them with \
+             `skill_read_file`. Do NOT use generic `file_read`/`shell` to locate \
+             skill files.\n\n",
         );
 
+        let mut activated = false;
         match strategy {
             SkillListingStrategy::NamesOnly | SkillListingStrategy::DiscoverToolOnly => {
                 let names: Vec<&str> = enabled.iter().map(|s| s.metadata.name.as_str()).collect();
                 out.push_str(&format!("Available skills: {}\n", names.join(", ")));
             }
             SkillListingStrategy::Query => {
-                let mut n = 0usize;
-                let total = enabled.len();
-                for s in &enabled {
-                    if n >= catalog_max {
-                        let omitted = total - n;
-                        out.push_str(&format!(
-                            "- ... and {} more (use `list_skills` to see them all)\n",
-                            omitted
-                        ));
-                        break;
+                // Matched skills first (in score order), then the rest of the catalog.
+                let mut listed: Vec<&Skill> = Vec::new();
+                for ranked in matching {
+                    if let Some(found) = enabled.iter().find(|s| s.metadata.name == ranked.name) {
+                        if !listed.iter().any(|l| l.metadata.name == found.metadata.name) {
+                            listed.push(found);
+                        }
                     }
-                    let desc = s.metadata.description.chars().take(120).collect::<String>();
-                    out.push_str(&format!("- **{}**: {}\n", s.metadata.name, desc));
-                    n += 1;
+                }
+                for s in &enabled {
+                    if !listed.iter().any(|l| l.metadata.name == s.metadata.name) {
+                        listed.push(s);
+                    }
+                }
+
+                for s in listed.iter().take(catalog_max) {
+                    // An empty description degrades to "discoverable by name" — do
+                    // not emit a trailing empty colon for it.
+                    if s.metadata.description.trim().is_empty() {
+                        out.push_str(&format!("- **{}**\n", s.metadata.name));
+                    } else {
+                        let desc = s.metadata.description.chars().take(120).collect::<String>();
+                        out.push_str(&format!("- **{}**: {}\n", s.metadata.name, desc));
+                    }
+                }
+                if listed.len() > catalog_max {
+                    out.push_str(&format!(
+                        "- ... and {} more (use `list_skills` to see them all)\n",
+                        listed.len() - catalog_max
+                    ));
+                }
+
+                if let Some(top) = strong_hit(matching) {
+                    metrics::record_suggestion_shown();
+                    out.push_str(&format!(
+                        "\nLikely applicable: \"{}\" — call skill_read_file(skill=\"{}\") before acting.\n",
+                        top.name, top.name
+                    ));
                 }
             }
             SkillListingStrategy::Disabled => unreachable!("Disabled is short-circuited at the top of build_skills_prompt"),
         }
 
         metrics::record_catalog_turn();
-        (Some(out), false)
+        (Some(out), activated)
     }
 
     fn tokenize(text: &str) -> Vec<String> {
@@ -660,6 +688,15 @@ pub fn catalog_report(manager: &SkillManager) -> Value {
                 .collect(),
         ),
     })
+}
+
+/// A top-1 match strong enough to earn the "Likely applicable" line: twice the
+/// `min_score` the ranker itself filters with, read from the same
+/// `SelectionPolicy` rather than restated as a literal. Shared by the Instant
+/// catalog and the Expert brief so the two can never drift apart.
+pub fn strong_hit(matching: &[RankedSkill]) -> Option<&RankedSkill> {
+    let threshold = SelectionPolicy::default().min_score * 2.0;
+    matching.first().filter(|top| top.score >= threshold)
 }
 
 /// Insert a skill, de-duplicating by (case-insensitive) name so the skills
@@ -1072,10 +1109,11 @@ struct SkillReadFileTool {
 impl Tool for SkillReadFileTool {
     fn name(&self) -> &str { "skill_read_file" }
     fn description(&self) -> &str {
-        "Progressive skill reading: read a supporting/reference file inside an already-loaded skill \
-directory (e.g. its 'reference.md' HTML template). Skills load their SKILL.md instructions \
-automatically; use this tool to fetch large companion files on demand. Pass an empty 'path' to \
-list the files available in the skill directory."
+        "Progressive skill reading: the catalog in the system prompt is names and \
+descriptions only — no instructions are inlined. Load a skill's instructions with \
+`skill_read_file` (skill=\"<name>\", path=\"SKILL.md\"), or pass an empty path to list \
+the files in its directory; large supporting/reference files (e.g. 'reference.md') are \
+read the same way on demand. Do NOT use generic `file_read`/`shell` to locate skill files."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -1133,6 +1171,7 @@ list the files available in the skill directory."
         match std::fs::read_to_string(&target_canon) {
             Ok(raw) => {
                 let content = if is_instruction {
+                    metrics::record_skill_load();
                     let mut b = strip_frontmatter(&raw).to_string();
                     if let Some(block) = steps::contract_block(&skill.step_contract()) { b.push_str(&block); }
                     b
@@ -1321,6 +1360,125 @@ impl Tool for RemoveSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_catalog_lists_names_and_suggests_only_for_a_strong_hit() {
+        // 规格 §2.2：Instant 的注入面是"目录 + 至多一行建议"。建议行必须自己带上
+        // 加载方式，并且只在 top-1 分数 ≥ min_score×2 时出现 —— 弱命中不给建议。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_sugg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for (dir, name, desc) in [
+            ("TriageFlow", "TriageFlow", "phishing triage workflow"),
+            ("ColdOne", "ColdOne", "unrelated cold skill"),
+        ] {
+            std::fs::create_dir_all(tmp.join(dir)).unwrap();
+            std::fs::write(
+                tmp.join(dir).join("SKILL.md"),
+                format!("---\nname: {}\ndescription: {}\n---\n# {} BODY-SENTINEL-7c3b\n", name, desc, name),
+            )
+            .unwrap();
+        }
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+
+        let strong = vec![RankedSkill { name: "TriageFlow".to_string(), score: 2.0 }];
+        let out = mgr
+            .build_skills_prompt(&strong, SkillListingStrategy::Query, 40)
+            .0
+            .expect("query strategy emits a section");
+        let weak = vec![RankedSkill { name: "ColdOne".to_string(), score: 0.11 }];
+        let out2 = mgr
+            .build_skills_prompt(&weak, SkillListingStrategy::Query, 40)
+            .0
+            .expect("query strategy emits a section");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(out.contains("TriageFlow"), "the hit must be listed: {out}");
+        assert!(
+            out.contains("Likely applicable: \"TriageFlow\"") && out.contains("skill_read_file"),
+            "a strong hit earns exactly one suggestion line telling how to load it: {out}"
+        );
+        assert!(!out.contains("BODY-SENTINEL-7c3b"), "no body bytes may be injected: {out}");
+
+        assert!(out2.contains("ColdOne"), "weak hits are still catalogued: {out2}");
+        assert!(
+            !out2.contains("Likely applicable"),
+            "a weak hit must not earn a suggestion line: {out2}"
+        );
+        assert!(!out2.contains("BODY-SENTINEL-7c3b"), "no body bytes may be injected: {out2}");
+    }
+
+    #[test]
+    fn matching_returns_ranked_names_without_bodies() {
+        // 规格 §2.1/§2.2 的核心：排序结果的载荷是 (name, score)，不是正文。
+        // 今天唯一读正文的地方就是这里（find_matching_with 用 s.body() 造返回值），
+        // 所以改成 name 之后，未加载技能的 OnceLock 必须仍然是空的。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_rank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Ranked")).unwrap();
+        std::fs::write(
+            tmp.join("Ranked/SKILL.md"),
+            "---\nname: Ranked\ndescription: triage workflow\n---\n# Ranked Body SENTINEL-4f7a\n",
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let ranked = mgr.rank("triage", &types::SelectionPolicy::default());
+        let sk = mgr.find_skill("Ranked").expect("the skill is registered");
+        let body_loaded = match &sk.content {
+            SkillContent::Lazy { cell, .. } => cell.get().is_some(),
+            SkillContent::Eager(_) => true,
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(ranked.len(), 1, "{:?}", ranked);
+        assert_eq!(ranked[0].name, "Ranked", "the payload must be the name, not the body");
+        assert_eq!(ranked[0].score, 2.5, "one description hit at x2.5, hand-derived");
+        assert!(!body_loaded, "ranking must not materialize the lazy body");
+    }
+
+    #[test]
+    fn triggers_earn_a_weight_in_matching() {
+        // 规格 §2.1：`triggers` 从"文档里声称 ×2.0、代码里没有"变成真的打分面。
+        // Phish 的 name/description 都不含查询词，只有 triggers 命中；
+        // 另一条 Desc 用 description 命中，作为"别把既有信号改坏"的正对照。
+        let tmp = std::env::temp_dir().join(format!("rs_skill_trig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("Phish")).unwrap();
+        std::fs::create_dir_all(tmp.join("Desc")).unwrap();
+        std::fs::write(
+            tmp.join("Phish/SKILL.md"),
+            "---\nname: netcap\ndescription: network capture tool\ntriggers: [phishing]\n---\n# P\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("Desc/SKILL.md"),
+            "---\nname: mailer\ndescription: phishing email triage\n---\n# D\n",
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let ranked = mgr.rank("phishing", &types::SelectionPolicy::default());
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 期望分数是手算的：Phish 只有 triggers 命中 1 次 → 1 × 2.0；
+        // Desc 的 description 命中 1 次 → 1 × 2.5。
+        assert_eq!(
+            ranked.len(),
+            2,
+            "the trigger hit and the description hit must both match: {:?}",
+            ranked
+        );
+        assert!(
+            ranked.iter().any(|r| r.name == "netcap" && r.score == 2.0),
+            "triggers must contribute their own weight: {:?}",
+            ranked
+        );
+        assert!(
+            ranked.iter().any(|r| r.name == "mailer" && r.score == 2.5),
+            "description scoring must not regress: {:?}",
+            ranked
+        );
+    }
 
     #[test]
     fn catalog_report_carries_warn_findings_for_registered_skills() {
@@ -1669,7 +1827,7 @@ mod tests {
 
         let mgr = SkillManager::new(tmp.to_str().unwrap());
 
-        let (q_opt, q_act) = mgr.build_skills_prompt("process report", SkillListingStrategy::Query, 20_000, 40, 3);
+        let (q_opt, q_act) = mgr.build_skills_prompt(&[], SkillListingStrategy::Query, 40);
         let q = q_opt.expect("query section present");
         let ql = q.to_lowercase();
         // Model self-routing: no body is auto-inlined; every enabled skill is a
@@ -1684,12 +1842,12 @@ mod tests {
         assert!(ql.contains("noisyskill"), "skill should be catalogued: {}", q);
         assert!(!q_act, "catalog-only routing must NOT mark a task skill active");
 
-        let (n_opt, _) = mgr.build_skills_prompt("process", SkillListingStrategy::NamesOnly, 20_000, 40, 3);
+        let (n_opt, _) = mgr.build_skills_prompt(&[], SkillListingStrategy::NamesOnly, 40);
         let n = n_opt.expect("names section present");
         assert!(n.contains("AlwaysSkill"));
         assert!(!n.contains("# always body"), "names-only must not inline bodies: {}", n);
 
-        assert!(mgr.build_skills_prompt("x", SkillListingStrategy::DiscoverToolOnly, 0, 0, 0).0.is_none());
+        assert!(mgr.build_skills_prompt(&[], SkillListingStrategy::DiscoverToolOnly, 0).0.is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1705,7 +1863,7 @@ mod tests {
             "---\nname: Alpha\ndescription: alpha\n---\n# Alpha\n").unwrap();
         let mgr = SkillManager::new(tmp.to_str().unwrap());
         assert!(!mgr.list().is_empty(), "Alpha skill should load");
-        let (p, active) = mgr.build_skills_prompt("alpha", SkillListingStrategy::Disabled, 20_000, 40, 3);
+        let (p, active) = mgr.build_skills_prompt(&[], SkillListingStrategy::Disabled, 40);
         assert!(p.is_none(), "Disabled must not inject a skill prompt");
         assert!(!active, "Disabled must not mark a task skill active");
         let _ = std::fs::remove_dir_all(&tmp);
