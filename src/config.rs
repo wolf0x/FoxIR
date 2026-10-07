@@ -152,6 +152,10 @@ pub struct AgentConfig {
     /// Tool permissions: category -> allowed (true) or denied (false)
     #[serde(default)]
     pub tool_permissions: HashMap<String, bool>,
+    /// 第三状态：这里的类别**连技能授权也不得免审批**（`allowed-tools` 名单和
+    /// 意图窄化过的臂一起失效，回落到逐次审批）。缺省空表 = 今天的两态行为。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_locks: Vec<String>,
     /// External Tools（`<workspace>/tools` 目录里的可执行文件）的启用状态与自定义描述。
     /// 过去存在 `tools/tools_state.json`，跟 GUI 其它配置分两处写；现在统一进 config.toml，
     /// 旧文件只在 map 为空时一次性导入（不删，避免动用户文件）。
@@ -526,6 +530,7 @@ impl Default for Config {
                 fallback_model: None,
                 timezone_offset: default_timezone_offset(),
                 tool_permissions: HashMap::new(),
+                permission_locks: Vec::new(),
                 external_tools: HashMap::new(),
                 expert_max_iterations: default_expert_max_iterations(),
                 expert_tool_timeout_secs: default_expert_tool_timeout_secs(),
@@ -913,6 +918,9 @@ timezone_offset = 8
 # write = true
 # delete = false
 # execute = true
+# Locked categories: skill allowed-tools grants do NOT apply here (still asked
+# every time, even after the user approved the skill).
+# permission_locks = ["delete", "execute"]
 
 # Multi-agent orchestration (SDD v1.5). Phase 0 enables read-only worker
 # sub-agents for the Expert root at depth 0. Set orchestration = "off" to keep
@@ -1139,6 +1147,48 @@ mod tests {
             default_skill_catalog_max(),
             "the kept key falls back to its documented default"
         );
+    }
+
+    #[test]
+    fn permission_locks_round_trip_and_survive_extended_save() {
+        // 第三状态的持久化位。两条加载路都要断：写了必须原样回来；
+        // 老用户的 config.toml 里根本没有这一行 ⇒ 必须读成空表，而不是加载失败。
+        let ws = tmp_ws("locks");
+        std::fs::write(
+            Path::new(&ws).join("config.toml"),
+            "[server]\n[agent]\nmax_iterations = 7\npermission_locks = [\"delete\", \"execute\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&ws).expect("the new key must load");
+        assert_eq!(
+            cfg.agent.permission_locks,
+            vec!["delete".to_string(), "execute".to_string()],
+            "the locks must read back verbatim"
+        );
+
+        let ws2 = tmp_ws("locks_absent");
+        std::fs::write(
+            Path::new(&ws2).join("config.toml"),
+            "[server]\n[agent]\nmax_iterations = 7\n",
+        )
+        .unwrap();
+        let old = Config::load(&ws2).unwrap();
+        assert!(
+            old.agent.permission_locks.is_empty(),
+            "a missing key must load as an empty list, not an error: {:?}",
+            old.agent.permission_locks
+        );
+
+        // GUI 的扩展设置保存走 load-then-mutate：它不碰这一行，也就不许把它抹掉
+        Config::save_extended_settings(&ws, Some("m".to_string()), None, 8, HashMap::new()).unwrap();
+        let after = Config::load(&ws).unwrap();
+        assert_eq!(
+            after.agent.permission_locks, cfg.agent.permission_locks,
+            "extended-settings save must not clear the locks"
+        );
+        assert_eq!(after.agent.max_iterations, 7, "sibling settings must survive");
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&ws2);
     }
 
     #[test]

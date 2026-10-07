@@ -1773,6 +1773,15 @@ impl Agent for LlmAgent {
         // derived from this list, so they cannot outlive the run.
         let skill_manager_for_grants = self.skill_manager.clone();
         let audit_session = ctx.base.session_id.clone();
+        // Third state, read once per run: categories the user locked, where no
+        // skill grant (bare name or narrowed arm) may bypass the prompt.
+        let grant_locked = match crate::config::Config::load(&self.workspace_dir) {
+            Ok(cfg) => cfg.agent.permission_locks,
+            Err(e) => {
+                tracing::warn!("Could not read permission_locks from config: {}; no category is locked", e);
+                Vec::new()
+            }
+        };
         let knowledge_reminder: Option<String> = if knowledge_pre_retrieval && !minimal_tier {
             self.build_knowledge_reminder(&user_message)
         } else {
@@ -2675,6 +2684,7 @@ impl Agent for LlmAgent {
                             author.clone(),
                             preauth_profile.clone(),
                             skill_grants,
+                            grant_locked.clone(),
                         );
 
                         let hist_start = history.len();

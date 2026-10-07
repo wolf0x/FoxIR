@@ -90,6 +90,9 @@ pub struct PermissionChecker {
     /// Skill-derived grants for this run. Unlike the profile above, a bypass
     /// through these is only allowed after its audit record is on disk.
     skill_grants: Option<Arc<crate::skill::grants::SkillGrantLedger>>,
+    /// Categories the user locked: no skill grant may bypass them. Read once
+    /// per run from `config.agent.permission_locks`.
+    grant_locked: Vec<String>,
 }
 
 impl PermissionChecker {
@@ -101,6 +104,7 @@ impl PermissionChecker {
         author: String,
         preauth_profile: Option<Arc<crate::managed::permission_profile::PermissionProfile>>,
         skill_grants: Option<Arc<crate::skill::grants::SkillGrantLedger>>,
+        grant_locked: Vec<String>,
     ) -> Self {
         Self {
             pending,
@@ -110,6 +114,7 @@ impl PermissionChecker {
             author,
             preauth_profile,
             skill_grants,
+            grant_locked,
         }
     }
 
@@ -128,7 +133,7 @@ impl PermissionChecker {
         if let Some(ledger) = &self.skill_grants {
             let escaped = {
                 let perms = self.permissions.lock().await;
-                grant_blocked_by_category(tool_name, args, &perms)
+                grant_blocked_by_category(tool_name, args, &perms, &self.grant_locked)
             };
             if escaped.is_none() {
                 let intent = explain_tool_call(tool_name, args);
@@ -284,14 +289,22 @@ fn detect_intent_category(tool_name: &str, args: &Value) -> Option<&'static str>
     }
 }
 
-/// Whether a skill-derived bypass must be refused because the call's *intent*
-/// reaches a category the user has not allowed. This is what keeps the five
-/// categories the final authority over `allowed-tools`.
+/// Whether a skill-derived bypass must be refused. Two ways, both narrowing:
+/// - the tool's **own** category is in `locked` (the third state: no skill grant
+///   may speak for the user in this category, name or arm alike);
+/// - the call's *intent* reaches a category the user has not allowed.
+///
+/// This is what keeps the five categories the final authority over `allowed-tools`.
 pub(crate) fn grant_blocked_by_category(
     tool_name: &str,
     args: &Value,
     perms: &HashMap<String, bool>,
+    locked: &[String],
 ) -> Option<&'static str> {
+    let own = tool_category(tool_name);
+    if locked.iter().any(|cat| cat == own) {
+        return Some(own);
+    }
     let reached = detect_intent_category(tool_name, args)?;
     if perms.get(reached).copied().unwrap_or(false) {
         None
@@ -561,6 +574,7 @@ mod tests {
             "FoxIR".to_string(),
             None,
             Some(Arc::new(ledger)),
+            vec![],
         );
 
         let allowed = checker
@@ -624,6 +638,7 @@ mod tests {
             "FoxIR".to_string(),
             None,
             Some(Arc::new(ledger)),
+            vec![],
         );
 
         let allowed = checker
@@ -676,6 +691,7 @@ mod tests {
             "FoxIR".to_string(),
             None,
             Some(Arc::new(ledger)),
+            vec![],
         );
 
         let watcher = tokio::spawn(watch_one_request(pending));
@@ -727,6 +743,95 @@ mod tests {
             None,
             "ext_ tools take args, not a shell command line"
         );
+    }
+
+    /// 第三状态：类别被"锁"住时，技能授权（名单级和窄臂都算）一律不使用。
+    #[test]
+    fn a_locked_category_refuses_names_and_arms_alike() {
+        let perms = default_permissions(); // delete/execute 都是 false（要背书）
+        let locked = vec!["delete".to_string(), "execute".to_string()];
+        let none_locked: [String; 0] = [];
+
+        assert_eq!(
+            grant_blocked_by_category(
+                "ext_ir_scan",
+                &serde_json::json!({ "args": "-s" }),
+                &perms,
+                &locked
+            ),
+            Some("execute"),
+            "a locked category refuses even a declared name"
+        );
+        assert_eq!(
+            grant_blocked_by_category(
+                "file_delete",
+                &serde_json::json!({ "path": "C:\\evidence\\x.log" }),
+                &perms,
+                &locked
+            ),
+            Some("delete"),
+            "the tool's own category is what the lock speaks about"
+        );
+        assert_eq!(
+            grant_blocked_by_category(
+                "shell_exec",
+                &serde_json::json!({ "command": "taskkill /f /im evil.exe" }),
+                &perms,
+                &locked
+            ),
+            Some("execute"),
+            "the lock is on the category, not on one declaration shape"
+        );
+
+        // 正对照：同样的调用在没有锁时都必须放行得了（否则上面三条是空断言）
+        assert_eq!(
+            grant_blocked_by_category("ext_ir_scan", &serde_json::json!({}), &perms, &none_locked),
+            None
+        );
+        assert_eq!(
+            grant_blocked_by_category(
+                "shell_exec",
+                &serde_json::json!({ "command": "taskkill /f /im evil.exe" }),
+                &perms,
+                &none_locked
+            ),
+            None
+        );
+    }
+
+    /// 锁住 execute 之后，已同意的 `ext_ir_scan` 也必须回到逐次审批，且不写台账。
+    #[tokio::test]
+    async fn a_locked_category_sends_a_granted_tool_back_to_confirmation() {
+        let tmp = std::env::temp_dir().join(format!("rs_gate_locked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mgr = consented_fixture(&tmp, "ExtScan", "ext_ir_scan");
+        let ledger = mgr.grant_ledger(&["ExtScan".to_string()], "sess-locked");
+        assert!(!ledger.is_empty(), "the fixture must produce a live grant");
+
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let checker = PermissionChecker::new(
+            pending.clone(),
+            tx,
+            Arc::new(Mutex::new(default_permissions())),
+            "inv-locked".to_string(),
+            "FoxIR".to_string(),
+            None,
+            Some(Arc::new(ledger)),
+            vec!["execute".to_string()],
+        );
+
+        let watcher = tokio::spawn(watch_one_request(pending));
+        let allowed = checker
+            .check("ext_ir_scan", &serde_json::json!({ "args": "-s" }))
+            .await;
+        let asked = watcher.await.unwrap();
+        let audit = tmp.join("_audit").join("grants.jsonl");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(asked.len(), 1, "a locked category must go back to asking");
+        assert!(!allowed, "the lock wins over the consent");
+        assert!(!audit.exists(), "no bypass, so no audit line may be written");
     }
 
     #[test]
