@@ -1,6 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
+<script>
+  /* the theme before the first paint, so a dark user never sees a white flash */
+  try {
+    document.documentElement.dataset.theme =
+      localStorage.getItem('foxir.theme') === 'dark' ? 'dark' : 'light';
+  } catch (e) {}
+</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Cache-Control" content="no-cache">
@@ -134,7 +141,8 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .nav-tab.active::before{content:'';position:absolute;left:0;top:50%;width:3.5px;height:58%;border-radius:2px;background:linear-gradient(180deg,#38bdf8,#3498db);transform:translateY(-50%)}
 .nav-tab.active .ic{color:#38bdf8}
 .ico{width:16px;height:16px;flex:none;vertical-align:-2px;display:inline-block;fill:currentColor}
-.sidebar-ftr{padding:12px 16px;border-top:1px solid #34495e;margin-top:auto;font-size:12px;color:#95a5a6;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* 两页脚同高、各占一行：左边是状态+两枚切换钮，右边是版本号 */
+.sidebar-ftr{height:44px;padding:0 16px;border-top:1px solid #34495e;margin-top:auto;font-size:12px;color:#95a5a6;display:flex;align-items:center;gap:8px;flex-wrap:nowrap;overflow:hidden}
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-right:6px;animation:pulse 3s ease-in-out infinite}
 .status-dot.ok{background:var(--green);animation:none}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.9)}}
@@ -182,7 +190,12 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .todo-desc.cancelled{text-decoration:line-through;opacity:.4}
 .todo-empty{color:var(--t3);text-align:center;padding:14px 0;font-size:11px}
 .output-section{flex:0 0 auto;border-top:1px solid var(--border)}
-.panel-ftr{flex:0 0 auto;height:41.77px;border-top:1px solid var(--border);flex-shrink:0}
+/* 右页脚：与左页脚同高 44px；右栏整体可滚，所以它 sticky 在底，并铺上与面板同色的底，
+   否则滚动时内容会从它背后透出来 */
+.panel-ftr{flex:0 0 auto;height:44px;border-top:1px solid var(--border);flex-shrink:0;
+  position:sticky;bottom:0;z-index:2;background:#f0f3f5;
+  display:flex;align-items:center;justify-content:flex-end;padding:0 14px;
+  font-size:11px;color:var(--t3);font-family:var(--mono)}
 .output-hdr{display:flex;align-items:center;justify-content:space-between}
 .btn-open-folder{background:none;border:none;cursor:pointer;font-size:14px;padding:0 2px;opacity:.65;line-height:1}
 .btn-open-folder:hover{opacity:1}
@@ -234,10 +247,25 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .msg-sel-btn:hover{background:var(--green);color:#fff;border-color:var(--green)}
 .msg-sel-btn.active{background:var(--green);color:#fff;border-color:var(--green)}
 .msg.selected .msg-content{outline:2px solid var(--green);outline-offset:1px}
-/* ── Selection export bar ── */
-.sel-bar{display:none;align-items:center;gap:12px;padding:8px 20px;background:#e8f5e9;border-top:1px solid #a5d6a7;font-size:12px;color:#2e7d32;flex-shrink:0}
+/* ── Selection export bar: PCBuddy's .selbar shape — a card that sits on the
+   composer rather than a strip welded to it — with FoxIR's own light palette. ── */
+.sel-bar{display:none;align-items:center;gap:10px;margin:0 auto 8px;padding:7px 12px;
+  width:860px;max-width:calc(100% - 32px);
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--rs);
+  font-size:12px;color:var(--t2);flex-shrink:0}
 .sel-bar.visible{display:flex}
-.sel-bar #selCount{font-weight:600}
+.sel-bar .lbl{white-space:nowrap}
+.sel-bar .n{font-family:var(--mono);color:var(--accent);font-weight:600}
+/* FoxIR's .btn has border:0; PCBuddy's bar buttons are bordered, and that 1px is
+   what makes them 24px tall instead of 22. */
+.sel-bar .btn{padding:3px 10px;font-size:12px;font-weight:500;border:1px solid #bdc3c7}
+.sel-bar .btn-p{border-color:var(--accent)}
+.sel-bar .btn-ghost{background:transparent;color:var(--t2)}
+.sel-bar .btn-ghost:hover{border-color:var(--accent);color:var(--t1)}
+.sel-bar .sel-clear{margin-left:auto}
+/* FoxIR's primary button lifts on hover; a 22px button inside a 7px-padded card
+   must not leave its own box. */
+.sel-bar .btn-p:hover{transform:none;box-shadow:none}
 
 /* 閳光偓閳光偓 Markdown Content Styling (full GFM, ref: NclawX) 閳光偓閳光偓 */
 .md-content{color:var(--t1);line-height:1.7;word-wrap:break-word;overflow-wrap:break-word}
@@ -391,12 +419,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 .managed-banner{padding:6px 20px;background:linear-gradient(135deg,#f5eef8,#fdf2e9);border-top:1px solid #e8d5f0;display:flex;align-items:center;gap:8px;font-size:11px;color:#8e44ad;font-weight:500;flex-shrink:0}
 
 /* Input bar */
-.input-bar{display:flex;align-items:flex-end;gap:10px;padding:16px 20px;background:#f8f9fa;border-top:1px solid #ecf0f1;flex-shrink:0}
-.input-bar input,.input-bar textarea{flex:1;padding:12px 16px;background:white;border:1px solid #bdc3c7;border-radius:var(--rs);color:var(--t1);font-size:14px;outline:0;font-family:inherit;height:44px}
-.input-bar textarea{resize:none;overflow-y:auto;line-height:1.4;min-height:44px;max-height:120px}
-.input-bar input:focus,.input-bar textarea:focus{border-color:#3498db;box-shadow:0 0 0 3px rgba(52,152,219,.1)}
-.input-bar .btn{height:44px;display:flex;align-items:center;padding:10px 24px}
-.interject-bar{display:flex;flex-wrap:wrap;gap:8px;padding:8px 16px;background:#eef4ff;border-top:1px solid #d9e5f7;font-size:13px}
+.interject-bar{display:flex;flex-wrap:wrap;gap:8px;padding:8px 16px;background:#eef4ff;border-top:1px solid #d9e5f7;font-size:13px;width:860px;max-width:calc(100% - 32px);margin:0 auto}
 .ij-item{display:inline-flex;align-items:center;gap:8px;background:#fff;border:1px solid #c3d6f2;border-radius:16px;padding:4px 10px;max-width:100%;color:#1f2937}
 .ij-item b{font-weight:600;white-space:normal}
 .ij-inject{background:#2563eb;color:#fff;border:none;border-radius:10px;padding:2px 8px;cursor:pointer;font-size:12px;white-space:nowrap}
@@ -406,8 +429,9 @@ input:checked+.slider:before{transform:translateX(20px)}
 
 /* ── Grok 风格输入框（Demo E 复刻：整体圆角容器） ── */
 .grok-bar{
-  display:flex; align-items:flex-end; gap:2px; margin:14px 16px; padding:10px 12px;
-  background:#fff; border:2px solid #cfd9de; border-radius:22px; flex-shrink:0;
+  display:flex; align-items:flex-end; gap:10px; margin:14px auto; padding:9px 9px 9px 44px;
+  max-width:860px; background:#fff; border:1px solid var(--border); border-radius:14px; flex-shrink:0;
+  position:relative;
   transition:border-color .3s, box-shadow .3s;
 }
 /* G2：执行时脉冲发光边框 */
@@ -422,59 +446,44 @@ input:checked+.slider:before{transform:translateX(20px)}
 .grok-bar:focus-within{border-color:#8ecdf8; box-shadow:0 0 0 1px #8ecdf8}
 .grok-bar input[type=file]{display:none}
 .grok-bar textarea{
-  flex:1; border:none; outline:0; resize:none; background:transparent; font-family:inherit;
-  color:var(--t1); font-size:15px; line-height:1.5; max-height:200px;
-  height:40px; min-height:40px; overflow-y:auto; padding:9px 4px 8px;
+  flex:1; min-width:0; height:auto; border:none; outline:0; resize:none; background:transparent; font-family:inherit;
+  color:var(--t1); font-size:15px; line-height:1.55; max-height:216px;
+  min-height:24px; overflow-y:auto; padding:3px 0;
 }
 .grok-bar textarea::placeholder{color:#8b98a5}
-/* 附件按钮 */
+/* 附件按钮：PCBuddy 的 .clip —— 坐在输入框左侧 44px 预留槽里的 30×30  Quiet 圆角块，
+   不再占 flex 位，所以整条高度只由发送按钮决定 */
 .grok-attach{
-  flex-shrink:0; width:40px; height:40px; border-radius:50%; border:none; background:transparent;
-  display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--accent);
-  transition:background .15s, transform .1s; position:relative;
+  position:absolute; left:7px; bottom:8px; width:30px; height:30px; padding:0;
+  border-radius:8px; border:none; background:transparent;
+  display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--t2);
+  transition:background .15s, transform .1s;
 }
-.grok-attach:hover{background:#e8f4fd}
+.grok-attach:hover{background:#e8f4fd;color:var(--accent)}
 .grok-attach:active{transform:scale(.92)}
-.grok-attach svg{width:19px;height:19px}
+.grok-attach svg{width:16px;height:16px}
 .grok-attach .grok-dot{
-  position:absolute; top:6px; right:6px; width:7px; height:7px; border-radius:50%;
+  position:absolute; top:3px; right:3px; width:6px; height:6px; border-radius:50%;
   background:var(--accent); display:none;
 }
 .grok-attach.has-file .grok-dot{display:block}
 /* 模式按钮 + 下拉 */
-.grok-mode{position:relative; flex-shrink:0; margin-right:2px}
-.grok-mode-btn{
-  display:flex; align-items:center; gap:6px; border:none; background:transparent; cursor:pointer;
-  height:40px; padding:0 10px; border-radius:13px; font-size:14px; color:var(--t1);
-  transition:background .15s;
-}
-.grok-mode-btn:hover{background:#e9edf0}
-.grok-mode-btn .grok-bolt{width:16px;height:16px;color:var(--accent)}
-.grok-mode-btn.expert .grok-bolt{color:#8e44ad}
-.grok-mode-btn .grok-arr{width:14px;height:14px;color:var(--t3);transition:transform .2s}
-.grok-mode.open .grok-mode-btn .grok-arr{transform:rotate(180deg)}
-.grok-menu{
-  position:absolute; bottom:calc(100% + 8px); right:0; min-width:250px; background:#fff;
-  border:1px solid var(--border); border-radius:14px; box-shadow:0 4px 16px rgba(0,0,0,.10);
-  padding:6px; display:none; z-index:100;
-}
-.grok-mode.open .grok-menu{display:block}
-.grok-item{display:flex; gap:10px; padding:10px; border-radius:10px; cursor:pointer; align-items:flex-start}
-.grok-item:hover{background:#f5f8fa}
-.grok-item .grok-ic{width:30px;height:30px;border-radius:8px;background:#e8f4fd;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.grok-item .grok-ic svg{width:16px;height:16px;color:var(--accent)}
-.grok-item .grok-ic.grok-exp{background:#f0ebfe}
-.grok-item .grok-ic.grok-exp svg{color:#8e44ad}
-.grok-item .grok-it{font-size:13px;font-weight:600;color:var(--t1)}
-.grok-item .grok-id{font-size:12px;color:var(--t3);margin-top:2px;line-height:1.4}
-.grok-item .grok-chk{margin-left:auto;color:var(--accent);font-weight:700;padding-top:2px;visibility:hidden}
-.grok-item.sel .grok-chk{visibility:visible}
+/* 模式切换：只剩一枚闪电，和 ◐ 亮暗钮同规格（22 圆），说明只在 hover 时以 tooltip 出现 */
+#modeBtn{margin-left:6px;width:22px;height:22px;flex:none;padding:0;border-radius:50%;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid #34495e;background:transparent;color:#95a5a6;font-size:11px;line-height:1}
+#modeBtn .grok-bolt{width:11px;height:11px;color:#8fb4d6}
+#modeBtn.expert .grok-bolt{color:#b39ddb}
+#modeBtn:hover{border-color:var(--accent);color:#e8eef4}
+:root[data-theme="dark"] #modeBtn{border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] #modeBtn .grok-bolt{color:#7a5312}
+:root[data-theme="dark"] #modeBtn.expert .grok-bolt{color:#c4b5fd}
 /* 发送 / 停止（狼头 LOGO 呼吸 ↔ 红色停止脉冲） */
 .grok-send{
-  flex-shrink:0; width:40px; height:40px; border-radius:50%; border:none; cursor:pointer;
+  flex-shrink:0; width:34px; height:34px; border-radius:50%; border:none; cursor:pointer;
   background:linear-gradient(135deg,#3498db 0%,#2ecc71 100%); color:#fff; display:flex; align-items:center; justify-content:center;
   transition:opacity .2s, transform .1s;
-  font-size:20px;
+  font-size:17px;
   position:relative;
 }
 .grok-send:not(:disabled):not(.running){animation:breatheGrok 2.2s ease-in-out infinite}
@@ -495,11 +504,11 @@ input:checked+.slider:before{transform:translateX(20px)}
 .btn-img{height:44px;width:44px;display:flex;align-items:center;justify-content:center;padding:0;background:#e8f4fd;border:1px solid #3498db;border-radius:var(--rs);cursor:pointer;font-size:20px;color:#3498db;flex-shrink:0}
 .btn-img:hover{background:#d0e9f9}
 .btn-img.disabled{opacity:0.4;cursor:not-allowed;background:#f0f0f0;border-color:#bdc3c7;color:#bdc3c7}
-.img-preview-bar{display:flex;gap:8px;padding:8px 20px 0;flex-wrap:wrap}
+.img-preview-bar{display:flex;gap:8px;padding:8px 20px 0;flex-wrap:wrap;width:860px;max-width:calc(100% - 32px);margin:0 auto}
 .img-preview-item{position:relative;width:64px;height:64px;border-radius:6px;overflow:hidden;border:1px solid #bdc3c7}
 .img-preview-item img{width:100%;height:100%;object-fit:cover}
 .img-preview-item .remove-img{position:absolute;top:1px;right:1px;width:18px;height:18px;background:rgba(0,0,0,0.6);color:#fff;border:none;border-radius:50%;font-size:12px;line-height:18px;text-align:center;cursor:pointer;padding:0}
-.file-preview-bar{display:flex;gap:8px;padding:8px 20px 0;flex-wrap:wrap}
+.file-preview-bar{display:flex;gap:8px;padding:8px 20px 0;flex-wrap:wrap;width:860px;max-width:calc(100% - 32px);margin:0 auto}
 .file-preview-item{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid #bdc3c7;border-radius:8px;padding:6px 10px;max-width:260px}
 .file-preview-item .fp-ext{font-size:10px;font-weight:700;color:#3498db;background:#e8f4fd;border-radius:4px;padding:2px 5px;flex-shrink:0}
 .file-preview-item .fp-name{font-size:12px;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -739,14 +748,14 @@ input:checked+.slider:before{transform:translateX(20px)}
 @keyframes lbFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes lbZoomIn{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}
 /* Slash command popup */
-.slash-popup{position:absolute;bottom:100%;left:20px;right:20px;max-height:260px;overflow-y:auto;background:white;border:1px solid #bdc3c7;border-radius:var(--rs);box-shadow:0 -4px 20px rgba(0,0,0,.12);z-index:100;display:none}
+.slash-popup{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);width:calc(100% - 32px);max-width:852px;max-height:260px;overflow-y:auto;background:white;border:1px solid #bdc3c7;border-radius:var(--rs);box-shadow:0 -4px 20px rgba(0,0,0,.12);z-index:100;display:none}
 .slash-popup.show{display:block}
-.slash-popup-item{padding:10px 16px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;flex-direction:column;gap:2px}
-.slash-popup-item:last-child{border-bottom:none}
+/* PCBuddy 的选择态：整行铺色，行内不再画分隔线 */
 .slash-popup-item:hover,.slash-popup-item.active{background:#e8f4fd}
-.slash-popup-name{font-weight:600;font-size:13px;color:var(--t1)}
-.slash-popup-desc{font-size:12px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.slash-popup-empty{padding:14px 16px;color:var(--t3);font-size:13px;text-align:center}
+.slash-popup-item{padding:5px 10px;cursor:pointer;display:flex;flex-direction:row;align-items:baseline;gap:10px;font-size:12.5px}
+.slash-popup-name{flex:none;font-family:var(--mono);font-weight:600;color:var(--accent)}
+.slash-popup-desc{min-width:0;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.slash-popup-empty{padding:8px 10px;color:var(--t3);font-size:12.5px;text-align:center}
 .expert-sec{margin-bottom:14px}
 .expert-sec h4{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#8b95a5;margin:8px 0 6px}
 .expert-stats{display:flex;gap:8px;flex-wrap:wrap}
@@ -992,14 +1001,270 @@ input:checked+.slider:before{transform:translateX(20px)}
 @keyframes lbFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes lbZoomIn{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}
 /* Slash command popup */
-.slash-popup{position:absolute;bottom:100%;left:20px;right:20px;max-height:260px;overflow-y:auto;background:white;border:1px solid #bdc3c7;border-radius:var(--rs);box-shadow:0 -4px 20px rgba(0,0,0,.12);z-index:100;display:none}
+.slash-popup{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);width:calc(100% - 32px);max-width:852px;max-height:260px;overflow-y:auto;background:white;border:1px solid #bdc3c7;border-radius:var(--rs);box-shadow:0 -4px 20px rgba(0,0,0,.12);z-index:100;display:none}
 .slash-popup.show{display:block}
-.slash-popup-item{padding:10px 16px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;flex-direction:column;gap:2px}
-.slash-popup-item:last-child{border-bottom:none}
+/* PCBuddy 的选择态：整行铺色，行内不再画分隔线 */
 .slash-popup-item:hover,.slash-popup-item.active{background:#e8f4fd}
-.slash-popup-name{font-weight:600;font-size:13px;color:var(--t1)}
-.slash-popup-desc{font-size:12px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.slash-popup-empty{padding:14px 16px;color:var(--t3);font-size:13px;text-align:center}
+.slash-popup-item{padding:5px 10px;cursor:pointer;display:flex;flex-direction:row;align-items:baseline;gap:10px;font-size:12.5px}
+.slash-popup-name{flex:none;font-family:var(--mono);font-weight:600;color:var(--accent)}
+.slash-popup-desc{min-width:0;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.slash-popup-empty{padding:8px 10px;color:var(--t3);font-size:12.5px;text-align:center}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   DARK OVERRIDE LAYER — palette copied from PCBuddy-Legacy
+   crates/web/assets/index.html :root (lines 12-35). Nothing here changes light.
+   ══════════════════════════════════════════════════════════════════════════ */
+:root[data-theme="dark"]{
+  --bg:#0a0d12; --bg2:#141922; --glass:#0f131a;
+  --border:#1f2733; --t1:#e4e9f1; --t2:#8b97a8; --t3:#5d6878;
+  --accent:#f5a623; --purple:#c4b5fd; --cyan:#7dd3fc; --red:#f87171;
+  --green:#4ade80; --orange:#f5a623;
+  --font:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+  --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,"SF Mono",Menlo,monospace;
+  color-scheme:dark;
+  /* 标准路径：给设了 scrollbar-width 的元素（.log-panel 是 thin）用，
+     那类元素在 Chromium 里会忽略 ::-webkit-scrollbar 自定义样式 */
+  scrollbar-color:#232c39 transparent;
+}
+:root[data-theme="dark"] body{background:#06080b}
+:root[data-theme="dark"] .container{background:var(--bg);box-shadow:0 20px 60px rgba(0,0,0,.6)}
+/* sidebar: Legacy uses one flat panel with a hairline, not a navy block */
+:root[data-theme="dark"] .sidebar{background:#0f131a;border-right:1px solid #1f2733}
+:root[data-theme="dark"] .sidebar-hdr{border-bottom-color:#1f2733}
+:root[data-theme="dark"] .sidebar-hdr h2,:root[data-theme="dark"] .sidebar-hdr p{color:#e4e9f1}
+:root[data-theme="dark"] .nav-tab{color:#8b97a8}
+:root[data-theme="dark"] .nav-tab:hover{background:#141922;color:#e4e9f1}
+:root[data-theme="dark"] .nav-tab.active{background:#1a212c;color:#f5a623}
+:root[data-theme="dark"] .sessions-hdr,:root[data-theme="dark"] .sessions-item{color:#8b97a8}
+:root[data-theme="dark"] .sessions-item:hover{background:#141922;color:#e4e9f1}
+:root[data-theme="dark"] .sessions-item.active{background:#1a212c;color:#e4e9f1}
+:root[data-theme="dark"] .sessions-new{border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] .sidebar-ftr{border-top-color:#1f2733;color:#5d6878}
+/* main surfaces */
+:root[data-theme="dark"] .chat-main{background:#0a0d12;border-right-color:#1f2733}
+:root[data-theme="dark"] .topbar{background:#0f131a;border-bottom-color:#1f2733;color:#8b97a8}
+:root[data-theme="dark"] .mode-bar{background:#0f131a;border-top-color:#1f2733}
+:root[data-theme="dark"] .log-panel{background:#0f131a}
+:root[data-theme="dark"] .panel-ftr{background:#0f131a;border-top-color:#1f2733;color:#5d6878}
+:root[data-theme="dark"] .log-hdr{background:#141922;color:#5d6878;border-bottom-color:#1f2733}
+:root[data-theme="dark"] .todo-item,:root[data-theme="dark"] .output-item{background:#141922;border-color:#1f2733}
+:root[data-theme="dark"] .todo-item:hover,:root[data-theme="dark"] .output-item:hover{background:#1a212c}
+:root[data-theme="dark"] .todo-desc,:root[data-theme="dark"] .output-name{color:#8b97a8}
+:root[data-theme="dark"] .todo-desc.completed,:root[data-theme="dark"] .output-name:hover{color:#5d6878}
+:root[data-theme="dark"] .log-entry{background:#11151c}
+:root[data-theme="dark"] .log-entry.info{border-left-color:#7dd3fc}
+:root[data-theme="dark"] .log-entry.tool{border-left-color:#c4b5fd;background:rgba(196,181,253,.07)}
+:root[data-theme="dark"] .log-entry.warn{border-left-color:#f5a623;background:rgba(245,166,35,.09)}
+:root[data-theme="dark"] .log-entry.error{border-left-color:#f87171;background:rgba(248,113,113,.09)}
+:root[data-theme="dark"] .log-entry.thinking{border-left-color:#c4b5fd;background:rgba(196,181,253,.06)}
+/* messages: bubbles go flat panel-2 with a hairline; the user bubble keeps the accent */
+:root[data-theme="dark"] .msg.user .msg-content{background:#1a212c;border:1px solid #2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .msg.assistant .msg-content{background:#0f131a;border:1px solid #1f2733;color:#e4e9f1}
+:root[data-theme="dark"] .msg-role{color:#f5a623}
+:root[data-theme="dark"] .msg-avatar{background:#1a212c}
+:root[data-theme="dark"] .msg-time{color:#5d6878}
+:root[data-theme="dark"] .msg-copy-btn,:root[data-theme="dark"] .msg-sel-btn{background:#141922;border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] .msg-copy-btn:hover,:root[data-theme="dark"] .msg-sel-btn:hover{background:#1a212c;color:#e4e9f1}
+/* markdown */
+:root[data-theme="dark"] .md-content code:not(pre code){background:#1a212c;border:1px solid #2a3442;color:#7dd3fc}
+:root[data-theme="dark"] .md-content pre{background:#0a0c0e;border-color:#1f2733}
+:root[data-theme="dark"] .md-content pre code{color:#e6e9ec;background:none}
+:root[data-theme="dark"] .md-content th{background:#141922;color:#8b97a8}
+:root[data-theme="dark"] .md-content th,:root[data-theme="dark"] .md-content td{border-color:#1f2733}
+:root[data-theme="dark"] .md-content blockquote{border-left-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] .md-content hr{border-top-color:#1f2733}
+:root[data-theme="dark"] .copy-btn{background:#1a212c;color:#8b97a8}
+:root[data-theme="dark"] .copy-btn:hover{background:#2a3442;color:#e4e9f1}
+/* thinking + tool blocks */
+:root[data-theme="dark"] .think-block.active{background:rgba(196,181,253,.07)}
+:root[data-theme="dark"] .think-block.done{background:rgba(196,181,253,.04)}
+:root[data-theme="dark"] .think-hdr{color:#c4b5fd}
+:root[data-theme="dark"] .think-hdr:hover{background:rgba(196,181,253,.09)}
+:root[data-theme="dark"] .think-text{color:#8b97a8}
+:root[data-theme="dark"] .tool-block.active{border-color:rgba(125,211,252,.35);background:rgba(125,211,252,.07)}
+:root[data-theme="dark"] .tool-block.done{border-color:#1f2733;background:#141922}
+:root[data-theme="dark"] .tool-hdr{color:#7dd3fc}
+:root[data-theme="dark"] .tool-hdr:hover{background:rgba(125,211,252,.09)}
+:root[data-theme="dark"] .tool-summary{color:#5d6878}
+:root[data-theme="dark"] .tool-body pre{background:#0a0c0e;border:1px solid #1f2733;color:#e6e9ec}
+:root[data-theme="dark"] .subagent-card{background:#0f131a;border-color:#1f2733}
+:root[data-theme="dark"] .subagent-card .sub-hdr{background:rgba(196,181,253,.08)}
+:root[data-theme="dark"] .subagent-card .sub-body{color:#8b97a8}
+:root[data-theme="dark"] .subagent-card .sub-ev a{color:#7dd3fc}
+/* permission / expert gate */
+:root[data-theme="dark"] .perm-request{background:#141922;border-color:#f5a623}
+:root[data-theme="dark"] .perm-request .perm-req-hdr{background:rgba(245,166,35,.14);color:#f5a623;border-bottom-color:#2a3442}
+:root[data-theme="dark"] .perm-request .perm-req-purpose{background:#11151c;color:#8b97a8;border-bottom-color:#1f2733}
+:root[data-theme="dark"] .perm-request .perm-req-body{color:#e4e9f1}
+:root[data-theme="dark"] .perm-request .perm-req-body pre{background:#0a0c0e;color:#e6e9ec}
+:root[data-theme="dark"] .perm-request .perm-req-actions{border-top-color:#1f2733}
+:root[data-theme="dark"] .expert-prior{background:#11151c;border-color:#2a3442}
+:root[data-theme="dark"] .expert-prior-hdr{color:#c4b5fd}
+:root[data-theme="dark"] .expert-prior-pre{color:#8b97a8}
+:root[data-theme="dark"] .perm-item{background:#0f131a;border-color:#1f2733}
+:root[data-theme="dark"] .perm-item:hover{border-color:#2a3442}
+:root[data-theme="dark"] .perm-info p{color:#5d6878}
+/* controls */
+:root[data-theme="dark"] .btn-allow{background:#1a212c;border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .btn-allow:hover{background:#4ade80;color:#052e20;border-color:#4ade80}
+:root[data-theme="dark"] .btn-deny{background:#1a212c;border-color:#2a3442;color:#f87171}
+:root[data-theme="dark"] .btn-deny:hover{background:#f87171;color:#2b0a0f;border-color:#f87171}
+:root[data-theme="dark"] .btn-allow:disabled,:root[data-theme="dark"] .btn-deny:disabled{background:#141922;color:#5d6878;border-color:#1f2733}
+/* 全局暗色表单规则给每个 textarea 都画了 1px 边 + 3px 方形 focus 环；输入区的边与环属于
+   外壳（.grok-bar），这里必须把内层的关掉 —— 否则暗色下打字会看到一圈方框，亮色则没有 */
+:root[data-theme="dark"] #msgInput,:root[data-theme="dark"] #msgInput:focus{border:0;box-shadow:none;background:transparent;color:#e4e9f1;outline:none}
+/* 输入外壳 = PCBuddy 的 .box：panel 底 + border-2 边，focus 只加一道琥珀环 */
+:root[data-theme="dark"] .grok-bar{background:#0f131a;border-color:#2a3442}
+:root[data-theme="dark"] .grok-bar:focus-within{border-color:#3b4757;box-shadow:0 0 0 3px rgba(245,166,35,.07)}
+:root[data-theme="dark"] .grok-attach{color:#5d6878}
+:root[data-theme="dark"] .grok-attach:hover{background:#1a212c;color:#f5a623}
+/* slash 弹层 = panel-2 底 + border-2 边；选中态是 panel-3 整行铺色 */
+:root[data-theme="dark"] .slash-popup{background:#141922;border-color:#2a3442}
+:root[data-theme="dark"] .slash-popup-item:hover,:root[data-theme="dark"] .slash-popup-item.active{background:#1a212c}
+:root[data-theme="dark"] .slash-popup-name{color:#f5a623}
+:root[data-theme="dark"] .slash-popup-desc{color:#8b97a8}
+:root[data-theme="dark"] .grok-send{background:#f5a623;color:#1b1207}
+:root[data-theme="dark"] .grok-send:disabled{background:#1a212c;color:#5d6878}
+:root[data-theme="dark"] .btn-stop{background:#2a1418;border-color:#f87171;color:#f87171}
+:root[data-theme="dark"] .mode-seg{background:#141922;border-color:#1f2733}
+:root[data-theme="dark"] .mode-seg button{color:#8b97a8}
+:root[data-theme="dark"] .mode-seg button.active{background:#1a212c;color:#f5a623}
+:root[data-theme="dark"] .attach-dot,:root[data-theme="dark"] .sel-bar{color:#8b97a8}
+/* PCBuddy-Legacy: amber-bordered bar, amber mono count, amber-filled primary,
+   ghost buttons that are the panel itself with a border-2 outline. */
+:root[data-theme="dark"] .sel-bar{background:#141922;border-color:#7a5312}
+:root[data-theme="dark"] .sel-bar .n{color:#f5a623}
+:root[data-theme="dark"] .sel-bar .btn-ghost{background:#141922;border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .sel-bar .btn-ghost:hover{background:#1a212c;border-color:#3b4757;color:#e4e9f1}
+/* the amber primary comes from the global dark .btn-p; only the lift is barred */
+:root[data-theme="dark"] .sel-bar .btn-p:hover{filter:brightness(1.08)}
+/* 输入区上方的三条带：插话条与附件预览条此前没有暗色覆盖，会带着 #eef4ff / #fff 的亮面板出现在深色里 */
+:root[data-theme="dark"] .interject-bar{background:#11151c;border-top-color:#1f2733;color:#8b97a8}
+:root[data-theme="dark"] .ij-item{background:#1a212c;border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .img-preview-item{border-color:#2a3442}
+:root[data-theme="dark"] .file-preview-item{background:#1a212c;border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .file-preview-item .fp-ext{background:#141922;color:#7dd3fc}
+/* 暗色滚动条：滚道透明（PCBuddy 的 ::-webkit-scrollbar-track 就是 transparent），
+   thumb 用 Legacy 的 #232c39 / hover #303c4d；宽度沿用 FoxIR 自己的 8px，不改版式 */
+:root[data-theme="dark"] ::-webkit-scrollbar-track{background:transparent}
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb{background:#232c39;border-radius:6px}
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{background:#303c4d}
+:root[data-theme="dark"] ::-webkit-scrollbar-corner{background:transparent}
+/* the toggle, parked between status and version */
+#themeToggle{margin-left:6px;width:22px;height:22px;flex:none;border-radius:50%;cursor:pointer;
+  border:1px solid #34495e;background:transparent;color:#95a5a6;font-size:11px;line-height:1;padding:0}
+:root[data-theme="dark"] #themeToggle{border-color:#2a3442;color:#f5a623}
+#themeToggle:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ─── stage 2: the non-chat pages (Settings / Dashboard / Tools / CRON / MCP / Knowledge) ─── */
+:root[data-theme="dark"] input,:root[data-theme="dark"] select,:root[data-theme="dark"] textarea{
+  background:#0f131a;border:1px solid #1f2733;color:#e4e9f1}
+:root[data-theme="dark"] input:focus,:root[data-theme="dark"] select:focus,:root[data-theme="dark"] textarea:focus{
+  border-color:#f5a623;box-shadow:0 0 0 3px rgba(245,166,35,.15)}
+:root[data-theme="dark"] input::placeholder,:root[data-theme="dark"] textarea::placeholder{color:#5d6878}
+:root[data-theme="dark"] .settings-scroll,:root[data-theme="dark"] .modern-page,
+:root[data-theme="dark"] .page{background:transparent;color:#e4e9f1}
+:root[data-theme="dark"] .settings-section,:root[data-theme="dark"] .form-card,
+:root[data-theme="dark"] .modern-page .settings-section{background:#0f131a;border-color:#1f2733;
+  box-shadow:0 1px 2px rgba(0,0,0,.4)}
+:root[data-theme="dark"] .settings-section h3,:root[data-theme="dark"] .modern-page .settings-section h3,
+:root[data-theme="dark"] .card-title,:root[data-theme="dark"] .form-group label{color:#e4e9f1}
+:root[data-theme="dark"] .form-group label,:root[data-theme="dark"] .muted{color:#8b97a8}
+:root[data-theme="dark"] .settings-section h3{border-bottom-color:#1f2733}
+:root[data-theme="dark"] .perm-item{background:#0f131a}
+:root[data-theme="dark"] .perm-status{background:#1a212c;color:#8b97a8;border-color:#2a3442}
+:root[data-theme="dark"] .perm-status.allowed{background:rgba(74,222,128,.14);color:#4ade80}
+:root[data-theme="dark"] .perm-status.endorse{background:rgba(245,166,35,.14);color:#f5a623}
+:root[data-theme="dark"] .perm-status.denied,:root[data-theme="dark"] .perm-status.blocked{
+  background:rgba(248,113,113,.14);color:#f87171}
+:root[data-theme="dark"] table{color:#e4e9f1}
+:root[data-theme="dark"] th{background:#141922;color:#8b97a8}
+:root[data-theme="dark"] th,:root[data-theme="dark"] td{border-color:#1f2733}
+:root[data-theme="dark"] tr:hover td{background:#141922}
+:root[data-theme="dark"] .token-table tr:nth-child(even),:root[data-theme="dark"] .modern-page tr:nth-child(even) td{background:#11151c}
+:root[data-theme="dark"] .cp-item,:root[data-theme="dark"] .qa-tile,:root[data-theme="dark"] .cron-field,
+:root[data-theme="dark"] .action-btn,:root[data-theme="dark"] .sessions-item{background:#141922;border-color:#1f2733;color:#8b97a8}
+:root[data-theme="dark"] .cp-item:hover,:root[data-theme="dark"] .qa-tile:hover,:root[data-theme="dark"] .action-btn:hover{
+  background:#1a212c;border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .sessions-popup,:root[data-theme="dark"] .dropdown,
+:root[data-theme="dark"] .lightbox-card{background:#0f131a;border-color:#1f2733;color:#e4e9f1;
+  box-shadow:0 16px 48px rgba(0,0,0,.55)}
+:root[data-theme="dark"] .btn{background:#1a212c;border:1px solid #2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .btn:hover{background:#2a3442}
+:root[data-theme="dark"] .btn-p{background:#f5a623;color:#1b1207;border-color:#f5a623}
+:root[data-theme="dark"] .btn-s{background:#1a212c;color:#8b97a8}
+:root[data-theme="dark"] .btn-d{background:rgba(248,113,113,.14);color:#f87171;border-color:rgba(248,113,113,.4)}
+:root[data-theme="dark"] .stat-card,:root[data-theme="dark"] .metric,:root[data-theme="dark"] .gauge-card{
+  background:#0f131a;border-color:#1f2733;color:#e4e9f1}
+:root[data-theme="dark"] .slider,:root[data-theme="dark"] .progress{background:#1a212c}
+:root[data-theme="dark"] h1,:root[data-theme="dark"] h2,:root[data-theme="dark"] h3,
+:root[data-theme="dark"] h4,:root[data-theme="dark"] h5{color:#e4e9f1}
+:root[data-theme="dark"] a{color:#7dd3fc}
+/* stragglers found by the per-page luminance sweep */
+:root[data-theme="dark"] .dash-section,:root[data-theme="dark"] .dash-card,
+:root[data-theme="dark"] .dash-panel,:root[data-theme="dark"] .dash-last-scan{
+  background:#0f131a;border-color:#1f2733;color:#e4e9f1}
+:root[data-theme="dark"] .expert-chip,:root[data-theme="dark"] .dash-badge{
+  background:#1a212c;border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] .cron-auto-toggle{background:#1a212c;border-color:#2a3442;color:#8b97a8}
+/* #configFileContent carries an inline background:white, so only !important wins */
+:root[data-theme="dark"] #configFileContent{background:#0a0c0e !important;color:#e6e9ec !important;
+  border-color:#1f2733 !important}
+:root[data-theme="dark"] .dash-status-bar{background:#0f131a;border-color:#1f2733;color:#e4e9f1}
+:root[data-theme="dark"] .qa-edit-btn{background:#1a212c;border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] .qa-edit-btn:hover{background:#2a3442;color:#e4e9f1}
+
+/* ── stage 3: 渐变面板（迁移时只改了 background-color，漏掉 background-image:linear-gradient）
+   Dashboard 整页底 + 五张 posture 卡 + token 卡 + Skills 的 mcp 卡 + Knowledge/CRON 的条目，
+   还有聊天区的两张浅色 header，全部在这段补。hue 保留，亮度换成 Legacy 的低照度着色。 ── */
+:root[data-theme="dark"] .dash-container{background:linear-gradient(135deg,#0a0d12 0%,#0f131a 50%,#0a0d12 100%)}
+:root[data-theme="dark"] .posture-card.total{background:linear-gradient(135deg,#111a26,#16222f);border-color:#22384c}
+:root[data-theme="dark"] .posture-card.input{background:linear-gradient(135deg,#0f1c14,#14251a);border-color:#234b2c}
+:root[data-theme="dark"] .posture-card.output{background:linear-gradient(135deg,#1d1508,#241a09);border-color:#4d3312}
+:root[data-theme="dark"] .posture-card.calls{background:linear-gradient(135deg,#170f1f,#1d1327);border-color:#382650}
+:root[data-theme="dark"] .posture-card.cache{background:linear-gradient(135deg,#0d1a1e,#122226);border-color:#1d4048}
+:root[data-theme="dark"] .posture-card.total .posture-number{color:#7dd3fc}
+:root[data-theme="dark"] .posture-card.input .posture-number{color:#4ade80}
+:root[data-theme="dark"] .posture-card.output .posture-number{color:#f5a623}
+:root[data-theme="dark"] .posture-card.calls .posture-number{color:#c4b5fd}
+:root[data-theme="dark"] .posture-card.cache .posture-number{color:#67e8f9}
+:root[data-theme="dark"] .posture-label{color:#8b97a8}
+:root[data-theme="dark"] .status-value{color:#e4e9f1}
+:root[data-theme="dark"] .token-card{background:linear-gradient(135deg,#141922,#1a212c);border-left-color:#7dd3fc}
+:root[data-theme="dark"] .token-card-label{color:#8b97a8}
+:root[data-theme="dark"] .token-card-value{color:#e4e9f1}
+:root[data-theme="dark"] .token-table th{color:#8b97a8;border-bottom-color:#1f2733}
+:root[data-theme="dark"] .token-table td{border-bottom-color:#171d26}
+:root[data-theme="dark"] .token-table tr:hover td{background:#141922}
+:root[data-theme="dark"] .expert-stats b{color:#7dd3fc}
+:root[data-theme="dark"] .expert-empty{color:#5d6878}
+:root[data-theme="dark"] .mcp-card{background:linear-gradient(135deg,#141922,#1a212c);border-color:#1f2733}
+:root[data-theme="dark"] .mcp-card-name{color:#e4e9f1}
+:root[data-theme="dark"] .mcp-tools{color:#8b97a8}
+:root[data-theme="dark"] .skill-ver{color:#5d6878}
+:root[data-theme="dark"] .cron-item{background:#141922;border-color:#1f2733;border-left-color:#2a3442}
+:root[data-theme="dark"] .cron-item:hover{box-shadow:0 6px 18px rgba(0,0,0,.45)}
+:root[data-theme="dark"] .cron-item.on{border-left-color:#4ade80}
+:root[data-theme="dark"] .cron-item-name{color:#e4e9f1}
+:root[data-theme="dark"] .cron-item-msg{color:#8b97a8}
+:root[data-theme="dark"] .cron-meta{color:#5d6878}
+:root[data-theme="dark"] .cron-meta-chip{background:#1d1a10;color:#f5a623;border-color:#4d3312}
+:root[data-theme="dark"] .cron-badge{background:#111a26;color:#7dd3fc;border-color:#22384c}
+:root[data-theme="dark"] .cron-status.on{color:#4ade80;background:#0f1c14}
+:root[data-theme="dark"] .cron-status.off{color:#8b97a8;background:#1a212c}
+:root[data-theme="dark"] .cron-act.on{background:#16321f;color:#4ade80}
+:root[data-theme="dark"] .cron-act.on:hover{background:#1d4228}
+:root[data-theme="dark"] .cron-act.off{background:#1a212c;color:#8b97a8}
+:root[data-theme="dark"] .cron-act.off:hover{background:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .cron-act.edit{background:#141922;color:#c4b5fd;border-color:#382650}
+:root[data-theme="dark"] .cron-act.edit:hover{background:#1d1327}
+:root[data-theme="dark"] .cron-act.danger{background:#1a212c;color:#f87171;border-color:#5c2626}
+:root[data-theme="dark"] .cron-act.danger:hover{background:#2a1418}
+/* 同一类缺陷在聊天区也有两张 header，一起补掉 */
+:root[data-theme="dark"] .perm-request .perm-req-hdr{background:linear-gradient(135deg,#1d1508,#241a09);color:#f5a623;border-bottom-color:#4d3312}
+:root[data-theme="dark"] .managed-banner{background:linear-gradient(135deg,#170f1f,#1d1327);color:#c4b5fd;border-top-color:#382650}
+:root[data-theme="dark"] .action-btn{background:linear-gradient(180deg,#141922,#1a212c);border-color:#2a3442;color:#e4e9f1}
+:root[data-theme="dark"] .action-btn:hover{background:linear-gradient(180deg,#1a212c,#222b38);box-shadow:0 8px 20px rgba(0,0,0,.5)}
 </style>
 </head>
 <body>
@@ -1046,7 +1311,10 @@ input:checked+.slider:before{transform:translateX(20px)}
     <div class="sidebar-ftr">
       <span class="status-dot" id="statusDot"></span>
       <span id="statusText">Disconnected</span>
-      <span id="sidebarVersion" style="margin-left:6px;font-size:11px;opacity:.75">v-</span>
+      <button id="themeToggle" type="button" title="切换亮暗" aria-label="切换亮暗">◐</button>
+      <button id="modeBtn" type="button" aria-pressed="false" title="Instant — 单轮直答 · 点击切到 Expert">
+        <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+      </button>
     </div>
   </div>
 
@@ -1195,7 +1463,7 @@ input:checked+.slider:before{transform:translateX(20px)}
             </label>
           </div>
           <!-- Expert Mode Settings (shown when Expert mode is enabled) -->
-          <div id="expertSettingsSection" style="display:none;margin-top:12px;padding:12px;background:#f8f9fa;border-radius:8px;border:1px solid #e2e8f0">
+          <div id="expertSettingsSection" style="display:none;margin-top:12px;padding:12px;background:var(--bg2);border-radius:8px;border:1px solid var(--border)">
             <label style="font-size:12px;font-weight:600;color:#8e44ad;margin-bottom:8px;display:block">&#9889; Expert Mode Settings</label>
             <div class="form-group" style="margin-bottom:8px">
               <label style="font-size:11px">Max Iterations</label>
@@ -1582,15 +1850,16 @@ input:checked+.slider:before{transform:translateX(20px)}
           <div class="img-preview-bar" id="imgPreviewBar"></div>
           <div class="file-preview-bar" id="filePreviewBar"></div>
           <div class="sel-bar" id="selBar">
-            <span id="selCount">0 selected</span>
-            <button class="btn btn-s" onclick="exportSelectedHtml()">&#128196; Export HTML</button>
-            <button class="btn btn-d" onclick="clearSelection()">Clear selection</button>
+            <span class="lbl"><span class="n" id="selCount">0</span> selected</span>
+            <button class="btn btn-p" onclick="exportSelectedHtml()">Export HTML</button>
+            <button class="btn btn-ghost" onclick="copySelectedText(this)">Copy selection</button>
+            <button class="btn btn-ghost sel-clear" onclick="clearSelection()">Clear</button>
           </div>
           <div style="position:relative">
           <button id="jumpBottomBtn" type="button" aria-label="Jump to latest" title="Jump to latest" onclick="jumpToLatest()" style="display:none;position:absolute;top:-15px;left:50%;transform:translateX(-50%);z-index:35;width:30px;height:30px;border-radius:50%;border:1px solid rgba(255,255,255,.35);background:rgba(90,110,130,.38);color:#fff;font-size:14px;line-height:1;font-weight:700;cursor:pointer;box-shadow:0 1px 6px rgba(0,0,0,.25);backdrop-filter:blur(2px)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="position:relative;top:0.5px"><path d="M6 9l6 6 6-6"/></svg></button>
           <div class="slash-popup" id="slashPopup"></div>
           <div class="interject-bar" id="interjectBar" style="display:none"></div>
-          <div class="input-bar grok-bar">
+          <div class="grok-bar">
             <input type="file" id="attachFileInput" multiple tabindex="-1" style="display:none" accept="image/*,.pdf,.docx,.xlsx,.txt,.md,.csv,.json,.xml,.yaml,.py,.js,.ts,.rs,.go,.java,.c,.cpp,.sql,.sh,.html,.css">
             <!-- 附件按钮（最左）：点击 / 拖拽 / 粘贴 -->
             <button class="grok-attach" id="attachBtn" type="button" title="附加文件（点击 / 拖拽 / 粘贴）">
@@ -1598,26 +1867,6 @@ input:checked+.slider:before{transform:translateX(20px)}
               <span class="grok-dot"></span>
             </button>
             <textarea id="msgInput" rows="1" placeholder="Type a message... (/ for skills, Shift+Enter for newline)" disabled onkeydown="handleInputKeydown(event)" oninput="handleInput(event)"></textarea>
-            <!-- 模式切换（发送按钮左侧）：Instant / Expert -->
-            <div class="grok-mode" id="modeWrap">
-              <button class="grok-mode-btn" id="modeBtn" type="button" aria-haspopup="true" aria-expanded="false">
-                <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                <span id="modeLabel">Instant</span>
-                <svg class="grok-arr" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
-              </button>
-              <div class="grok-menu" id="modeMenu">
-                <div class="grok-item sel" data-mode="normal">
-                  <div class="grok-ic"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
-                  <div><div class="grok-it">Instant</div><div class="grok-id">Fast for simple task</div></div>
-                  <div class="grok-chk">✓</div>
-                </div>
-                <div class="grok-item" data-mode="managed">
-                  <div class="grok-ic grok-exp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35M11 8v6M8 11h6"/></svg></div>
-                  <div><div class="grok-it">Expert</div><div class="grok-id">Loop for long-horizon Tasks</div></div>
-                  <div class="grok-chk">✓</div>
-                </div>
-              </div>
-            </div>
             <!-- 发送 / 停止（狼头 LOGO） -->
             <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送">🐺</button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopAgent()" style="display:none">Stop</button>
@@ -1640,7 +1889,7 @@ input:checked+.slider:before{transform:translateX(20px)}
             </div>
             <div class="output-list" id="outputList"></div>
           </div>
-          <div class="panel-ftr"></div>
+          <div class="panel-ftr"><span id="sidebarVersion">v-</span></div>
         </div>
       </div>
     </div>
@@ -2543,8 +2792,19 @@ function updateSelBar(){
   var n=document.querySelectorAll('#convArea .msg.selected').length;
   var bar=document.getElementById('selBar');
   var cnt=document.getElementById('selCount');
-  if(cnt)cnt.textContent=n+' selected';
+  // The word lives in the markup, the number here: PCBuddy styles the count
+  // (mono, amber) and a stitched string would take that styling with it.
+  if(cnt)cnt.textContent=n;
   if(bar)bar.classList.toggle('visible',n>0);
+}
+function copySelectedText(btn){
+  var parts=Array.prototype.slice.call(document.querySelectorAll('#convArea .msg.selected .msg-content'));
+  if(!parts.length){addLog('No messages selected','warn');return;}
+  var text=parts.map(function(c){return c.innerText.trim();}).join('\n\n---\n\n');
+  var done=function(){var o=btn.textContent;btn.textContent='✓ Copied';setTimeout(function(){btn.textContent=o;},1200);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(function(){fallbackCopy(text);done();});
+  }else{fallbackCopy(text);done();}
 }
 function clearSelection(){
   document.querySelectorAll('#convArea .msg.selected').forEach(function(m){
@@ -2563,8 +2823,11 @@ function blobToDataUrl(blob){
 }
 // Fetch every <img> in the container and inline it as a base64 data URL so
 // the exported file is fully self-contained (screenshots etc. keep working).
+// Returns how many were inlined: an export that says "3 messages" but silently
+// dropped every screenshot is a record that lies about what it holds.
 async function inlineImages(container){
   var imgs=container.querySelectorAll('img');
+  var inlined=0;
   for(var i=0;i<imgs.length;i++){
     var img=imgs[i];
     var src=img.getAttribute('src')||'';
@@ -2573,8 +2836,19 @@ async function inlineImages(container){
       var resp=await fetch(src);
       if(!resp.ok)continue;
       img.setAttribute('src',await blobToDataUrl(await resp.blob()));
+      inlined++;
     }catch(e){/* keep original src */}
   }
+  return inlined;
+}
+// Which conversation this file came from, printed in the export rather than
+// guessed at later: PCBuddy stamps version + session on every document.
+function exportMetaTail(){
+  var ver=((document.getElementById('sidebarVersion')||{}).textContent||'').trim();
+  var out='';
+  if(SESSION_ID)out+=' &middot; session '+esc(String(SESSION_ID).slice(0,8));
+  if(ver&&ver!=='v-')out+=' &middot; '+esc(ver);
+  return out;
 }
 async function exportSelectedHtml(){
   var sel=Array.prototype.slice.call(document.querySelectorAll('#convArea .msg.selected'));
@@ -2583,18 +2857,24 @@ async function exportSelectedHtml(){
   var clones=sel.map(function(m){
     var c=m.cloneNode(true);
     c.querySelectorAll('.msg-actions').forEach(function(a){a.remove();});
+    // Dead controls: a copy button in a static file invites a click that does
+    // nothing, and a form field would let a reader type into the record.
+    c.querySelectorAll('button,input,textarea,select').forEach(function(a){a.remove();});
     c.querySelectorAll('[onclick]').forEach(function(el){el.removeAttribute('onclick');});
     c.classList.remove('selected');
     c.removeAttribute('data-controls');
     return c;
   });
   // Inline images (screenshots etc.) as base64 so the file is self-contained.
-  for(var i=0;i<clones.length;i++){await inlineImages(clones[i]);}
+  var images=0;
+  try{
+    for(var i=0;i<clones.length;i++){images+=await inlineImages(clones[i]);}
+  }catch(e){addLog('Export: image inlining failed ('+(e.message||e)+'), writing the text anyway','warn');}
   var bodyHtml=clones.map(function(c){return c.outerHTML;}).join('');
   // Embed the page's real stylesheet so the export looks identical to the chat.
   var css='';
   document.querySelectorAll('style').forEach(function(s){css+=s.textContent+'\n';});
-  var html='<!DOCTYPE html><html><head><meta charset="utf-8"><title>RustAgent Chat Export</title><style>'
+  var html='<!DOCTYPE html><html data-theme="'+(document.documentElement.getAttribute('data-theme')||'light')+'"><head><meta charset="utf-8"><title>RustAgent Chat Export</title><style>'
     +css
     +'\n/* ── Export overrides ── */\n'
     +'html,body{height:auto;overflow:visible}\n'
@@ -2603,14 +2883,16 @@ async function exportSelectedHtml(){
     +'.ex-hdr{font-size:18px;font-weight:700;color:#fff;margin-bottom:2px}\n'
     +'.ex-sub{font-size:12px;color:rgba(255,255,255,.85);margin-bottom:16px}\n'
     +'.ex-conv{background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.3);padding:20px;display:flex;flex-direction:column;gap:12px}\n'
+    +':root[data-theme="dark"] .ex-conv{background:#0f131a;box-shadow:0 20px 60px rgba(0,0,0,.6)}\n'
     +'</style></head><body><div class="ex-page">'
     +'<div class="ex-hdr">&#129302; RustAgent Chat Export</div>'
-    +'<div class="ex-sub">'+sel.length+' message(s) &middot; '+esc(new Date().toLocaleString())+'</div>'
+    +'<div class="ex-sub">'+sel.length+' message(s) &middot; '+esc(new Date().toLocaleString())
+    +' &middot; '+images+' image(s) inlined'+exportMetaTail()+'</div>'
     +'<div class="ex-conv">'+bodyHtml+'</div></div></body></html>';
   var blob=new Blob([html],{type:'text/html'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='rustagent-chat-'+Date.now()+'.html';a.click();
   setTimeout(function(){URL.revokeObjectURL(a.href)},1000);
-  addLog('Exported '+sel.length+' message(s) to HTML','info');
+  addLog('Exported '+sel.length+' message(s) to HTML ('+images+' image(s) inlined)','info');
   // 导出完成后自动清除选中，避免残留高亮
   clearSelection();
 }
@@ -2703,17 +2985,9 @@ document.addEventListener('DOMContentLoaded',function(){
   if(attInput)attInput.addEventListener('change',function(e){handleAttachFiles(e.target.files);e.target.value='';});
   const attBtn=document.getElementById('attachBtn');
   if(attBtn)attBtn.addEventListener('click',function(){attInput.click();});
-  // 模式下拉
-  const modeWrap=document.getElementById('modeWrap'),modeMenu=document.getElementById('modeMenu');
+  // 模式切换：左下角那颗按钮，两态直接点击互切
   const modeBtn=document.getElementById('modeBtn');
-  if(modeBtn)modeBtn.addEventListener('click',function(e){e.stopPropagation();modeWrap.classList.toggle('open');modeBtn.setAttribute('aria-expanded',modeWrap.classList.contains('open'));});
-  document.addEventListener('click',function(e){if(modeWrap&&!modeWrap.contains(e.target)){modeWrap.classList.remove('open');modeBtn.setAttribute('aria-expanded','false');}});
-  if(modeMenu)modeMenu.querySelectorAll('.grok-item').forEach(function(item){
-    item.addEventListener('click',function(){
-      setManagedMode(item.dataset.mode==='managed');
-      modeWrap.classList.remove('open');
-    });
-  });
+  if(modeBtn)modeBtn.addEventListener('click',function(){setManagedMode(!managedMode);});
   // 拖拽上传
   const bar=document.querySelector('.grok-bar');
   if(bar){
@@ -3432,7 +3706,7 @@ async function loadTools(){
     if(tools.length){
       el.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="text-align:left;border-bottom:2px solid var(--border)"><th style="padding:8px 4px">Name</th><th>Type</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+tools.map(t=>{
         const status=t.enabled?'<span style="color:var(--green)">&#9679; Enabled</span>':'<span style="color:var(--t3)">&#9679; Disabled</span>';
-        return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 4px"><strong>'+esc(t.name)+'</strong><br><span style="font-size:11px;color:var(--t3)">'+esc(t.path)+'</span></td><td><span style="background:#e8ecee;padding:2px 8px;border-radius:10px;font-size:11px">.'+esc(t.extension)+'</span></td><td style="color:var(--t3);font-size:12px">'+esc(t.description)+'</td><td>'+status+'</td><td><button class="btn btn-s" style="padding:4px 8px;font-size:11px" onclick="toggleTool(\''+esc(t.name)+'\')">'+(t.enabled?'Disable':'Enable')+'</button></td></tr>';
+        return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 4px"><strong>'+esc(t.name)+'</strong><br><span style="font-size:11px;color:var(--t3)">'+esc(t.path)+'</span></td><td><span style="background:var(--bg2);color:var(--t2);padding:2px 8px;border-radius:10px;font-size:11px">.'+esc(t.extension)+'</span></td><td style="color:var(--t3);font-size:12px">'+esc(t.description)+'</td><td>'+status+'</td><td><button class="btn btn-s" style="padding:4px 8px;font-size:11px" onclick="toggleTool(\''+esc(t.name)+'\')">'+(t.enabled?'Disable':'Enable')+'</button></td></tr>';
       }).join('')+'</tbody></table>';
     }else{
       el.innerHTML='<div style="padding:20px;text-align:center;color:var(--t3)"><p>No tools found in Tools directory.</p><p style="font-size:12px;margin-top:8px">Place .exe, .bat, .ps1, or .cmd files in the Tools folder to use them as external tools.</p></div>';
@@ -3993,13 +4267,6 @@ function toggleComputerUse(enabled){
 function setManagedMode(on){
   managedMode=on;
   managedModes[SESSION_ID]=on;
-  // Update segmented control
-  document.querySelectorAll('#modeSeg button').forEach(b=>{
-    b.classList.toggle('active',(on&&b.dataset.mode==='managed')||(!on&&b.dataset.mode==='normal'));
-  });
-  // Update hint text
-  const hint=document.getElementById('modeHint');
-  if(hint){hint.textContent=on?'Expert mode active — Loop for long-horizon tasks':'Instant mode active — single turn execution';hint.classList.toggle('active',on);}
   // Show/hide managed banner (removed — using hint text only)
   // Sync Settings toggle
   const globalToggle=document.getElementById('globalManagedToggle');
@@ -4007,17 +4274,16 @@ function setManagedMode(on){
   // Show/hide Expert settings section
   const expertSection=document.getElementById('expertSettingsSection');
   if(expertSection)expertSection.style.display=on?'block':'none';
-  // Sync Grok 风格输入框模式下拉
-  const label=document.getElementById('modeLabel');
+  // Sync the footer mode button: state lives in the bolt's colour, the words
+  // only appear as the hover tooltip.
   const modeBtn=document.getElementById('modeBtn');
-  if(label)label.textContent=on?'Expert':'Instant';
-  if(modeBtn)modeBtn.classList.toggle('expert',on);
+  if(modeBtn){
+    modeBtn.classList.toggle('expert',on);
+    modeBtn.setAttribute('aria-pressed',on?'true':'false');
+    modeBtn.title=on?'Expert — 长任务循环 · 点击切回 Instant':'Instant — 单轮直答 · 点击切到 Expert';
+  }
   const sendBtn=document.getElementById('sendBtn');
   if(sendBtn)sendBtn.classList.toggle('expert',on);
-  const menu=document.getElementById('modeMenu');
-  if(menu)menu.querySelectorAll('.grok-item').forEach(function(it){
-    it.classList.toggle('sel',(on&&it.dataset.mode==='managed')||(!on&&it.dataset.mode==='normal'));
-  });
 }
 function toggleGlobalManaged(checked){
   setManagedMode(checked);
@@ -4578,7 +4844,7 @@ async function loadTokenUsage(){
         const hitCell=(r.cached_tokens===null||r.cached_tokens===undefined)?'<span style="color:#94a3b8">n/a</span>':'<span style="color:#0891b2;font-weight:600">'+fmtCacheRate(dr)+'</span>';
         h+='<tr><td>'+r.date+'</td><td style="font-weight:500">'+r.model+'</td><td style="text-align:right">'+fmtNum(r.calls)+'</td><td style="text-align:right">'+fmtNum(r.prompt_tokens)+'</td><td style="text-align:right">'+cachedCell+'</td><td style="text-align:right">'+hitCell+'</td><td style="text-align:right">'+fmtNum(r.completion_tokens)+'</td><td style="text-align:right;font-weight:600">'+fmtNum(r.total_tokens)+'</td></tr>';
       });
-      h+='<tr style="font-weight:700;background:#f1f5f9"><td colspan="2">Total &middot; '+rangeLabel+'</td><td style="text-align:right">'+fmtNum(s.total_calls||0)+'</td><td style="text-align:right">'+fmtNum(s.total_prompt_tokens||0)+'</td><td style="text-align:right">'+fmtNum(s.total_cached_tokens||0)+'</td><td style="text-align:right;color:#0891b2">'+fmtCacheRate(cacheRateSummary)+'</td><td style="text-align:right">'+fmtNum(s.total_completion_tokens||0)+'</td><td style="text-align:right;color:#2563eb">'+fmtNum(s.total_tokens||0)+'</td></tr>';
+      h+='<tr style="font-weight:700;background:var(--bg2)"><td colspan="2">Total &middot; '+rangeLabel+'</td><td style="text-align:right">'+fmtNum(s.total_calls||0)+'</td><td style="text-align:right">'+fmtNum(s.total_prompt_tokens||0)+'</td><td style="text-align:right">'+fmtNum(s.total_cached_tokens||0)+'</td><td style="text-align:right;color:#0891b2">'+fmtCacheRate(cacheRateSummary)+'</td><td style="text-align:right">'+fmtNum(s.total_completion_tokens||0)+'</td><td style="text-align:right;color:#2563eb">'+fmtNum(s.total_tokens||0)+'</td></tr>';
       h+='</table>';
       document.getElementById('dashHistoryTable').innerHTML=h;
     }
@@ -4624,15 +4890,24 @@ function showSlashList(list, filter, mode, emptyMsg){
 }
 function showSkillsPopup(filter){showSlashList(slashSkills, filter, 'skills', 'No matching skills');}
 
-// Top-level slash command menu: /skill, /agent, /new
+// Top-level slash command menu, mirroring PCBuddy's set: the views you can lose
+// your place in, plus stop / new / help. The Skills *page* is deliberately not
+// listed — its word belongs to the skill picker, which is the more useful read.
+const SLASH_VIEWS=[['chat','聊天'],['dashboard','仪表盘'],['tools','工具'],
+                   ['knowledge','知识库'],['cron','定时任务'],['mcp','MCP'],['settings','设置']];
 function showCmdMenu(rest){
   const popup=document.getElementById('slashPopup');
   const r=(rest||'').toLowerCase();
   const menu=[];
-  if('skill'.startsWith(r))menu.push({name:'/skill',desc:'Run a skill' ,mode:'skills'});
-  if('new'.startsWith(r))menu.push({name:'/new',desc:'Reset to a new session',mode:'new'});
+  const add=(name,desc,mode)=>{ if(name.slice(1).startsWith(r)) menu.push({name,desc,mode}); };
+  add('/skills','列出全部技能，上下键选择后回车','skills');
+  add('/stop','停止当前回合','stop');
+  add('/new','开一个新会话','new');
+  add('/help','显示可用命令','help');
+  SLASH_VIEWS.forEach(([v,label])=>add('/'+v,'跳到 '+label,'goto:'+v));
   slashMode='commands';
-  if(!menu.length){popup.innerHTML='<div class="slash-popup-empty">No such command</div>';popup.classList.add('show');slashOpen=true;slashIdx=-1;return;}
+  if(!menu.length){popup.innerHTML='<div class="slash-popup-empty">没有匹配的命令</div>';popup.classList.add('show');slashOpen=true;slashIdx=-1;return;}
+  slashIdx=0;
   popup.innerHTML=menu.map((c,i)=>{
     return '<div class="slash-popup-item'+(i===slashIdx?' active':'')+'" data-idx="'+i+'" data-name="'+c.name+'" onmousedown="selectSlashItem(\''+c.name+'\',\'commands\')">' +
       '<span class=\'slash-popup-name\'>'+c.name+'</span>' +
@@ -4652,11 +4927,17 @@ function hideSlashPopup(){
 function selectSlashItem(name, mode){
   const inp=document.getElementById('msgInput');
   if(mode==='commands'){
-    if(name==='/new'){ inp.value=''; hideSlashPopup(); newSession(); return; }
-    inp.value=name+' ';
+    const popup=document.getElementById('slashPopup');
+    const hit=(popup._filtered||[]).find(c=>c.name===name);
+    const m=(hit&&hit.mode)||'';
     hideSlashPopup();
-    // Immediately surface the concrete list for the chosen command.
-    if(name==='/skill'){ showSkillsPopup(''); }
+    inp.value='';
+    if(name==='/new'){ newSession(); inp.focus(); return; }
+    if(name==='/stop'){ stopAgent(); return; }
+    if(name==='/help'){ slashHelpLine(); return; }
+    if(m.startsWith('goto:')){ gotoView(m.slice(5)); return; }
+    inp.value='/skills ';
+    showSkillsPopup('');
     inp.focus();
     return;
   } else {
@@ -4664,6 +4945,21 @@ function selectSlashItem(name, mode){
   }
   hideSlashPopup();
   inp.focus();
+}
+// /<view> jumps to a page by clicking its own tab, so the nav state stays the
+// single source of truth instead of being duplicated here.
+function gotoView(v){
+  const tab=Array.from(document.querySelectorAll('.nav-tab'))
+    .find(b=>new RegExp("switchPage\\(['\"]"+v+"['\"]").test(b.getAttribute('onclick')||''));
+  if(tab) tab.click();
+}
+function slashHelpLine(){
+  const d=document.createElement('div'); d.className='msg assistant';
+  d.innerHTML=asstPrefix()+'<div class="msg-content md-content">'+renderMd(
+    '可用命令：`/skills` 选技能 · `/stop` 停止回合 · `/new` 新会话 · `/help` 本条 · '+
+    SLASH_VIEWS.map(v=>'`/'+v[0]+'`').join(' '))+'</div>';
+  document.getElementById('convArea').appendChild(d);
+  scrollBottom();
 }
 function highlightSlashItem(idx){
   const popup=document.getElementById('slashPopup');
@@ -4675,22 +4971,27 @@ function highlightSlashItem(idx){
 
 function handleInput(e){
   const inp=e.target;
+  // One source of truth for the box: the CSS declares min/max, the autosize reads
+  // them back. The old hardcoded 44/120 fought the stylesheet's 40/200 and made
+  // the composer jump 4px on the first keystroke.
+  const cs=getComputedStyle(inp);
+  const minH=parseFloat(cs.minHeight)||40, maxH=parseFloat(cs.maxHeight)||200;
   inp.style.height='auto';
-  inp.style.height=Math.max(44,Math.min(inp.scrollHeight,120))+'px';
+  inp.style.height=Math.max(minH,Math.min(inp.scrollHeight,maxH))+'px';
   updateSendState();
   const val=inp.value;
-  const lower=val.toLowerCase();
-  if(lower.startsWith('/skill ')){
-    if(keepNamePopup(val.slice(7))) showSkillsPopup(val.slice(7).trim());
-    else hideSlashPopup();
-  } else if(lower.startsWith('/skill')){
-    showSkillsPopup(val.slice(6).trim());
-  } else if(lower.startsWith('/new')){
+  if(!val.startsWith('/')){ hideSlashPopup(); return; }
+  // The command word is consumed first; only what follows it filters the list.
+  // Taking slice(6) instead made "/skills" search for a skill named "s…".
+  const head=val.slice(1).split(/\s+/)[0].toLowerCase();
+  if(head==='skill'||head==='skills'){
+    const after=val.slice(1+head.length);
+    if(!keepNamePopup(after)){ hideSlashPopup(); return; }
+    showSkillsPopup(after.trim());
+  } else if(head==='new'){
     hideSlashPopup();
-  } else if(lower.startsWith('/')){
-    showCmdMenu(val.slice(1));
   } else {
-    hideSlashPopup();
+    showCmdMenu(head);
   }
 }
 function keepNamePopup(after){
@@ -4706,8 +5007,15 @@ function handleInputKeydown(e){
   if(slashOpen){
     const popup=document.getElementById('slashPopup');
     const items=popup._filtered||[];
-    if(e.key==='ArrowDown'){ e.preventDefault(); slashIdx=Math.min(slashIdx+1,items.length-1); highlightSlashItem(slashIdx); return; }
-    if(e.key==='ArrowUp'){ e.preventDefault(); slashIdx=Math.max(slashIdx-1,0); highlightSlashItem(slashIdx); return; }
+    // The list is a ring, like PCBuddy's moveMenu: from the last skill ArrowDown
+    // lands on the first, so a long list never needs scrolling back up by hand.
+    const move=(step)=>{
+      if(!items.length)return;
+      slashIdx=((slashIdx+step)%items.length+items.length)%items.length;
+      highlightSlashItem(slashIdx);
+    };
+    if(e.key==='ArrowDown'){ e.preventDefault(); move(1); return; }
+    if(e.key==='ArrowUp'){ e.preventDefault(); move(-1); return; }
     if(e.key==='Escape'){ e.preventDefault(); hideSlashPopup(); return; }
     if(e.key==='Enter'||e.key==='Tab'){
       e.preventDefault();
@@ -4720,14 +5028,35 @@ function handleInputKeydown(e){
   }
   if(e.key==='Enter'&&!e.shiftKey){
     e.preventDefault();
-    const input=document.getElementById('msgInput');
-    const raw=input.value.trim();
+    const inp=document.getElementById('msgInput');
+    const raw=inp.value.trim();
     const lower=raw.toLowerCase();
-    if(lower==='/new'){ input.value=''; newSession(); return; }
-    // Bare / incomplete slash commands are not sent to the model.
-    if(lower==='/'||lower==='/skill'||/^\/skill\s*$/.test(lower)){
+    const head=lower.startsWith('/')?lower.slice(1).split(/\s+/)[0]:'';
+    // Checked first: the picker owns the word "skills", so it must win over any
+    // view jump that might one day reuse the same spelling.
+    if(head==='skill'||head==='skills'){
+      // Still an unfinished pick when nothing follows the command word; note that
+      // the skills list leaves slashIdx at -1 until an arrow key moves it, so this
+      // is the path where Enter means "send", not "accept row 0".
+      if(!/\S\s+\S/.test(lower.slice(1))) return;
+      // /skills is only a spelling; the field the server reads is /skill.
+      inp.value='/skill'+raw.slice(1+head.length);
+      hideSlashPopup();
+      sendMsg();
       return;
     }
+    const view=SLASH_VIEWS.find(v=>v[0]===head);
+    // Enter on a command word runs it — typing it into the chat would be a
+    // message the model has no way to act on.
+    if(head==='stop'||head==='new'||head==='help'||view){
+      inp.value=''; inp.style.height='auto'; hideSlashPopup(); updateSendState();
+      if(head==='stop'){ stopAgent(); return; }
+      if(head==='new'){ newSession(); return; }
+      if(head==='help'){ slashHelpLine(); return; }
+      gotoView(head); return;
+    }
+    if(lower==='/'){ return; }
+    hideSlashPopup();
     sendMsg();
   }
 }
@@ -4936,6 +5265,22 @@ function toggleAgent(hdr) {
   if (card) card.classList.toggle('open');
 }
 
+</script>
+<script>
+/* light/dark toggle — choice persists in localStorage */
+(function(){
+  function wire(){
+    var b=document.getElementById('themeToggle');
+    if(!b){ setTimeout(wire, 200); return; }
+    b.addEventListener('click', function(){
+      var r=document.documentElement;
+      var next = r.dataset.theme==='dark' ? 'light' : 'dark';
+      r.dataset.theme = next;
+      try{ localStorage.setItem('foxir.theme', next); }catch(e){}
+    });
+  }
+  wire();
+})();
 </script>
 </html>
 
