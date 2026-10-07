@@ -5,6 +5,7 @@ pub mod self_improve;
 pub mod metrics;
 pub mod schema;
 pub mod grants;
+pub mod install;
 pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ fn sanitize_dir_name(name: &str) -> String {
 /// component), returning the safely joined path. Used to stop malicious skill
 /// paths (`files[].path`, `content_file`, `source_path`) from writing or reading
 /// outside the intended directory.
-fn resolve_inside(base: &Path, rel: &str) -> Result<PathBuf, String> {
+pub fn resolve_inside(base: &Path, rel: &str) -> Result<PathBuf, String> {
     if rel.is_empty() {
         return Err("empty relative path".to_string());
     }
@@ -297,6 +298,147 @@ impl SkillManager {
             }
         }
         ledger
+    }
+
+    /// Where a package waits while it is being screened: a sibling of `skills/`,
+    /// so `reload()`'s `{skills}/**/SKILL.md` glob cannot see it.
+    fn quarantine_root(&self) -> PathBuf {
+        self.skills_dir
+            .parent()
+            .map(|parent| parent.join(".skill-quarantine"))
+            .unwrap_or_else(|| self.skills_dir.join(".skill-quarantine"))
+    }
+
+    /// True when the recycle bin already holds a skill directory with this name
+    /// (`<name>` or `<name>-<timestamp>` from `delete_skill`).
+    fn recycle_bin_holds(&self, dir_name: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(self.skills_dir.join("_deleted")) else {
+            return false;
+        };
+        let prefixed = format!("{dir_name}-");
+        entries.filter_map(|entry| entry.ok()).any(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name == dir_name || name.starts_with(&prefixed)
+        })
+    }
+
+    /// Install a skill from a folder the user pointed at (P4a, user-initiated).
+    ///
+    /// The source tree is screened *before* it is copied, staged outside the
+    /// scanned tree, screened again, then moved in with a same-volume rename.
+    /// A refused install leaves `skills/` untouched.
+    pub fn install_from_folder(
+        &self,
+        source: &Path,
+        name: Option<&str>,
+    ) -> Result<install::InstallOutcome, String> {
+        let requested = name
+            .map(str::to_string)
+            .or_else(|| {
+                source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| "no skill name: pass one, or point at a named folder".to_string())?;
+        let dir_name = sanitize_dir_name(&requested);
+        if dir_name.is_empty() {
+            return Err(format!("'{requested}' has no characters usable as a directory name"));
+        }
+        if self.recycle_bin_holds(&dir_name) {
+            return Err(format!(
+                "'{dir_name}' is in skills/_deleted; restore it from the recycle bin instead of installing over it"
+            ));
+        }
+
+        // Pre-screen the source so oversized or malformed content is never copied.
+        let source_entries =
+            install::walk_staged(source).map_err(|e| install::errors_text(&e))?;
+        install::plan_entries(&source_entries).map_err(|e| install::errors_text(&e))?;
+
+        let staging = self
+            .quarantine_root()
+            .join(format!("incoming-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| format!("create staging {}: {}", staging.display(), e))?;
+        if let Err(e) = install::copy_tree(source, &staging) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e.to_string());
+        }
+
+        match install::install_staged(&self.skills_dir, &staging, &dir_name) {
+            Ok(outcome) => {
+                // install_staged renamed the tree away; only a leftover is possible on
+                // some failure paths, and that leftover is our own scratch copy.
+                let _ = std::fs::remove_dir_all(&staging);
+                self.reload();
+                self.notify_skills_changed();
+                Ok(outcome)
+            }
+            Err(errors) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                Err(install::errors_text(&errors))
+            }
+        }
+    }
+
+    /// Install a fetched single `SKILL.md` (P4a, user-initiated).
+    pub fn install_single_file(
+        &self,
+        content: &[u8],
+        name: Option<&str>,
+    ) -> Result<install::InstallOutcome, String> {
+        let text = std::str::from_utf8(content)
+            .map_err(|_| "the downloaded file is not UTF-8 text".to_string())?;
+        let requested = name
+            .map(str::to_string)
+            .or_else(|| {
+                schema::parse_frontmatter(text, "probe")
+                    .ok()
+                    .map(|doc| doc.metadata.name)
+            })
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| "no skill name: the download has no usable frontmatter name".to_string())?;
+        let dir_name = sanitize_dir_name(&requested);
+        if dir_name.is_empty() {
+            return Err(format!("'{requested}' has no characters usable as a directory name"));
+        }
+        if self.recycle_bin_holds(&dir_name) {
+            return Err(format!(
+                "'{dir_name}' is in skills/_deleted; restore it from the recycle bin instead of installing over it"
+            ));
+        }
+
+        let staging = self
+            .quarantine_root()
+            .join(format!("incoming-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| format!("create staging {}: {}", staging.display(), e))?;
+        std::fs::write(staging.join("SKILL.md"), content)
+            .map_err(|e| format!("write staged SKILL.md: {e}"))?;
+
+        self.finish_staged_install(&staging, &dir_name)
+    }
+
+    /// Land a staged tree and refresh the catalog; our own scratch copy is always
+    /// cleaned up, and a refused install never reaches `skills/`.
+    fn finish_staged_install(
+        &self,
+        staging: &Path,
+        dir_name: &str,
+    ) -> Result<install::InstallOutcome, String> {
+        match install::install_staged(&self.skills_dir, staging, dir_name) {
+            Ok(outcome) => {
+                let _ = std::fs::remove_dir_all(staging);
+                self.reload();
+                self.notify_skills_changed();
+                Ok(outcome)
+            }
+            Err(errors) => {
+                let _ = std::fs::remove_dir_all(staging);
+                Err(install::errors_text(&errors))
+            }
+        }
     }
 
     /// Record the user's decision about one skill's declared `allowed-tools`.
@@ -1848,6 +1990,63 @@ mod tests {
             "an edited SKILL.md must not keep the old approval"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn installing_a_folder_stages_outside_the_skills_glob_and_registers() {
+        // 落位前必须先能被 reload() 扫到？不能 —— 隔离区在 skills/ 之外。
+        // 同时钉住：装完立刻可被发现，以及回收站里有同名时不许静默复活。
+        let root = std::env::temp_dir().join(format!("rs_install_mgr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let skills = root.join("skills");
+        let source = root.join("source/MySkill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: MySkill\ndescription: installed from a folder\n---\n# M\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("reference.md"), "ref").unwrap();
+
+        let mgr = SkillManager::new(skills.to_str().unwrap());
+        let outcome = mgr
+            .install_from_folder(&source, None)
+            .expect("folder install accepted");
+        assert_eq!(outcome.dir, skills.join("MySkill"));
+        assert!(skills.join("MySkill/reference.md").is_file());
+        let names: Vec<String> = mgr.list().into_iter().map(|m| m.name).collect();
+        assert!(
+            names.contains(&"MySkill".to_string()),
+            "an installed skill must be discoverable: {names:?}"
+        );
+        assert!(
+            !root.join("skills/.skill-quarantine").exists(),
+            "quarantine must never live inside the scanned tree"
+        );
+        assert!(!source.exists() || source.join("SKILL.md").is_file(), "the user's source tree stays put");
+
+        // 删掉后再装：回收站里有同名 → 明确拒绝，不静默复活
+        mgr.delete_skill("MySkill").expect("moved to recycle bin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: MySkill\ndescription: d\n---\n# M\n").unwrap();
+        let err = mgr
+            .install_from_folder(&source, None)
+            .expect_err("a trashed name must not be silently resurrected");
+        assert!(err.contains("_deleted"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §4.0 的边界：安装入口只能是用户发起的 HTTP 端点。模型能调到任何一个，
+    /// 就等于"它读到的一段文本"可以让 FoxIR 去拉包。
+    #[test]
+    fn install_entry_points_are_not_model_tools() {
+        let names = SkillManager::skill_tool_names();
+        for forbidden in ["install_from_url", "install_from_path", "install_from_folder"] {
+            assert!(
+                !names.iter().any(|n| n == forbidden),
+                "{forbidden} must not be model-callable: {names:?}"
+            );
+        }
     }
 
     #[test]

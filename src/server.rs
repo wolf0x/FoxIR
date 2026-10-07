@@ -416,6 +416,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/skills/{name}", delete(skills_delete_handler))
         .route("/api/skills/{name}/toggle", post(skills_toggle_handler))
         .route("/api/skills/{name}/grant", post(skills_grant_handler))
+        .route("/api/skills/install_from_url", post(skills_install_url_handler))
+        .route("/api/skills/install_from_path", post(skills_install_path_handler))
         .route("/api/mcp", get(mcp_handler))
         .route("/api/mcp", post(mcp_create_handler))
         .route("/api/mcp/{name}", delete(mcp_delete_handler))
@@ -1177,6 +1179,53 @@ async fn skills_grant_handler(
     let approved = body.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
     match state.skill_manager.record_skill_grant(&name, approved) {
         Ok(hash) => Json(json!({ "success": true, "approved": approved, "skill_md_hash": hash })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+/// P4a: install one `SKILL.md` from an https URL. User-initiated only — there is
+/// no model-callable install tool, because text the model read must not be able
+/// to make FoxIR fetch and install a package.
+async fn skills_install_url_handler(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
+    let url = match body.get("url").and_then(|v| v.as_str()) {
+        Some(url) => url.to_string(),
+        None => return Json(json!({ "success": false, "error": "missing 'url'" })),
+    };
+    let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string);
+    let outcome = match crate::skill::install::download_single_file(&url).await {
+        Err(e) => Err(e),
+        Ok(bytes) => state.skill_manager.install_single_file(&bytes, name.as_deref()),
+    };
+    match outcome {
+        Ok(landed) => Json(json!({
+            "success": true,
+            "skill_name": landed.skill_name,
+            "dir": landed.dir.to_string_lossy(),
+            "skill_md_hash": landed.skill_md_hash,
+        })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
+    }
+}
+
+/// P4a: install a skill from a folder already inside the workspace. Same rule as
+/// above: a human points at it; the agent cannot.
+async fn skills_install_path_handler(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
+    let rel = match body.get("path").and_then(|v| v.as_str()) {
+        Some(rel) => rel.to_string(),
+        None => return Json(json!({ "success": false, "error": "missing 'path'" })),
+    };
+    let source = match crate::skill::resolve_inside(std::path::Path::new(&state.workspace_dir), &rel) {
+        Ok(path) => path,
+        Err(e) => return Json(json!({ "success": false, "error": format!("unacceptable path: {e}") })),
+    };
+    let name = body.get("name").and_then(|v| v.as_str()).map(str::to_string);
+    match state.skill_manager.install_from_folder(&source, name.as_deref()) {
+        Ok(landed) => Json(json!({
+            "success": true,
+            "skill_name": landed.skill_name,
+            "dir": landed.dir.to_string_lossy(),
+            "skill_md_hash": landed.skill_md_hash,
+        })),
         Err(e) => Json(json!({ "success": false, "error": e })),
     }
 }
