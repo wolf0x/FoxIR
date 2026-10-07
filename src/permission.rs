@@ -87,6 +87,9 @@ pub struct PermissionChecker {
     /// Pre-authorization profile for managed tasks (Phase 6).
     /// Matching tool calls bypass the permission gate entirely.
     preauth_profile: Option<Arc<crate::managed::permission_profile::PermissionProfile>>,
+    /// Skill-derived grants for this run. Unlike the profile above, a bypass
+    /// through these is only allowed after its audit record is on disk.
+    skill_grants: Option<Arc<crate::skill::grants::SkillGrantLedger>>,
 }
 
 impl PermissionChecker {
@@ -97,6 +100,7 @@ impl PermissionChecker {
         invocation_id: String,
         author: String,
         preauth_profile: Option<Arc<crate::managed::permission_profile::PermissionProfile>>,
+        skill_grants: Option<Arc<crate::skill::grants::SkillGrantLedger>>,
     ) -> Self {
         Self {
             pending,
@@ -105,6 +109,7 @@ impl PermissionChecker {
             invocation_id,
             author,
             preauth_profile,
+            skill_grants,
         }
     }
 
@@ -116,6 +121,27 @@ impl PermissionChecker {
     ///   intent maps to a DENIED category (e.g., delete), still requires confirmation.
     /// Returns `true` if allowed, `false` if denied.
     pub async fn check(&self, tool_name: &str, args: &Value) -> bool {
+        // Skill-derived grants: audit first, effect after. If the record cannot
+        // be written the call is asked of the user instead of going through.
+        if let Some(ledger) = &self.skill_grants {
+            let intent = explain_tool_call(tool_name, args);
+            match ledger.authorize_with_audit(tool_name, args, &intent) {
+                crate::skill::grants::AuditOutcome::Bypassed { skill } => {
+                    crate::skill::metrics::record_grant_activated();
+                    info!("Skill '{skill}' pre-authorized '{tool_name}' (audited)");
+                    return true;
+                }
+                crate::skill::grants::AuditOutcome::AuditFailed { skill, error } => {
+                    crate::skill::metrics::record_grant_audit_failure();
+                    info!(
+                        "Skill '{skill}' grant not used: audit record failed ({error}); asking the user"
+                    );
+                    return self.request_confirmation(tool_name, tool_category(tool_name), args).await;
+                }
+                crate::skill::grants::AuditOutcome::NoGrant => {}
+            }
+        }
+
         // Phase 6: pre-authorized actions (managed mode) bypass the permission gate.
         // Intent-level matching keeps the bypass narrow (e.g., shell_exec taskkill only).
         if let Some(profile) = &self.preauth_profile {
@@ -470,6 +496,67 @@ fn readable_target(t: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 端到端一次：分类表关掉的情况下，只有"已同意 + 内容绑住 + 审计已落盘"的
+    /// 技能授权才让这道窄化过的调用过去，并且留下一行台账。
+    #[tokio::test]
+    async fn a_consented_skill_grant_bypasses_the_gate_only_after_the_audit_lands() {
+        use crate::skill::{schema, SkillManager};
+        let tmp = std::env::temp_dir().join(format!("rs_gate_grant_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("MyTool")).unwrap();
+        let md = "---\nname: MyTool\ndescription: d\nallowed-tools: sys_process\n---\n# body\n";
+        std::fs::write(tmp.join("MyTool/SKILL.md"), md).unwrap();
+        schema::write_manifest(
+            &tmp.join("MyTool"),
+            &schema::SourceManifest::local(md.as_bytes()),
+        )
+        .unwrap();
+        let hash = schema::skill_md_hash(md.as_bytes());
+        std::fs::write(
+            tmp.join("skills_state.json"),
+            format!(
+                "{{\"MyTool\":{{\"enabled\":true,\"grants\":{{\"consented_hash\":\"{hash}\",\"tools\":[\"sys_process\"]}}}}}}"
+            ),
+        )
+        .unwrap();
+
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let ledger = mgr.grant_ledger(&["MyTool".to_string()], "sess-gate");
+        assert!(!ledger.is_empty(), "the fixture must produce a live grant");
+
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut perms = default_permissions();
+        perms.insert("modify".to_string(), false); // sys_process 属 modify，无授权必问
+        let checker = PermissionChecker::new(
+            pending,
+            tx,
+            Arc::new(Mutex::new(perms)),
+            "inv-gate".to_string(),
+            "FoxIR".to_string(),
+            None,
+            Some(Arc::new(ledger)),
+        );
+
+        let allowed = checker
+            .check(
+                "sys_process",
+                &serde_json::json!({ "action": "kill", "name": "evil.exe" }),
+            )
+            .await;
+        let text = std::fs::read_to_string(tmp.join("_audit").join("grants.jsonl"))
+            .expect("one audit line must exist");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(allowed, "the narrowed, consented call should go through");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record["tool"], "sys_process");
+        assert_eq!(record["decision"], "auto-granted");
+        assert_eq!(record["session"], "sess-gate");
+    }
 
     #[test]
     fn explain_delete_cleanup_script() {

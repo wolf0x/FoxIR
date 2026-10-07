@@ -4,6 +4,7 @@ pub mod verify;
 pub mod self_improve;
 pub mod metrics;
 pub mod schema;
+pub mod grants;
 pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};
@@ -244,6 +245,99 @@ impl SkillManager {
     /// Human-readable problems reading a skill's source manifest.
     pub fn manifest_issue_reports(&self) -> Vec<String> {
         self.manifest_issues.read().unwrap().clone()
+    }
+
+    /// Build the run's grant ledger from the skills loaded so far in it.
+    ///
+    /// A skill contributes a grant only when all three hold: its content is
+    /// bound by a recorded manifest hash, the user consented to *that* hash, and
+    /// the file has not changed since. Anything else stays inert — the narrowed
+    /// call then goes through the normal prompt.
+    pub fn grant_ledger(&self, loaded: &[String], session: &str) -> grants::SkillGrantLedger {
+        let mut ledger =
+            grants::SkillGrantLedger::new(self.skills_dir.join("_audit").join("grants.jsonl"));
+        let store = self.read_store();
+        let skills = self.skills.read().unwrap();
+
+        for name in loaded {
+            let Some(skill) = skills.iter().find(|s| &s.metadata.name == name) else {
+                continue;
+            };
+            let dir = Path::new(&skill.skill_dir);
+            let Ok(bytes) = std::fs::read(dir.join("SKILL.md")) else {
+                continue;
+            };
+            let current_hash = schema::skill_md_hash(&bytes);
+            let recorded_hash = schema::read_manifest(dir)
+                .ok()
+                .flatten()
+                .and_then(|manifest| manifest.skill_md_hash);
+            let state = store.state_of(name);
+            let facts = grants::GrantFacts {
+                current_hash: &current_hash,
+                recorded_hash: recorded_hash.as_deref(),
+                consented_hash: state.and_then(|s| s.grants.consented_hash.as_deref()),
+                declined_hash: state.and_then(|s| s.grants.declined_hash.as_deref()),
+                tools: skill.metadata.allowed_tools.clone(),
+            };
+            if let grants::GrantState::Consent { actions } = grants::grant_state(&facts) {
+                if actions.is_empty() {
+                    continue;
+                }
+                let plan = grants::GrantPlan {
+                    actions,
+                    findings: Vec::new(),
+                };
+                ledger.add(grants::SkillGrant {
+                    skill: name.clone(),
+                    full_hash: current_hash,
+                    session: session.to_string(),
+                    profile: grants::fragment(name, &plan),
+                });
+            }
+        }
+        ledger
+    }
+
+    /// Record the user's decision about one skill's declared `allowed-tools`.
+    ///
+    /// Deliberately user-initiated: a skill cannot approve itself, and the
+    /// decision binds to the full hash of `SKILL.md` as it is on disk right now.
+    /// An unbound or drifted file is refused — approving content you cannot
+    /// identify is how a stale approval outlives the thing it was given for.
+    pub fn record_skill_grant(&self, name: &str, approved: bool) -> Result<String, String> {
+        let (skill_name, skill_dir, tools) = {
+            let skills = self.skills.read().unwrap();
+            let wanted = name.trim().to_lowercase();
+            let skill = skills
+                .iter()
+                .find(|s| s.metadata.name.to_lowercase() == wanted)
+                .ok_or_else(|| format!("Skill '{name}' is not registered"))?;
+            (
+                skill.metadata.name.clone(),
+                PathBuf::from(&skill.skill_dir),
+                skill.metadata.allowed_tools.clone(),
+            )
+        };
+        let bytes = std::fs::read(skill_dir.join("SKILL.md"))
+            .map_err(|e| format!("read {}: {}", skill_dir.display(), e))?;
+        let current_hash = schema::skill_md_hash(&bytes);
+        let Some(recorded_hash) = schema::read_manifest(&skill_dir)?
+            .and_then(|manifest| manifest.skill_md_hash)
+        else {
+            return Err(format!(
+                "cannot bind '{skill_name}' to its content: no {} manifest, so nothing can be approved",
+                schema::MANIFEST_FILE
+            ));
+        };
+        if recorded_hash != current_hash {
+            return Err(format!(
+                "'{skill_name}' changed since it was recorded (manifest {recorded_hash} != current {current_hash}); review the new content first"
+            ));
+        }
+        let mut store = self.read_store();
+        store.record_consent(&skill_name, &current_hash, &tools, approved)?;
+        Ok(current_hash)
     }
 
     pub fn list(&self) -> Vec<SkillMetadata> {
@@ -1639,6 +1733,121 @@ mod tests {
 
         assert_eq!(count, 2, "both distinct skills register");
         assert!(reports.is_empty(), "no collision, no report: {:?}", reports);
+    }
+
+    #[test]
+    fn recording_a_grant_needs_content_binding_and_is_what_makes_a_ledger_live() {
+        // 同意 → 台账生效；拒绝 → 台账空。这一条同时钉住两件事：
+        // 没有清单绑定就不接受同意（§1.3），以及"同意是激活的唯一入口"。
+        let tmp = std::env::temp_dir().join(format!("rs_grant_record_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let md = "---\nname: MyTool\ndescription: d\nallowed-tools: sys_process\n---\n# body\n";
+        std::fs::create_dir_all(tmp.join("MyTool")).unwrap();
+        std::fs::write(tmp.join("MyTool/SKILL.md"), md).unwrap();
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+
+        // (1) 文件还没被清单绑住 → 不接受同意
+        let err = mgr
+            .record_skill_grant("MyTool", true)
+            .expect_err("an unbound skill cannot be consented");
+        assert!(err.contains("bind") || err.contains("manifest"), "{err}");
+
+        // (2) 绑定之后同意 → 台账立刻有了一条，且记录的是全长哈希
+        schema::write_manifest(
+            &tmp.join("MyTool"),
+            &schema::SourceManifest::local(md.as_bytes()),
+        )
+        .unwrap();
+        mgr.reload();
+        mgr.record_skill_grant("MyTool", true).expect("consent accepted");
+        let hash = schema::skill_md_hash(md.as_bytes());
+        let persisted = schema::SkillStateStore::load(&tmp.join("skills_state.json"));
+        assert_eq!(
+            persisted
+                .state_of("MyTool")
+                .expect("entry")
+                .grants
+                .consented_hash
+                .as_deref(),
+            Some(hash.as_str()),
+            "the approval must be bound to the full hash"
+        );
+        assert!(
+            !mgr.grant_ledger(&["MyTool".to_string()], "sess-r").is_empty(),
+            "a consented, bound skill must be able to authorise"
+        );
+
+        // (3) 撤回同意 → 台账变空
+        mgr.record_skill_grant("MyTool", false).expect("refusal accepted");
+        assert!(
+            mgr.grant_ledger(&["MyTool".to_string()], "sess-r").is_empty(),
+            "a declined skill grants nothing"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn grant_ledger_needs_consent_content_binding_and_no_drift() {
+        // 三条路径一起钉：没有同意 → 不放行；有同意但清单缺失（内容没绑住）→ 不放行；
+        // 清单在、同意在、但文件被改过（哈希漂了）→ 撤权。
+        let tmp = std::env::temp_dir().join(format!("rs_grants_ledger_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let md = "---\nname: MyTool\ndescription: d\nallowed-tools: sys_process\n---\n# body\n";
+        let hash = schema::skill_md_hash(md.as_bytes());
+
+        std::fs::create_dir_all(tmp.join("MyTool")).unwrap();
+        std::fs::write(tmp.join("MyTool/SKILL.md"), md).unwrap();
+
+        // (1) 只有同意在册才可能放行 —— 这里还没写任何状态
+        let mgr = SkillManager::new(tmp.to_str().unwrap());
+        let ledger = mgr.grant_ledger(&["MyTool".to_string()], "sess-1");
+        assert!(ledger.is_empty(), "no consent on record yet: {:?}", ledger.is_empty());
+
+        // (3) 同意在册 + 清单缺失 = 内容没绑住，仍然不放行
+        std::fs::write(
+            tmp.join("skills_state.json"),
+            format!("{{\"MyTool\":{{\"enabled\":true,\"grants\":{{\"consented_hash\":\"{hash}\",\"tools\":[\"sys_process\"]}}}}}}"),
+        )
+        .unwrap();
+        mgr.reload();
+        let ledger = mgr.grant_ledger(&["MyTool".to_string()], "sess-1");
+        assert!(ledger.is_empty(), "an unbound file grants nothing");
+
+        // 补上清单（内容绑住）→ 放行
+        schema::write_manifest(
+            &tmp.join("MyTool"),
+            &schema::SourceManifest::local(md.as_bytes()),
+        )
+        .expect("manifest written");
+        mgr.reload();
+        let ledger = mgr.grant_ledger(&["MyTool".to_string()], "sess-1");
+        assert!(
+            !matches!(
+                ledger.authorize_with_audit(
+                    "sys_process",
+                    &json!({"action": "kill", "name": "evil.exe"}),
+                    "终止进程",
+                ),
+                crate::skill::grants::AuditOutcome::NoGrant
+            ),
+            "a consented, bound skill must be able to authorise the narrowed call"
+        );
+
+        // 内容一改，同一份同意立刻不生效（哈希漂了）
+        std::fs::write(tmp.join("MyTool/SKILL.md"), format!("{md}\n# appended by someone else\n")).unwrap();
+        let after_edit = mgr.grant_ledger(&["MyTool".to_string()], "sess-1");
+        assert!(
+            matches!(
+                after_edit.authorize_with_audit(
+                    "sys_process",
+                    &json!({"action": "kill", "name": "evil.exe"}),
+                    "终止进程",
+                ),
+                crate::skill::grants::AuditOutcome::NoGrant
+            ),
+            "an edited SKILL.md must not keep the old approval"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

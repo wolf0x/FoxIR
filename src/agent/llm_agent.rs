@@ -1769,6 +1769,10 @@ impl Agent for LlmAgent {
         let knowledge_pre_retrieval = ctx.knowledge_pre_retrieval;
         let budget_dashboard_enabled = ctx.budget_dashboard;
         let budget_sink = ctx.budget_sink.clone();
+        // P3: skills whose instructions were loaded *by this run*. Grants are
+        // derived from this list, so they cannot outlive the run.
+        let skill_manager_for_grants = self.skill_manager.clone();
+        let audit_session = ctx.base.session_id.clone();
         let knowledge_reminder: Option<String> = if knowledge_pre_retrieval && !minimal_tier {
             self.build_knowledge_reminder(&user_message)
         } else {
@@ -2064,6 +2068,7 @@ impl Agent for LlmAgent {
             let mut active_model = model.clone();
             let mut used_fallback = false;
             let mut has_executed_tools = false;
+            let mut loaded_skills: Vec<String> = Vec::new();
             let mut reprompt_count = 0u32;
             // pending-action 补发计数（模式 B：宣告动作却收场）。全 run 上限 1 次，最坏多花一轮。
             let mut nudge_count = 0u32;
@@ -2652,7 +2657,16 @@ impl Agent for LlmAgent {
                         has_executed_tools = true;
                         history.push(ChatMessage::assistant_with_tool_calls(tool_calls.clone()));
 
-                        // Create permission checker for this iteration
+                        // Create permission checker for this iteration. Grants come
+                        // only from skills loaded by *earlier* iterations, so a skill
+                        // read inside the same batch cannot authorize a call in it.
+                        let skill_grants = match &skill_manager_for_grants {
+                            Some(sm) if !loaded_skills.is_empty() => {
+                                let ledger = sm.grant_ledger(&loaded_skills, &audit_session);
+                                (!ledger.is_empty()).then(|| std::sync::Arc::new(ledger))
+                            }
+                            _ => None,
+                        };
                         let checker = PermissionChecker::new(
                             permission_pending.clone(),
                             tx.clone(),
@@ -2660,6 +2674,7 @@ impl Agent for LlmAgent {
                             invocation_id.clone(),
                             author.clone(),
                             preauth_profile.clone(),
+                            skill_grants,
                         );
 
                         let hist_start = history.len();
@@ -2764,6 +2779,22 @@ impl Agent for LlmAgent {
                         // state" windows. On stall it condenses duplicated results in history,
                         // injects an automatic strategy reconsideration, and (bounded) terminates
                         // gracefully with a summary if still stuck. No human intervention needed.
+                        for msg in &history[hist_start..] {
+                            if msg.role != "tool" || msg.name.as_deref() != Some("skill_read_file") {
+                                continue;
+                            }
+                            let Some(txt) = msg.content_as_text() else { continue };
+                            let Ok(result) = serde_json::from_str::<serde_json::Value>(&txt) else {
+                                continue;
+                            };
+                            if let Some(skill) =
+                                crate::skill::grants::loaded_skill_name("skill_read_file", &result)
+                            {
+                                if !loaded_skills.contains(&skill) {
+                                    loaded_skills.push(skill);
+                                }
+                            }
+                        }
                         let tool_msgs = collect_tool_results_args(&history[hist_start..]);
                         let mut stalled = false;
                         if !tool_msgs.is_empty() {

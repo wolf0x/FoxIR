@@ -17,6 +17,8 @@ static LOAD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static IMPROVEMENTS: AtomicU64 = AtomicU64::new(0);
 static SUGGESTION_SHOWN: AtomicU64 = AtomicU64::new(0);
 static SKILL_LOADS: AtomicU64 = AtomicU64::new(0);
+static GRANTS_ACTIVATED: AtomicU64 = AtomicU64::new(0);
+static GRANT_AUDIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn bump(c: &AtomicU64) { c.fetch_add(1, Ordering::Relaxed); }
 fn get(c: &AtomicU64) -> u64 { c.load(Ordering::Relaxed) }
@@ -40,6 +42,8 @@ pub fn init(path: PathBuf) {
                     set(&IMPROVEMENTS, &v, "improvements");
                     set(&SUGGESTION_SHOWN, &v, "suggestions_shown");
                     set(&SKILL_LOADS, &v, "skill_loads");
+                    set(&GRANTS_ACTIVATED, &v, "grants_activated");
+                    set(&GRANT_AUDIT_FAILURES, &v, "grant_audit_failures");
                 }
             }
         }
@@ -49,6 +53,8 @@ pub fn init(path: PathBuf) {
 pub fn record_catalog_turn() { bump(&CATALOG_TURNS); }
 pub fn record_suggestion_shown() { bump(&SUGGESTION_SHOWN); }
 pub fn record_skill_load() { bump(&SKILL_LOADS); }
+pub fn record_grant_activated() { bump(&GRANTS_ACTIVATED); }
+pub fn record_grant_audit_failure() { bump(&GRANT_AUDIT_FAILURES); }
 pub fn record_read_call() { bump(&READ_CALLS); }
 pub fn record_read_failure() { bump(&READ_FAILURES); }
 pub fn record_load_failure() { bump(&LOAD_FAILURES); }
@@ -73,6 +79,8 @@ pub fn snapshot() -> Value {
         "improvements": get(&IMPROVEMENTS),
         "suggestions_shown": get(&SUGGESTION_SHOWN),
         "skill_loads": get(&SKILL_LOADS),
+        "grants_activated": get(&GRANTS_ACTIVATED),
+        "grant_audit_failures": get(&GRANT_AUDIT_FAILURES),
         "router_mode": "llm",
     })
 }

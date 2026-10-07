@@ -415,6 +415,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/skills/reload", post(skills_reload_handler))
         .route("/api/skills/{name}", delete(skills_delete_handler))
         .route("/api/skills/{name}/toggle", post(skills_toggle_handler))
+        .route("/api/skills/{name}/grant", post(skills_grant_handler))
         .route("/api/mcp", get(mcp_handler))
         .route("/api/mcp", post(mcp_create_handler))
         .route("/api/mcp/{name}", delete(mcp_delete_handler))
@@ -1161,6 +1162,22 @@ async fn skills_toggle_handler(
     match state.skill_manager.toggle_skill(&name) {
         Some(enabled) => Json(json!({ "success": true, "enabled": enabled })),
         None => Json(json!({ "success": false, "error": "Not found" })),
+    }
+}
+
+/// Record the user's decision about a skill's declared `allowed-tools`.
+///
+/// There is deliberately no tool that reaches this: a skill cannot approve
+/// itself, so the only way a grant becomes live is a human calling this endpoint.
+async fn skills_grant_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let approved = body.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
+    match state.skill_manager.record_skill_grant(&name, approved) {
+        Ok(hash) => Json(json!({ "success": true, "approved": approved, "skill_md_hash": hash })),
+        Err(e) => Json(json!({ "success": false, "error": e })),
     }
 }
 

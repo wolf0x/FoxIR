@@ -32,6 +32,21 @@ fn default_true() -> bool {
     true
 }
 
+/// What the user decided about one skill's declared `allowed-tools`.
+/// Bound to the full `skill_md_hash`: new content is a new question.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrantConsent {
+    #[serde(default)]
+    pub consented_hash: Option<String>,
+    #[serde(default)]
+    pub declined_hash: Option<String>,
+    /// The tool names the decision covered, so the UI can show what was agreed.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub granted_at: Option<i64>,
+}
+
 /// Per-skill runtime state, persisted in `skills_state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillState {
@@ -53,6 +68,9 @@ pub struct SkillState {
     /// P1 has no writer for this; P3 authorization does.
     #[serde(default)]
     pub reviewed_at: Option<i64>,
+    /// The user's decision about this skill's declared `allowed-tools`.
+    #[serde(default)]
+    pub grants: GrantConsent,
 }
 
 /// The `skills_state.json` store, read in two stages so a schema change cannot
@@ -110,26 +128,56 @@ impl SkillStateStore {
         store
     }
 
-    /// Full persisted state for one skill. P1's only consumer is the test suite;
-    /// P3 reads the recorded `skill_md_hash` through here to bind its grants.
-    #[allow(dead_code)]
-    pub fn get(&self, name: &str) -> Option<&SkillState> {
-        self.skills.get(name)
-    }
-
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
 
-    /// Toggle a skill and persist. Refuses to write when the file matched neither
-    /// known shape, so a corrupt file is never overwritten by an empty structure.
-    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+    /// Full persisted state for one skill.
+    pub fn state_of(&self, name: &str) -> Option<&SkillState> {
+        self.skills.get(name)
+    }
+
+    /// Record the user's decision about a skill's declared `allowed-tools`.
+    /// Approval and refusal are both bound to the full `skill_md_hash`, and a
+    /// refusal clears any earlier approval (new content is a new question).
+    pub fn record_consent(
+        &mut self,
+        name: &str,
+        skill_md_hash: &str,
+        tools: &[String],
+        approved: bool,
+    ) -> Result<(), String> {
+        self.guard_writable()?;
+        let entry = self.skills.entry(name.to_string()).or_default();
+        entry.grants.tools = tools.to_vec();
+        if approved {
+            entry.grants.consented_hash = Some(skill_md_hash.to_string());
+            entry.grants.declined_hash = None;
+            entry.grants.granted_at = Some(now_unix());
+        } else {
+            entry.grants.declined_hash = Some(skill_md_hash.to_string());
+            entry.grants.consented_hash = None;
+        }
+        if entry.installed_at.is_none() {
+            entry.installed_at = Some(now_unix());
+        }
+        self.save()
+    }
+
+    fn guard_writable(&self) -> Result<(), String> {
         if self.unreadable {
             return Err(format!(
                 "refusing to write {}: it matches neither the new nor the legacy shape",
                 self.path.display()
             ));
         }
+        Ok(())
+    }
+
+    /// Toggle a skill and persist. Refuses to write when the file matched neither
+    /// known shape, so a corrupt file is never overwritten by an empty structure.
+    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        self.guard_writable()?;
         let entry = self.skills.entry(name.to_string()).or_default();
         entry.enabled = enabled;
         if entry.installed_at.is_none() {
@@ -140,19 +188,14 @@ impl SkillStateStore {
 
     /// Drop a skill's persisted entry (used when the skill directory is removed).
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
-        if self.unreadable {
-            return Err(format!(
-                "refusing to write {}: it matches neither the new nor the legacy shape",
-                self.path.display()
-            ));
-        }
+        self.guard_writable()?;
         self.skills.remove(name);
         self.save()
     }
 
     /// The persisted enabled flag, if any.
     pub fn enabled_flag(&self, name: &str) -> Option<bool> {
-        self.skills.get(name).map(|s| s.enabled)
+        self.state_of(name).map(|state| state.enabled)
     }
 
     /// Atomic write of the current map; refuses when the last read was unreadable.
@@ -286,6 +329,12 @@ pub enum Finding {
         value_preview: String,
         migrate_to: String,
     },
+    /// P3, warn-level: a declared `allowed-tools` entry outside the grantable
+    /// vocabulary. The skill still registers; the entry grants nothing.
+    GrantUnsupported { tool: String, reason: &'static str },
+    /// P3, warn-level: another host's grant syntax (e.g. `Bash(git commit)`).
+    /// Not ours to interpret, so it is reported rather than guessed at.
+    UnsupportedGrantSyntax { raw: String },
 }
 
 /// The six frontmatter keys the agentskills.io standard defines.
@@ -412,6 +461,12 @@ pub fn parse_frontmatter(frontmatter: &str, dir_name: &str) -> Result<SkillDoc, 
         warn_if_too_long(&mut warnings, "compatibility", compatibility, COMPATIBILITY_LIMIT);
     }
     classify_unknown_keys(mapping, &mut warnings);
+    // Which declared tools can actually be honoured is decided by the ceiling in
+    // `grants`; asking at parse time is what makes an inert declaration visible.
+    let allowed_tools = get("allowed-tools")
+        .map(canonicalize_list)
+        .unwrap_or_default();
+    warnings.extend(super::grants::plan_grants(&allowed_tools).findings);
 
     Ok(SkillDoc {
         warnings,
@@ -425,7 +480,7 @@ pub fn parse_frontmatter(frontmatter: &str, dir_name: &str) -> Result<SkillDoc, 
                 .to_string(),
             platforms: get("platforms").map(canonicalize_list).unwrap_or_default(),
             deps: get("deps").map(canonicalize_list).unwrap_or_default(),
-            allowed_tools: get("allowed-tools").map(canonicalize_list).unwrap_or_default(),
+            allowed_tools,
             compatibility: get("compatibility").and_then(|v| v.as_str()).map(str::to_string),
             metadata: metadata_map,
             triggers,
@@ -546,6 +601,54 @@ mod tests {
     }
 
     #[test]
+    fn consent_records_round_trip_and_keep_the_enable_flag() {
+        // P3 的同意必须落在同一个状态文件里，而且不能顺手把 §1.2 守住的
+        // 启停开关刷掉 —— 这是"新字段带 #[serde(default)] 才能加"的现场验证。
+        let dir = temp_state_dir("consent");
+        let path = dir.join("skills_state.json");
+        std::fs::write(&path, "{\"S\": false}").unwrap();
+
+        let mut store = SkillStateStore::load(&path);
+        store
+            .record_consent("S", "aaa", &["sys_process".to_string()], true)
+            .expect("consent must persist");
+
+        let reopened = SkillStateStore::load(&path);
+        let state = reopened.state_of("S").expect("entry survives");
+        assert!(!state.enabled, "recording consent must not re-enable the skill");
+        assert_eq!(state.grants.consented_hash.as_deref(), Some("aaa"));
+        assert_eq!(
+            state.grants.tools,
+            vec!["sys_process".to_string()],
+            "what was approved has to be recorded, not just that something was"
+        );
+        assert!(state.grants.declined_hash.is_none());
+        assert!(state.grants.granted_at.is_some());
+
+        // 拒绝走同一张表，且把之前的同意清掉
+        let mut store2 = SkillStateStore::load(&path);
+        store2
+            .record_consent("S", "bbb", &["sys_process".to_string()], false)
+            .expect("refusal must persist");
+        let after = SkillStateStore::load(&path);
+        let grants = &after.state_of("S").expect("entry").grants;
+        assert_eq!(grants.declined_hash.as_deref(), Some("bbb"));
+        assert_eq!(grants.consented_hash, None, "a refusal for other content clears the old approval");
+
+        // 受害者样本：状态文件读不动时不许写回（与 §1.2 同一条底线）
+        let broken = dir.join("broken").join("skills_state.json");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, "{ nope").unwrap();
+        let mut guarded = SkillStateStore::load(&broken);
+        let err = guarded
+            .record_consent("S", "aaa", &[], true)
+            .expect_err("an unreadable store refuses to write");
+        assert!(err.contains("skills_state.json"), "{err}");
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ nope");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_state_file_is_reported_and_never_written_over() {
         // 现状是 `from_str(...).unwrap_or_default()`：解析失败 = 静默当成空表，
         // 下一次保存就把用户的状态文件覆成空结构。这里要求"报出来 + 不落盘"。
@@ -583,7 +686,7 @@ mod tests {
 
         let store = SkillStateStore::load(&path);
         let got = store
-            .get("OldSkill")
+            .state_of("OldSkill")
             .expect("a legacy entry must survive the schema change");
         assert!(!got.enabled, "a disabled skill must stay disabled");
         assert_eq!(got.source, Source::Local, "legacy entries have no install source");
@@ -600,6 +703,36 @@ mod tests {
             "load must not write the file back"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 天花板外的 `allowed-tools` 必须在**校验期**就说出来（规格 §3.1），
+    /// 而不是等到运行时静默忽略 —— 否则技能作者永远不知道自己写的授权没生效。
+    #[test]
+    fn allowed_tools_outside_the_ceiling_warn_at_parse_time() {
+        let doc = parse_frontmatter(
+            "name: foo\ndescription: d\nallowed-tools: sys_process winrm\n",
+            "foo",
+        )
+        .expect("an ungrantable name is warn-level");
+        assert_eq!(
+            doc.metadata.allowed_tools,
+            vec!["sys_process".to_string(), "winrm".to_string()],
+            "the declaration is kept verbatim, not rewritten"
+        );
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|f| matches!(f, Finding::GrantUnsupported { tool, .. } if tool == "winrm")),
+            "winrm must be reported as ungrantable: {:?}",
+            doc.warnings
+        );
+        assert!(
+            !doc.warnings
+                .iter()
+                .any(|f| matches!(f, Finding::GrantUnsupported { tool, .. } if tool == "sys_process")),
+            "the narrowed tool is inside the ceiling: {:?}",
+            doc.warnings
+        );
     }
 
     #[test]
