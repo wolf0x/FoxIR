@@ -100,8 +100,11 @@ struct DeltaContent {
 
 #[derive(Debug, Deserialize)]
 struct ToolCallChunk {
-    #[serde(default)]
-    index: usize,
+    /// `index` is optional in practice: several OpenAI-compatible gateways omit it.
+    /// A missing index must therefore never default to slot 0, or parallel tool
+    /// calls in one turn collapse into a single call with concatenated names and
+    /// arguments. See `ToolCallAccumulator::slot_for`.
+    index: Option<usize>,
     id: Option<String>,
     function: Option<FunctionChunk>,
 }
@@ -320,7 +323,7 @@ impl OpenAiProvider {
         let mut s = resp.bytes_stream();
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
-        let mut tool_calls_map: Vec<ToolCallAccum> = Vec::new();
+        let mut tc_accum = ToolCallAccumulator::default();
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut captured_usage: Option<crate::model::UsageMetadata> = None;
         let mut finish_reason: Option<String> = None;
@@ -411,21 +414,7 @@ impl OpenAiProvider {
                                     }
                                     if let Some(tcs) = &choice.delta.tool_calls {
                                         for tc in tcs {
-                                            let idx = tc.index;
-                                            while tool_calls_map.len() <= idx {
-                                                tool_calls_map.push(ToolCallAccum::default());
-                                            }
-                                            if let Some(ref id) = tc.id {
-                                                tool_calls_map[idx].id = id.clone();
-                                            }
-                                            if let Some(ref func) = tc.function {
-                                                if let Some(ref name) = func.name {
-                                                    tool_calls_map[idx].name.push_str(name);
-                                                }
-                                                if let Some(ref args) = func.arguments {
-                                                    tool_calls_map[idx].arguments.push_str(args);
-                                                }
-                                            }
+                                            tc_accum.absorb(tc);
                                         }
                                     }
                                 }
@@ -450,29 +439,7 @@ impl OpenAiProvider {
             debug!("LLM stream aborted because the client disconnected or stopped the session");
         }
 
-        let mut synthetic_id_counter = 0u32;
-        let tool_calls: Vec<ToolCallDelta> = tool_calls_map
-            .into_iter()
-            .filter(|tc| !tc.name.is_empty())
-            .map(|tc| {
-                let id = if tc.id.is_empty() {
-                    let sid = format!("tc_synthetic_{}", synthetic_id_counter);
-                    synthetic_id_counter += 1;
-                    debug!("Tool call '{}' missing ID from API, generated synthetic ID: {}", tc.name, sid);
-                    sid
-                } else {
-                    tc.id
-                };
-                ToolCallDelta {
-                    id,
-                    call_type: "function".to_string(),
-                    function: FunctionCallDelta {
-                        name: Some(tc.name),
-                        arguments: Some(tc.arguments),
-                    },
-                }
-            })
-            .collect();
+        let tool_calls = tc_accum.finish();
 
         Ok((full_content, full_reasoning, tool_calls, captured_usage, finish_reason, stream_timed_out))
     }
@@ -565,7 +532,7 @@ impl Llm for OpenAiProvider {
 
         let parsed_stream = async_stream::stream! {
             let mut byte_buf: Vec<u8> = Vec::new();
-            let mut tc_map: Vec<ToolCallAccum> = Vec::new();
+            let mut tc_accum = ToolCallAccumulator::default();
             let mut accumulated_content = String::new();
             let mut accumulated_reasoning = String::new();
             let mut finish_reason: Option<String> = None;
@@ -616,21 +583,7 @@ impl Llm for OpenAiProvider {
                                         }
                                         if let Some(tcs) = &choice.delta.tool_calls {
                                             for tc in tcs {
-                                                let idx = tc.index;
-                                                while tc_map.len() <= idx {
-                                                    tc_map.push(ToolCallAccum::default());
-                                                }
-                                                if let Some(ref id) = tc.id {
-                                                    tc_map[idx].id = id.clone();
-                                                }
-                                                if let Some(ref func) = tc.function {
-                                                    if let Some(ref name) = func.name {
-                                                        tc_map[idx].name.push_str(name);
-                                                    }
-                                                    if let Some(ref args) = func.arguments {
-                                                        tc_map[idx].arguments.push_str(args);
-                                                    }
-                                                }
+                                                tc_accum.absorb(tc);
                                             }
                                         }
                                     }
@@ -643,28 +596,7 @@ impl Llm for OpenAiProvider {
             }
 
             // Emit final response with accumulated data
-            let mut synthetic_id_counter = 0u32;
-            let tool_calls: Vec<ToolCallDelta> = tc_map
-                .into_iter()
-                .filter(|tc| !tc.name.is_empty())
-                .map(|tc| {
-                    let id = if tc.id.is_empty() {
-                        let sid = format!("tc_synthetic_{}", synthetic_id_counter);
-                        synthetic_id_counter += 1;
-                        sid
-                    } else {
-                        tc.id
-                    };
-                    ToolCallDelta {
-                        id,
-                        call_type: "function".to_string(),
-                        function: FunctionCallDelta {
-                            name: Some(tc.name),
-                            arguments: Some(tc.arguments),
-                        },
-                    }
-                })
-                .collect();
+            let tool_calls = tc_accum.finish();
 
             yield Ok(LlmResponse {
                 content: if accumulated_content.is_empty() { None } else { Some(accumulated_content) },
@@ -689,6 +621,145 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+    /// Set once this call's arguments hit `MAX_ARGS_BYTES`, so the warning fires
+    /// once per call instead of once per dropped fragment.
+    args_capped: bool,
+}
+
+/// Slots streaming `tool_calls` fragments into whole calls.
+///
+/// The wire gives no ordering guarantee for parallel calls, only the `index`
+/// key, and that key is missing on some compatible gateways. Attribution
+/// therefore falls through a ladder rather than trusting one field.
+#[derive(Default)]
+struct ToolCallAccumulator {
+    calls: Vec<ToolCallAccum>,
+}
+
+impl ToolCallAccumulator {
+    /// Calls beyond this are dropped. Bounds allocation against a malformed
+    /// `index` (or an endpoint inventing call ids forever).
+    const MAX_CALLS: usize = 128;
+    /// Argument bytes retained per call. Bounds a stream that never stops
+    /// emitting `arguments` for one call.
+    const MAX_ARGS_BYTES: usize = 2 * 1024 * 1024;
+
+    fn slot_for(&mut self, tc: &ToolCallChunk) -> Option<usize> {
+        // 1. An explicit index wins.
+        if let Some(idx) = tc.index {
+            if idx >= Self::MAX_CALLS {
+                tracing::warn!(
+                    "Discarding tool-call fragment with out-of-range index {} (cap {})",
+                    idx,
+                    Self::MAX_CALLS
+                );
+                return None;
+            }
+            while self.calls.len() <= idx {
+                self.calls.push(ToolCallAccum::default());
+            }
+            return Some(idx);
+        }
+
+        // 2. A call id: continue the call carrying it, else start a new one.
+        if let Some(id) = tc.id.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(pos) = self.calls.iter().position(|c| c.id == id) {
+                return Some(pos);
+            }
+            return self.open_new();
+        }
+
+        // 3. Neither index nor id. OpenAI delivers `name` whole in a call's first
+        // fragment, so a second name while the last call already has one means a
+        // second call; anything else continues the last one.
+        let carries_name = tc
+            .function
+            .as_ref()
+            .and_then(|f| f.name.as_deref())
+            .is_some_and(|s| !s.is_empty());
+        let last_has_name = self.calls.last().is_some_and(|c| !c.name.is_empty());
+        if carries_name && last_has_name {
+            return self.open_new();
+        }
+        match self.calls.len().checked_sub(1) {
+            Some(last) => Some(last),
+            None => self.open_new(),
+        }
+    }
+
+    fn open_new(&mut self) -> Option<usize> {
+        if self.calls.len() >= Self::MAX_CALLS {
+            tracing::warn!(
+                "Tool-call stream exceeded {} distinct calls; dropping further fragments",
+                Self::MAX_CALLS
+            );
+            return None;
+        }
+        self.calls.push(ToolCallAccum::default());
+        Some(self.calls.len() - 1)
+    }
+
+    fn absorb(&mut self, tc: &ToolCallChunk) {
+        let Some(slot) = self.slot_for(tc) else { return };
+        let call = &mut self.calls[slot];
+        if let Some(id) = tc.id.as_deref().filter(|s| !s.is_empty()) {
+            call.id = id.to_string();
+        }
+        let Some(func) = tc.function.as_ref() else { return };
+        if let Some(name) = func.name.as_deref() {
+            call.name.push_str(name);
+        }
+        if let Some(args) = func.arguments.as_deref() {
+            if call.arguments.len() + args.len() > Self::MAX_ARGS_BYTES {
+                if !call.args_capped {
+                    tracing::warn!(
+                        "Tool call '{}' arguments exceeded {} bytes; truncating the rest of the stream for this call",
+                        if call.name.is_empty() { "<unnamed>" } else { &call.name },
+                        Self::MAX_ARGS_BYTES
+                    );
+                    call.args_capped = true;
+                }
+                let room = Self::MAX_ARGS_BYTES.saturating_sub(call.arguments.len());
+                // Cut on a char boundary so the kept prefix stays valid UTF-8.
+                let mut take = room;
+                while take > 0 && !args.is_char_boundary(take) {
+                    take -= 1;
+                }
+                call.arguments.push_str(&args[..take]);
+            } else {
+                call.arguments.push_str(args);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<ToolCallDelta> {
+        let mut synthetic_id_counter = 0u32;
+        self.calls
+            .iter_mut()
+            .filter(|tc| !tc.name.is_empty())
+            .map(|tc| {
+                let id = if tc.id.is_empty() {
+                    let sid = format!("tc_synthetic_{}", synthetic_id_counter);
+                    synthetic_id_counter += 1;
+                    debug!(
+                        "Tool call '{}' missing ID from API, generated synthetic ID: {}",
+                        tc.name, sid
+                    );
+                    sid
+                } else {
+                    std::mem::take(&mut tc.id)
+                };
+                ToolCallDelta {
+                    id,
+                    call_type: "function".to_string(),
+                    function: FunctionCallDelta {
+                        name: Some(std::mem::take(&mut tc.name)),
+                        arguments: Some(std::mem::take(&mut tc.arguments)),
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +993,193 @@ mod usage_cache_parsing {
                           "reasoning_tokens":2,"serving_cost":0.001}"#);
         assert_eq!(u.prompt_tokens, Some(10));
         assert_eq!(u.cached_prompt_tokens(), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_call_slot_attribution {
+    use super::*;
+    use crate::config::ModelConfig;
+    use std::sync::Arc;
+
+    fn frag(index: Option<usize>, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallChunk {
+        let function = (name.is_some() || args.is_some()).then(|| FunctionChunk {
+            name: name.map(str::to_string),
+            arguments: args.map(str::to_string),
+        });
+        ToolCallChunk { index, id: id.map(str::to_string), function }
+    }
+
+    fn collect(frags: impl IntoIterator<Item = ToolCallChunk>) -> Vec<ToolCallDelta> {
+        let mut acc = ToolCallAccumulator::default();
+        for f in frags {
+            acc.absorb(&f);
+        }
+        acc.finish()
+    }
+
+    fn name_of(tc: &ToolCallDelta) -> &str {
+        tc.function.name.as_deref().unwrap_or("")
+    }
+
+    fn args_of(tc: &ToolCallDelta) -> &str {
+        tc.function.arguments.as_deref().unwrap_or("")
+    }
+
+    /// The regression this file used to fail: a gateway omitting `index` landed every
+    /// fragment in slot 0, so a turn requesting two tools came back as ONE call whose
+    /// name was both names concatenated and whose arguments were both payloads glued
+    /// together. The loop then reported a nonexistent tool and the model retried blind.
+    #[test]
+    fn indexless_fragments_with_distinct_ids_stay_two_calls() {
+        let calls = collect([
+            frag(None, Some("call_A"), Some("ir_evtx_parse"), Some("{\"path\":\"")),
+            frag(None, None, None, Some(r#"a.evtx"}"#)),
+            frag(None, Some("call_B"), Some("ir_usn"), Some(r#"{"drive":"C"}"#)),
+        ]);
+        assert_eq!(calls.len(), 2, "two distinct call ids must never merge");
+        assert_eq!(calls[0].id, "call_A");
+        assert_eq!(name_of(&calls[0]), "ir_evtx_parse");
+        assert_eq!(args_of(&calls[0]), r#"{"path":"a.evtx"}"#);
+        assert_eq!(name_of(&calls[1]), "ir_usn");
+        assert_eq!(args_of(&calls[1]), r#"{"drive":"C"}"#);
+    }
+
+    #[test]
+    fn explicit_index_still_wins_over_arrival_order() {
+        let calls = collect([
+            frag(Some(1), Some("c2"), Some("second"), Some("{}")),
+            frag(Some(0), Some("c1"), Some("first"), Some("{}")),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(name_of(&calls[0]), "first", "slot 0 is the first call");
+        assert_eq!(name_of(&calls[1]), "second");
+    }
+
+    /// With neither index nor id, a second `name` is the only remaining signal that a
+    /// new call began. This holds because OpenAI delivers `name` whole in a call's
+    /// first fragment; a gateway that splits names AND omits both keys would be
+    /// mis-split here, and is the reason the explicit-index path is checked first.
+    #[test]
+    fn indexless_and_idless_fragments_split_on_a_second_name() {
+        let calls = collect([
+            frag(None, None, Some("file_read"), Some("{}")),
+            frag(None, None, Some("file_list"), Some("{}")),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(name_of(&calls[1]), "file_list");
+    }
+
+    #[test]
+    fn a_split_name_stays_one_call_when_indexed() {
+        let calls = collect([
+            frag(Some(0), Some("c1"), Some("ir_evtx"), None),
+            frag(Some(0), None, Some("_parse"), Some("{}")),
+        ]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(name_of(&calls[0]), "ir_evtx_parse");
+    }
+
+    #[test]
+    fn an_out_of_range_index_is_dropped_not_allocated() {
+        let calls = collect([
+            frag(Some(0), Some("c1"), Some("kept"), Some("{}")),
+            frag(Some(9_999_999), Some("c2"), Some("dropped"), Some("{}")),
+        ]);
+        assert_eq!(calls.len(), 1, "a huge index must not grow the map to 10M entries");
+        assert_eq!(name_of(&calls[0]), "kept");
+    }
+
+    #[test]
+    fn distinct_ids_beyond_the_cap_are_dropped() {
+        let frags: Vec<ToolCallChunk> = (0..300)
+            .map(|i| frag(None, Some(&format!("id_{i}")), Some("tool"), Some("{}")))
+            .collect();
+        let calls = collect(frags);
+        assert_eq!(calls.len(), ToolCallAccumulator::MAX_CALLS);
+    }
+
+    #[test]
+    fn an_endless_argument_stream_is_bounded() {
+        let big = "x".repeat(500_000);
+        let frags: Vec<ToolCallChunk> = (0..5)
+            .map(|_| frag(Some(0), Some("c1"), Some("tool"), Some(&big)))
+            .collect();
+        let calls = collect(frags);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            args_of(&calls[0]).len(),
+            ToolCallAccumulator::MAX_ARGS_BYTES,
+            "2.5MB of streamed arguments must be cut at the cap, not kept whole"
+        );
+    }
+
+    async fn spawn_indexless_tool_call_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+
+            // Deliberately no "index" key anywhere, as some compatible gateways emit.
+            let a_head = "{\"path\":\"";
+            let a_tail = r#"a.evtx"}"#;
+            let b_args = r#"{"drive":"C"}"#;
+            let events = [
+                serde_json::json!({"choices": [{"delta": {"tool_calls": [
+                    {"id": "call_A", "function": {"name": "ir_evtx_parse", "arguments": a_head}}
+                ]}}]}),
+                serde_json::json!({"choices": [{"delta": {"tool_calls": [
+                    {"function": {"arguments": a_tail}}
+                ]}}]}),
+                serde_json::json!({"choices": [{"delta": {"tool_calls": [
+                    {"id": "call_B", "function": {"name": "ir_usn", "arguments": b_args}}
+                ]}, "finish_reason": "tool_calls"}]}),
+            ];
+            let mut body = String::new();
+            for e in events {
+                body.push_str(&format!("data: {e}\n\n"));
+            }
+            body.push_str("data: [DONE]\n\n");
+
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let frame = format!("{:x}\r\n{}\r\n", body.len(), body);
+            let _ = sock.write_all(frame.as_bytes()).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn model_for(api_base: String) -> ModelConfig {
+        ModelConfig { title: "stub".into(), name: "stub-model".into(), api_base,
+            api_key: None, api_key_env: None, context_window: 4096, max_tokens: 64,
+            temperature: 0.0, supports_vision: false }
+    }
+
+    /// The same wire bytes through the real `chat_stream` path, so the fix is proven
+    /// where the agent loop actually consumes it rather than only in the helper.
+    #[tokio::test]
+    async fn chat_stream_separates_indexless_parallel_tool_calls() {
+        let api_base = spawn_indexless_tool_call_server().await;
+        let provider = OpenAiProvider::new_with_shared_timeouts(
+            Arc::new(tokio::sync::RwLock::new(vec![model_for(api_base)])), 10, 5);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentResult<crate::agent::AgentEvent>>(16);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let (_content, _reasoning, tool_calls, _usage, finish_reason, stream_timed_out) = provider
+            .chat_stream("stub-model", &[ChatMessage::user("go")], &[], tx, "inv", "test")
+            .await
+            .expect("a complete stream must return Ok");
+        assert!(!stream_timed_out, "the stub terminated cleanly");
+        assert_eq!(tool_calls.len(), 2, "one turn, two tools, no index on the wire");
+        assert_eq!(name_of(&tool_calls[0]), "ir_evtx_parse");
+        assert_eq!(args_of(&tool_calls[0]), r#"{"path":"a.evtx"}"#);
+        assert_eq!(name_of(&tool_calls[1]), "ir_usn");
+        assert_eq!(args_of(&tool_calls[1]), r#"{"drive":"C"}"#);
+        assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
     }
 }
