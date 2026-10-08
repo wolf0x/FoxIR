@@ -17,7 +17,7 @@ use crate::error::AgentResult;
 pub fn tool_category(name: &str) -> &'static str {
     match name {
         // Read — pure information gathering, no side effects
-        "file_read" | "file_list" | "sys_info" | "sys_eventlog" | "browser_open" | "web_fetch"
+        "file_read" | "file_list" | "file_grep" | "sys_info" | "sys_eventlog" | "browser_open" | "web_fetch"
         | "ir_scan" | "ir_account" | "ir_persistence" | "ir_network" | "ir_eventlog"
         | "ir_file" | "ir_artifacts" | "ir_driver" | "ir_analyzer" | "ir_report"
         | "ir_weblog_scan" | "ir_evtx_parse" | "ir_log_parse" | "ir_pcap_analyze"

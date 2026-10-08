@@ -174,7 +174,8 @@ fn manager_system_prompt(lang: &str, domain: TaskDomain, tool_defs: &[ToolDefini
     prompt.push_str("1. If a Skill matches the subtask domain, instruct the Executor to use it (load it via skill_read_file on demand)\n");
     prompt.push_str("2. Select tools closest to the data source — prefer domain-specific tools over generic shell/browser:\n");
     prompt.push_str("   - EVTX → ir_eventlog, PCAP → ir_pcap_analyze, Memory → ir_memdump\n");
-    prompt.push_str("   - Registry → ir_registry, Prefetch → ir_prefetch, Timeline → ir_timeline\n");
+    prompt.push_str("   - Execution history / Prefetch → ir_artifacts, Registry persistence (autorun) → ir_persistence, Timeline → ir_timeline\n");
+    prompt.push_str("   NOTE: many Windows forensics tools (artifact/deep-hunt/one-shot: ir_pcap_analyze, ir_memdump, ir_timeline, ir_report, ir_scan, ir_case, ir_usn, ir_vss, ir_evtx_parse, ir_log_parse, ir_artifacts, ir_weblog_scan, ir_attackpath, ir_eml, ir_driver, malware_scan, malware_deep) are on-demand by default and may be absent from the tool list. Call load_tool_schema(name) to retrieve the schema, then invoke it normally — they stay executable.\n");
     prompt.push_str("3. Match tool to artifact type; do NOT use shell commands when a specialized tool exists\n\n");
     prompt.push_str("Layer 2 — Execution Dispatch:\n");
     prompt.push_str("- Expert mode is ALWAYS serial: Manager → Executor → Auditor per round\n");

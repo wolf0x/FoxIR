@@ -141,7 +141,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .nav-tab.active::before{content:'';position:absolute;left:0;top:50%;width:3.5px;height:58%;border-radius:2px;background:linear-gradient(180deg,#38bdf8,#3498db);transform:translateY(-50%)}
 .nav-tab.active .ic{color:#38bdf8}
 .ico{width:16px;height:16px;flex:none;vertical-align:-2px;display:inline-block;fill:currentColor}
-/* 两页脚同高、各占一行：左边是状态+两枚切换钮，右边是版本号 */
+/* 两页脚同高、各占一行：左边是状态+版本号，右边是亮暗 + Instant|Expert 模式切换钮 */
 .sidebar-ftr{height:44px;padding:0 16px;border-top:1px solid #34495e;margin-top:auto;font-size:12px;color:#95a5a6;display:flex;align-items:center;gap:8px;flex-wrap:nowrap;overflow:hidden}
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-right:6px;animation:pulse 3s ease-in-out infinite}
 .status-dot.ok{background:var(--green);animation:none}
@@ -172,13 +172,14 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .chat-panels{display:flex;flex:1;overflow:hidden}
 .chat-main{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border);min-width:0;background:#f7f9fa}
 .conv-area{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-.log-panel{width:280px;display:flex;flex-direction:column;background:#f0f3f5;flex-shrink:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
-.log-section{display:flex;flex-direction:column;min-height:0}
+.log-panel{width:280px;display:flex;flex-direction:column;background:#e7ecf1;padding:8px;flex-shrink:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin}
+.log-section{display:flex;flex-direction:column;min-height:0;background:#f7fafc;border:1px solid #d3dce4;border-radius:10px;box-shadow:0 1px 3px rgba(30,55,80,.10);margin-bottom:8px;overflow:hidden}
 .log-section-main{flex:1 1 auto;min-height:0}
-.todo-section{flex:0 0 auto;border-bottom:1px solid var(--border)}
+/* 亮色：右栏 B 卡片浮起（柔白 #f7fafc / 面板 #e7ecf1 / 描边 #d3dce4） */
+.todo-section{flex:0 0 auto;background:#f7fafc;border:1px solid #d3dce4;border-radius:10px;box-shadow:0 1px 3px rgba(30,55,80,.10);margin-bottom:8px;overflow:hidden}
 .todo-list{padding:6px 8px;font-size:11px;flex:0 0 auto}
 .todo-list::-webkit-scrollbar{display:none}
-.todo-item{display:flex;align-items:center;gap:6px;padding:5px 7px;margin-bottom:4px;border-radius:5px;background:rgba(0,0,0,.03);border:1px solid var(--border)}
+.todo-item{display:flex;align-items:center;gap:6px;padding:5px 7px;margin-bottom:4px;border-radius:5px;background:#eef4f9;border:1px solid #dbe5ee}
 .todo-item:hover{background:rgba(0,0,0,.06)}
 .todo-status{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .todo-status.pending{background:var(--t3)}
@@ -189,18 +190,18 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .todo-desc.completed{text-decoration:line-through;opacity:.5}
 .todo-desc.cancelled{text-decoration:line-through;opacity:.4}
 .todo-empty{color:var(--t3);text-align:center;padding:14px 0;font-size:11px}
-.output-section{flex:0 0 auto;border-top:1px solid var(--border)}
+.output-section{flex:0 0 auto}
 /* 右页脚：与左页脚同高 44px；右栏整体可滚，所以它 sticky 在底，并铺上与面板同色的底，
    否则滚动时内容会从它背后透出来 */
-.panel-ftr{flex:0 0 auto;height:44px;border-top:1px solid var(--border);flex-shrink:0;
-  position:sticky;bottom:0;z-index:2;background:#f0f3f5;
+.panel-ftr{flex:0 0 auto;height:44px;border:1px solid #d3dce4;border-radius:10px;box-shadow:0 1px 3px rgba(30,55,80,.10);flex-shrink:0;
+  position:sticky;bottom:0;z-index:2;background:#f7fafc;
   display:flex;align-items:center;justify-content:flex-end;padding:0 14px;
   font-size:11px;color:var(--t3);font-family:var(--mono)}
 .output-hdr{display:flex;align-items:center;justify-content:space-between}
 .btn-open-folder{background:none;border:none;cursor:pointer;font-size:14px;padding:0 2px;opacity:.65;line-height:1}
 .btn-open-folder:hover{opacity:1}
-.output-list{overflow:hidden;padding:6px 8px;font-size:11px;flex:0 0 auto;height:158px}
-.output-item{display:flex;align-items:center;gap:6px;padding:5px 7px;margin-bottom:4px;border-radius:5px;background:rgba(0,0,0,.03);border:1px solid var(--border)}
+.output-list{overflow:hidden;padding:6px 8px;font-size:11px;flex:0 0 auto;min-height:158px}
+.output-item{display:flex;align-items:center;gap:6px;padding:5px 7px;margin-bottom:4px;border-radius:5px;background:#eef4f9;border:1px solid #dbe5ee}
 .output-item:hover{background:rgba(0,0,0,.06)}
 .output-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t2);cursor:pointer}
 .output-name:hover{color:var(--accent);text-decoration:underline}
@@ -208,7 +209,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .output-dl{flex-shrink:0;text-decoration:none;font-size:13px;opacity:.65;padding:0 2px;line-height:1}
 .output-dl:hover{opacity:1}
 .output-empty{color:var(--t3);text-align:center;padding:14px 0;font-size:11px}
-.log-hdr{padding:10px 14px;font-size:11px;font-weight:600;color:var(--t3);background:#e8ecee;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.5px}
+.log-hdr{padding:10px 14px;font-size:11px;font-weight:600;color:#46586a;background:#e9f0f6;border-bottom:1px solid #d8e3ec;text-transform:uppercase;letter-spacing:.5px}
 .log-area{flex:1;min-height:calc(11.6em + 16px);overflow-y:auto;scrollbar-width:none;padding:8px;font-size:11px;color:var(--t2);line-height:1.5}
 .log-area::-webkit-scrollbar{display:none}
 .log-entry{padding:3px 6px;margin-bottom:3px;border-radius:4px;border-left:3px solid var(--border);background:rgba(0,0,0,.02);word-break:break-word}
@@ -407,7 +408,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 .perm-request .perm-resolved-msg.allowed{color:#27ae60;background:#e8f8f0;border-top:1px solid #c8e6d5}
 .perm-request .perm-resolved-msg.denied{color:#e74c3c;background:#fdf0ed;border-top:1px solid #f5c6c0}
 .expert-prior{margin-top:10px;border:1px solid #d6c7e8;border-radius:6px;background:#f7f3fc;overflow:hidden}
-.expert-prior-hdr{padding:6px 10px;font-size:11px;font-weight:700;color:#6c3fa0;background:#efe7fa;border-bottom:1px solid #e0d3f2}
+.expert-prior-hdr{padding:6px 10px;font-size:11px;font-weight:700;color:#fff;background:linear-gradient(90deg,#8e44ad,#9b59b6);border-bottom:1px solid #7d3c9a}
 .expert-prior-pre{margin:0;padding:8px 10px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:#4a3a63;max-height:200px;overflow-y:auto;font-family:inherit}
 
 /* Mode selector bar (Demo B) */
@@ -471,15 +472,23 @@ input:checked+.slider:before{transform:translateX(20px)}
 }
 .grok-attach.has-file .grok-dot{display:block}
 /* 模式按钮 + 下拉 */
-/* 模式切换：只剩一枚闪电，和 ◐ 亮暗钮同规格（22 圆），说明只在 hover 时以 tooltip 出现 */
-#modeBtn{margin-left:6px;width:22px;height:22px;flex:none;padding:0;border-radius:50%;cursor:pointer;
-  display:inline-flex;align-items:center;justify-content:center;
-  border:1px solid #34495e;background:transparent;color:#95a5a6;font-size:11px;line-height:1}
-#modeBtn .grok-bolt{width:11px;height:11px;color:#8fb4d6}
+/* 模式切换：右下角分段钮 = 闪电 + Instant|Expert 两态文字，当前态高亮；整枚点击互切（沿用 #modeBtn + .expert class，JS 不变） */
+#modeBtn{margin-left:6px;height:24px;flex:none;padding:0 2px;border-radius:20px;cursor:pointer;
+  display:inline-flex;align-items:center;
+  border:1px solid #34495e;background:transparent;color:#95a5a6;font-family:system-ui,"Segoe UI",sans-serif;font-size:11px;line-height:1}
+#modeBtn .grok-bolt{width:11px;height:11px;color:#8fb4d6;margin:0 4px 0 6px}
+#modeBtn .mode-opt{padding:0 6px;opacity:.45;font-weight:600}
+#modeBtn .mode-sep{opacity:.3}
+#modeBtn .mode-instant{color:#3498db}
+#modeBtn .mode-expert{color:#8e44ad}
+#modeBtn:not(.expert) .mode-instant{opacity:1}
+#modeBtn.expert .mode-expert{opacity:1}
 #modeBtn.expert .grok-bolt{color:#b39ddb}
-#modeBtn:hover{border-color:var(--accent);color:#e8eef4}
+#modeBtn:hover{border-color:var(--accent)}
 :root[data-theme="dark"] #modeBtn{border-color:#2a3442;color:#8b97a8}
 :root[data-theme="dark"] #modeBtn .grok-bolt{color:#7a5312}
+:root[data-theme="dark"] #modeBtn .mode-instant{color:#38bdf8}
+:root[data-theme="dark"] #modeBtn .mode-expert{color:#c4b5fd}
 :root[data-theme="dark"] #modeBtn.expert .grok-bolt{color:#c4b5fd}
 /* 发送 / 停止（狼头 LOGO 呼吸 ↔ 红色停止脉冲） */
 .grok-send{
@@ -1047,11 +1056,14 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] .chat-main{background:#0a0d12;border-right-color:#1f2733}
 :root[data-theme="dark"] .topbar{background:#0f131a;border-bottom-color:#1f2733;color:#8b97a8}
 :root[data-theme="dark"] .mode-bar{background:#0f131a;border-top-color:#1f2733}
-:root[data-theme="dark"] .log-panel{background:#0f131a}
-:root[data-theme="dark"] .panel-ftr{background:#0f131a;border-top-color:#1f2733;color:#5d6878}
-:root[data-theme="dark"] .log-hdr{background:#141922;color:#5d6878;border-bottom-color:#1f2733}
-:root[data-theme="dark"] .todo-item,:root[data-theme="dark"] .output-item{background:#141922;border-color:#1f2733}
-:root[data-theme="dark"] .todo-item:hover,:root[data-theme="dark"] .output-item:hover{background:#1a212c}
+:root[data-theme="dark"] .log-panel{background:#0b0e13}
+:root[data-theme="dark"] .panel-ftr{background:#141922;border-color:#242f3d;box-shadow:0 1px 3px rgba(0,0,0,.4);color:#5d6878}
+:root[data-theme="dark"] .log-hdr{background:#10161e;color:#7f8b9c;border-bottom-color:#232f3d}
+/* 暗色卡片化：区块与页脚统一为深卡片 */
+:root[data-theme="dark"] .log-section,
+:root[data-theme="dark"] .todo-section{background:#141922;border-color:#242f3d;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+:root[data-theme="dark"] .todo-item,:root[data-theme="dark"] .output-item{background:#1a212c;border-color:#2b3648}
+:root[data-theme="dark"] .todo-item:hover,:root[data-theme="dark"] .output-item:hover{background:#232c39}
 :root[data-theme="dark"] .todo-desc,:root[data-theme="dark"] .output-name{color:#8b97a8}
 :root[data-theme="dark"] .todo-desc.completed,:root[data-theme="dark"] .output-name:hover{color:#5d6878}
 :root[data-theme="dark"] .log-entry{background:#11151c}
@@ -1102,7 +1114,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] .perm-request .perm-req-body pre{background:#0a0c0e;color:#e6e9ec}
 :root[data-theme="dark"] .perm-request .perm-req-actions{border-top-color:#1f2733}
 :root[data-theme="dark"] .expert-prior{background:#11151c;border-color:#2a3442}
-:root[data-theme="dark"] .expert-prior-hdr{color:#c4b5fd}
+:root[data-theme="dark"] .expert-prior-hdr{color:#ede9fe;background:linear-gradient(90deg,#3b2a5e,#4a3873);border-bottom-color:#4a3873}
 :root[data-theme="dark"] .expert-prior-pre{color:#8b97a8}
 :root[data-theme="dark"] .perm-item{background:#0f131a;border-color:#1f2733}
 :root[data-theme="dark"] .perm-item:hover{border-color:#2a3442}
@@ -1153,11 +1165,19 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] ::-webkit-scrollbar-thumb{background:#232c39;border-radius:6px}
 :root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{background:#303c4d}
 :root[data-theme="dark"] ::-webkit-scrollbar-corner{background:transparent}
-/* the toggle, parked between status and version */
-#themeToggle{margin-left:6px;width:22px;height:22px;flex:none;border-radius:50%;cursor:pointer;
-  border:1px solid #34495e;background:transparent;color:#95a5a6;font-size:11px;line-height:1;padding:0}
-:root[data-theme="dark"] #themeToggle{border-color:#2a3442;color:#f5a623}
-#themeToggle:hover{border-color:var(--accent);color:var(--accent)}
+/* the theme toggle — 右下角分段钮 = ◐ + Light|Dark 两态文字，当前态高亮（靠 :root[data-theme] 驱动，JS 不变） */
+#themeToggle{margin-left:6px;height:24px;flex:none;padding:0 2px;border-radius:20px;cursor:pointer;
+  display:inline-flex;align-items:center;
+  border:1px solid #34495e;background:transparent;color:#95a5a6;font-family:system-ui,"Segoe UI",sans-serif;font-size:11px;line-height:1}
+#themeToggle .tt-ico{margin:0 4px 0 6px;font-size:12px}
+#themeToggle .tt-opt{padding:0 6px;font-weight:600}
+#themeToggle .tt-sep{opacity:.3}
+#themeToggle .tt-light{color:#e8a33d;opacity:1}
+#themeToggle .tt-dark{color:#38bdf8;opacity:.45}
+:root[data-theme="dark"] #themeToggle .tt-light{opacity:.45}
+:root[data-theme="dark"] #themeToggle .tt-dark{opacity:1}
+:root[data-theme="dark"] #themeToggle{border-color:#2a3442;color:#8b97a8}
+#themeToggle:hover{border-color:var(--accent)}
 
 /* ─── stage 2: the non-chat pages (Settings / Dashboard / Tools / CRON / MCP / Knowledge) ─── */
 :root[data-theme="dark"] input,:root[data-theme="dark"] select,:root[data-theme="dark"] textarea{
@@ -1314,10 +1334,7 @@ input:checked+.slider:before{transform:translateX(20px)}
     <div class="sidebar-ftr">
       <span class="status-dot" id="statusDot"></span>
       <span id="statusText">Disconnected</span>
-      <button id="themeToggle" type="button" title="切换亮暗" aria-label="切换亮暗">◐</button>
-      <button id="modeBtn" type="button" aria-pressed="false" title="Instant — 单轮直答 · 点击切到 Expert">
-        <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      </button>
+      <span id="sidebarVersion" style="margin-left:auto;font-family:var(--mono);font-size:11px;opacity:.8">v-</span>
     </div>
   </div>
 
@@ -1892,7 +1909,12 @@ input:checked+.slider:before{transform:translateX(20px)}
             </div>
             <div class="output-list" id="outputList"></div>
           </div>
-          <div class="panel-ftr"><span id="sidebarVersion">v-</span></div>
+          <div class="panel-ftr">
+                    <button id="themeToggle" type="button" title="切换亮暗" aria-label="切换亮暗"><span class="tt-ico">◐</span><span class="tt-opt tt-light">Light</span><span class="tt-sep">|</span><span class="tt-opt tt-dark">Dark</span></button>
+                    <button id="modeBtn" type="button" aria-pressed="false" title="Instant — 单轮直答 · 点击切到 Expert">
+                      <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span class="mode-opt mode-instant">Instant</span><span class="mode-sep">|</span><span class="mode-opt mode-expert">Expert</span>
+                    </button>
+                  </div>
         </div>
       </div>
     </div>
@@ -4060,6 +4082,15 @@ function sanitizeHtml(html){
   html=String(html==null?"":html);
   try{return (window.DOMPurify&&DOMPurify.sanitize)?DOMPurify.sanitize(html):html}catch(e){return html}
 }
+function normalizeMediaUrls(html){
+  if(!html||typeof html!=='string')return html;
+  try{
+    // Rewrite any absolute http(s)://host[:port]/workspace/... or /output/... used in an
+    // img src / a href back to a same-origin relative path. Guards against the model (or
+    // a tool) hardcoding host:port, which breaks the image/link when served off localhost.
+    return html.replace(/(src|href)(\s*=\s*)(["'])https?:\/\/[^"'\s>]*?\/((?:workspace|output)\/[^"']*)\3/gi,'$1$2$3/$4$3');
+  }catch(e){return html;}
+}
 function renderMd(text){
   if(!text)return'';
   var NL=String.fromCharCode(10);
@@ -4069,9 +4100,9 @@ function renderMd(text){
     // 方案A: 转义孤立 `~`，避免 Hive 案例里用 `~` 做字段分隔时被误判成删除线；
     // 成对的 `~~...~~`（真正的 Markdown 删除线）仍保留。
     var escT=text.replace(/(^|[^~])~(?!~)/g,'$1\\~');
-    return sanitizeHtml(marked.parse(escT))
+    return normalizeMediaUrls(sanitizeHtml(marked.parse(escT)))
   }catch(e){}}
-  return sanitizeHtml(renderMdFallback(text));
+  return normalizeMediaUrls(sanitizeHtml(renderMdFallback(text)));
 }
 function renderMdFallback(text){
   text=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n');

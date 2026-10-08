@@ -43,6 +43,8 @@ pub struct OrchestratorEnv {
     /// Linux IR tool-set switch, inherited from the parent run so a worker sees
     /// exactly the same tool family availability as the agent that spawned it.
     pub linux_ir_tools: Arc<std::sync::atomic::AtomicBool>,
+    /// Windows IR full-load switch, inherited identically.
+    pub win_ir_full_load: Arc<std::sync::atomic::AtomicBool>,
     /// Web Browser capability switch, inherited like every other tool gate:
     /// a worker must not advertise browser_cdp when the parent disabled it.
     pub browser_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -567,6 +569,7 @@ impl Orchestrator {
             .two_tier_memory(self.env.two_tier_memory)
             .sop_replay(self.env.sop_replay.clone())
             .linux_ir_tools(self.env.linux_ir_tools.clone())
+            .win_ir_full_load(self.env.win_ir_full_load.clone())
             .browser_enabled(self.env.browser_enabled.clone())
             .mode(AgentMode::Expert)
             .depth(ctx_depth + 1)

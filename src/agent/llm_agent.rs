@@ -183,6 +183,32 @@ pub(crate) fn apply_linux_ir_gate(
     (kept, catalog, n)
 }
 
+/// Settings gate for the Windows IR/forensics family (the 17 cold tools in
+/// [`crate::tool::ir_win::WIN_IR_COLD_TOOLS`]).
+///
+/// Mirrors [`apply_linux_ir_gate`]: when the `win_ir_tools` switch is off (default)
+/// the cold schemas leave the per-request payload and gain a one-line catalog entry
+/// (still executable, pulled back via `load_tool_schema`). The 7 hot core-triage
+/// tools are never in the cold set, so they stay resident with zero round-trip
+/// latency. Returns (delivered defs, catalog, demoted).
+pub(crate) fn apply_win_ir_gate(
+    defs: Vec<crate::model::ToolDefinition>,
+    mut catalog: Vec<(String, String)>,
+    full_load: bool,
+) -> (Vec<crate::model::ToolDefinition>, Vec<(String, String)>, usize) {
+    if full_load {
+        return (defs, catalog, 0);
+    }
+    let (kept, demoted): (Vec<_>, Vec<_>) = defs
+        .into_iter()
+        .partition(|d| !crate::tool::ir_win::is_win_ir_cold(&d.function.name));
+    let n = demoted.len();
+    for d in &demoted {
+        catalog.push((d.function.name.clone(), catalog_summary(&d.function.description)));
+    }
+    (kept, catalog, n)
+}
+
 /// System-prompt tier (nested prefixes: Minimal is a strict byte-prefix of
 /// Full). Selected per user message; Minimal serves pure greetings with the
 /// persona head only, skipping the full tool/rulebook sections (~80% smaller
@@ -542,6 +568,10 @@ pub struct LlmAgent {
     /// of the per-request tool payload and exposed through the on-demand schema
     /// catalog instead. Hot-reloadable; shared with AppState.
     linux_ir_tools: Arc<std::sync::atomic::AtomicBool>,
+    /// Settings switch: when false (default) the Windows IR cold tools are kept out
+    /// of the per-request tool payload and exposed through the on-demand schema
+    /// catalog. Hot-reloadable; shared with AppState.
+    win_ir_full_load: Arc<std::sync::atomic::AtomicBool>,
     /// Web Browser 能力开关（Tools 页）。false 时 browser_cdp 已从注册表注销，
     /// 系统提示里那段浏览器说明也必须消失。
     browser_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -575,6 +605,7 @@ pub struct LlmAgentBuilder {
     skill_used_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     sop_replay: Arc<std::sync::atomic::AtomicBool>,
     linux_ir_tools: Arc<std::sync::atomic::AtomicBool>,
+    win_ir_full_load: Arc<std::sync::atomic::AtomicBool>,
     browser_enabled: Arc<std::sync::atomic::AtomicBool>,
     cleanup_sessions: Vec<Arc<crate::tool::browser_cdp::BrowserSession>>,
     memory_store: Option<Arc<crate::memory::MemoryStore>>,
@@ -604,6 +635,7 @@ impl LlmAgentBuilder {
             skill_used_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             sop_replay: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             linux_ir_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            win_ir_full_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             browser_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cleanup_sessions: Vec::new(),
             memory_store: None,
@@ -643,6 +675,8 @@ impl LlmAgentBuilder {
     pub fn sop_replay(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.sop_replay = v; self }
     /// Set the Linux IR tool-set switch (shared with AppState for hot reload).
     pub fn linux_ir_tools(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.linux_ir_tools = v; self }
+    /// Set the Windows IR full-load switch (shared with AppState for hot reload).
+    pub fn win_ir_full_load(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.win_ir_full_load = v; self }
     /// Set the Web Browser capability switch (shared with AppState for hot reload).
     pub fn browser_enabled(mut self, v: Arc<std::sync::atomic::AtomicBool>) -> Self { self.browser_enabled = v; self }
     pub fn cleanup_session(mut self, session: Arc<crate::tool::browser_cdp::BrowserSession>) -> Self {
@@ -682,6 +716,7 @@ impl LlmAgentBuilder {
             skill_used_sessions: self.skill_used_sessions,
             sop_replay: self.sop_replay,
             linux_ir_tools: self.linux_ir_tools,
+            win_ir_full_load: self.win_ir_full_load,
             browser_enabled: self.browser_enabled,
             cleanup_sessions: self.cleanup_sessions,
             memory_store: self.memory_store,
@@ -949,8 +984,7 @@ when speaking to them directly. Never use generic terms like \"user\", \"hey\", 
         prompt.push_str(
             "\n## Greetings Stay Shallow\n\
 Even if the context or memory mentions pending tasks, TODO lists, or past cases, NEVER bring \
-them up in a greeting reply — task status lives on the user's TASKS panel, not in your mouth.\n\
-
+them up in a greeting reply — task status lives on the user's TASKS panel, not in your mouth.\n\n\
 - **Greetings stay shallow.** For a basic \"hello\" / greeting, reply with exactly ONE short, warm line that \
   welcomes them and asks what they need. Do NOT enumerate, summarize, or name any past tasks, cases, projects, or \
   topics — never lead with anything like \"最近的事都记着…\" and never list case names. Do NOT claim anything \
@@ -1000,6 +1034,8 @@ Layer 1 — Capability Selection (WHAT to use):\n\
    - Email investigation → M365/Email skill, NOT browser→Outlook\n\
    - Remote logs → WinRM/SSH tool, NOT RDP\n\
    - EVTX files → ir_eventlog, PCAP → ir_pcap_analyze, Memory → ir_memdump\n\
+   - Execution history / what programs ran / recently opened files → ir_artifacts (on-demand: call load_tool_schema first, then mode=prefetch/amcache/shimcache)\n\
+   NOTE: several Windows forensics tools are on-demand by default and may NOT appear in the current tool list (ir_pcap_analyze, ir_memdump, ir_timeline, ir_report, ir_scan, ir_case, ir_usn, ir_vss, ir_evtx_parse, ir_log_parse, ir_artifacts, ir_weblog_scan, ir_attackpath, ir_eml, ir_driver, malware_scan, malware_deep). If the tool you need is missing, call `load_tool_schema(name)` first to get its full schema, then invoke it normally — they stay executable.\n\
 3. CRITICAL: Skill trigger ≠ decomposition trigger. A single-document Skill task (e.g., \"modify this PPT\") stays on the main Agent Loop — do NOT fan out.\n\
 \n\
 Layer 2 — Execution Dispatch (HOW to run):\n\
@@ -1709,6 +1745,10 @@ impl Agent for LlmAgent {
             // pays off against a Linux target; off ⇒ on-demand only.
             let linux_ir_full = self.linux_ir_tools.load(std::sync::atomic::Ordering::SeqCst);
             let (defs, periph, demoted) = apply_linux_ir_gate(defs, periph, linux_ir_full);
+            // Settings gate: Windows IR cold tools (large / task-specific / one-shot)
+            // leave the payload when off (default) — demoted to on-demand catalog.
+            let win_ir_full = self.win_ir_full_load.load(std::sync::atomic::Ordering::SeqCst);
+            let (defs, periph, win_demoted) = apply_win_ir_gate(defs, periph, win_ir_full);
             let ls = if periph.is_empty() {
                 None
             } else {
@@ -1736,8 +1776,8 @@ impl Agent for LlmAgent {
                 })
             };
             info!(
-                "[session:{}] Core tool set: {} tool(s), +{} on demand (linux_ir_full={} demoted={})",
-                session_id, defs.len(), periph.len(), linux_ir_full, demoted
+                "[session:{}] Core tool set: {} tool(s), +{} on demand (linux_ir_full={} demoted={} win_ir_full={} win_demoted={})",
+                session_id, defs.len(), periph.len(), linux_ir_full, demoted, win_ir_full, win_demoted
             );
             (defs, ls)
         };
@@ -1822,6 +1862,7 @@ impl Agent for LlmAgent {
                 two_tier_memory: self.two_tier_memory,
                 sop_replay: self.sop_replay.clone(),
                 linux_ir_tools: self.linux_ir_tools.clone(),
+                win_ir_full_load: self.win_ir_full_load.clone(),
                 browser_enabled: self.browser_enabled.clone(),
                 parent_model: ctx.model_name.clone(),
                 permissions: ctx.permissions.clone(),
@@ -4691,6 +4732,110 @@ mod tests {
         );
         assert!(cost > 1_000, "expected a material block, measured {}", cost);
         assert!(catalog_cost * 4 < cost, "catalog form must be far smaller ({} vs {})", catalog_cost, cost);
+    }
+
+    // ── Windows 取证族热/冷分层载入开关 ──────────────────────────────────
+
+    /// 开关 OFF：17 个冷工具离开每轮请求，转为目录一行（仍注册、仍可执行）；
+    /// 7 个 hot 核心 triage 工具与普通工具原样常驻；核心集体积必须真的下降。
+    #[test]
+    fn win_ir_gate_off_demotes_cold_and_shrinks_payload() {
+        let cold = crate::tool::ir_win::WIN_IR_COLD_TOOLS;
+        let hot = crate::tool::ir_win::WIN_IR_HOT_TOOLS;
+        let body = "Detect suspicious entries and cross-check them against known patterns. More guidance follows. ".repeat(8);
+        let mut defs: Vec<_> = cold
+            .iter()
+            .chain(hot.iter())
+            .map(|n| fake_def(n, &body))
+            .collect();
+        defs.push(fake_def("file_read", "Read a file."));
+        let before = tool_defs_tokens(&defs);
+
+        let (kept, catalog, demoted) = apply_win_ir_gate(defs, Vec::new(), false);
+
+        assert_eq!(demoted, cold.len(), "every cold tool must be demoted");
+        assert!(kept.iter().all(|d| !crate::tool::ir_win::is_win_ir_cold(&d.function.name)));
+        // 7 hot + file_read 留下
+        assert_eq!(kept.len(), hot.len() + 1, "only hot tools + non-family stay on the wire");
+        for h in hot {
+            assert!(kept.iter().any(|d| d.function.name == *h), "hot tool {h} must stay resident");
+        }
+        assert!(kept.iter().any(|d| d.function.name == "file_read"));
+        assert_eq!(catalog.len(), cold.len(), "each demoted tool gains a catalog entry");
+        for (n, sum) in &catalog {
+            assert!(cold.iter().any(|x| x == n), "catalog must only list cold tools");
+            assert!(sum.chars().count() <= 161, "catalog entry must stay one short line: {}", sum);
+            assert!(!sum.contains("More guidance"), "only the first sentence is cataloged");
+        }
+        let after = tool_defs_tokens(&kept);
+        assert!(after < before, "off must shrink the per-request tool payload ({} -> {})", before, after);
+        assert!(before - after > before / 4, "the cold set is a material share of the payload");
+    }
+
+    /// 开关 ON（Expert 全量载入）：冷集原样交付，不写目录。
+    #[test]
+    fn win_ir_gate_on_is_pass_through() {
+        let defs = vec![fake_def("ir_memdump", "Dump memory."), fake_def("ir_process", "List processes.")];
+        let (kept, catalog, demoted) = apply_win_ir_gate(defs, Vec::new(), true);
+        assert_eq!(demoted, 0);
+        assert!(catalog.is_empty());
+        assert_eq!(kept.len(), 2, "full load keeps every schema");
+    }
+
+    /// 单一事实源校验：冷/热名单无重叠，且每个冷名都确实在 build_default 注册（
+    /// 防新增工具漏网或名字拼写错），并断言 hot 集永不被门控。
+    #[test]
+    fn win_ir_cold_names_are_registered_and_disjoint_from_hot() {
+        let cold = crate::tool::ir_win::WIN_IR_COLD_TOOLS;
+        let hot = crate::tool::ir_win::WIN_IR_HOT_TOOLS;
+        assert_eq!(cold.len(), 17, "cold set must have 17 members");
+        assert_eq!(hot.len(), 7, "hot set must have 7 members");
+        // 无重叠
+        for h in hot {
+            assert!(!crate::tool::ir_win::is_win_ir_cold(h), "hot tool {h} must never be in the cold set");
+        }
+        // 冷集内部去重
+        let uniq: std::collections::HashSet<&&str> = cold.iter().collect();
+        assert_eq!(uniq.len(), cold.len(), "no duplicates in the cold list");
+        // 均已注册
+        let reg = crate::tool::ToolRegistry::build_default("", None);
+        for n in cold.iter().chain(hot.iter()) {
+            assert!(reg.get_definition(n).is_some(), "tool `{n}` in the tiering list is not registered in build_default");
+        }
+    }
+
+    /// hot 核心工具永不进门控（即使开关 OFF 也常驻）——核心 triage 零往返的契约。
+    #[test]
+    fn hot_core_tools_never_gated() {
+        let hot = crate::tool::ir_win::WIN_IR_HOT_TOOLS;
+        assert!(hot.contains(&"ir_analyzer"), "analysis hub must stay hot");
+        assert!(hot.contains(&"ir_eventlog"), "live event-log query must stay hot");
+        for n in hot {
+            assert!(!crate::tool::ir_win::is_win_ir_cold(n), "hot tool {n} escaped into the cold set");
+        }
+    }
+
+    /// 真实测量（非夹具）：默认关时离开每轮请求的到底是多少 tokens（兼作 ROI 回归）。
+    #[test]
+    fn win_ir_cold_real_schema_cost_is_material() {
+        let reg = crate::tool::ToolRegistry::build_default("", None);
+        let cold_defs: Vec<_> = crate::tool::ir_win::WIN_IR_COLD_TOOLS
+            .iter()
+            .filter_map(|n| reg.get_definition(n))
+            .collect();
+        assert_eq!(cold_defs.len(), crate::tool::ir_win::WIN_IR_COLD_TOOLS.len());
+        let full = tool_defs_tokens(&cold_defs);
+        let catalog_cost: usize = cold_defs
+            .iter()
+            .map(|d| estimate_tokens(&d.function.name) + estimate_tokens(&catalog_summary(&d.function.description)))
+            .sum();
+        println!(
+            "MEASURED win_ir cold set: {} members, full schemas = {} tokens, catalog form = {} tokens, saved = {} tokens ({:.0}% off)",
+            cold_defs.len(), full, catalog_cost, full - catalog_cost,
+            (full - catalog_cost) as f64 * 100.0 / full as f64
+        );
+        assert!(full > 1_000, "expected a material block, measured {}", full);
+        assert!(catalog_cost * 4 < full, "catalog form must be far smaller ({} vs {})", catalog_cost, full);
     }
 
     /// 小窗口下可证伪的端列不变式：硬门不误杀「有点紧」，而一旦裁 history，

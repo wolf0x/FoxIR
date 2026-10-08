@@ -22,12 +22,21 @@ impl Tool for IrArtifactsTool {
         "ir_artifacts"
     }
     fn description(&self) -> &str {
-        "Deep Windows artifact parser for execution evidence: Prefetch (run count, \
-         timestamps, loaded modules), Amcache (SHA1 + path), ShimCache (AppCompatCache), \
-         LNK files (target/args), UserAssist (ROT13-decoded execution counts), \
-         browser history (Chrome/Edge/Firefox). \
-         Use this for execution timeline evidence — NOT ir_file. \
-         Requires admin for system artifacts (Prefetch, Amcache, ShimCache)."
+        "Windows execution-history forensics (Prefetch/Amcache/ShimCache/LNK/UserAssist): \
+         which programs ran, run count, last-run times, recently opened files. \
+         Prefetch (.pf): extracts program execution history — run count, last-run timestamps and loaded modules, \
+         providing timeline evidence for digital forensics and behavior analysis. \
+         Amcache: program-manifest artifact recording executable paths, SHA1 hashes and timestamps of programs seen \
+         or run on the system, used for program provenance and execution-history analysis. \
+         ShimCache: application-compatibility cache in the SYSTEM registry, recording executable paths and \
+         last-modified times, helping judge whether a program was ever executed. \
+         LNK: Windows shortcut files recording target path, volume serial and created/modified/accessed times, used \
+         to reconstruct recently opened or accessed programs and files. \
+         UserAssist: artifact in NTUSER.DAT (ROT13-encoded) recording programs the user launched via Explorer, with \
+         run count and last-execution time — key evidence of deliberate user execution. \
+         Browser history: access records in the Chrome/Edge/Firefox SQLite database (URL, title, visit time and \
+         count), used to rebuild the user's browsing timeline. \
+         Use this for execution/timeline evidence — NOT ir_file. Requires admin for Prefetch, Amcache and ShimCache."
     }
     fn is_builtin(&self) -> bool {
         true

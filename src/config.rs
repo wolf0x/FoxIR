@@ -67,6 +67,13 @@ pub struct AgentConfig {
     /// `linux_ssh` 不受本开关影响，始终载入。
     #[serde(default = "default_linux_ir_tools")]
     pub linux_ir_tools: bool,
+    /// Windows 取证族中“体积大 / 任务专用 / 一次性终端”冷工具（见
+    /// `tool::ir_win::WIN_IR_COLD_TOOLS`，17 个）是否每轮全量载入。
+    /// 默认关：关闭时它们降为按需载入（仍注册、仍可执行，模型用
+    /// load_tool_schema 取回完整模式后调用）；7 个核心 triage 工具不受
+    /// 影响始终常驻。Expert 完整猎杀可一键“全量载入”把冷集拉回常驻。
+    #[serde(default = "default_win_ir_full_load")]
+    pub win_ir_full_load: bool,
     /// browser_cdp 是否无头运行。默认 true（不弹窗口）。
     /// 改为 false 后浏览器会显示出来，用于在一次需要密码/2FA/扫码的登录
     /// 上完成后长期复用（登录态存在 workspace 的持久 profile 目录里）。
@@ -509,6 +516,7 @@ impl Default for Config {
                 two_tier_memory: default_two_tier_memory(),
                 budget_dashboard: default_budget_dashboard(),
                 linux_ir_tools: default_linux_ir_tools(),
+                win_ir_full_load: default_win_ir_full_load(),
                 browser_headless: default_browser_headless(),
                 browser_executable: default_browser_executable(),
                 browser_enabled: default_browser_enabled(),
@@ -569,6 +577,8 @@ fn default_budget_dashboard() -> bool { true }
 // Linux target. Keeping it out of the request prefix also protects the provider's
 // prompt cache (the schema block sits before the conversation).
 fn default_linux_ir_tools() -> bool { false }
+// Windows IR 冷工具默认不常驻（降为按需）；Expert 完整猎杀可在 Tools 页一键拉回。
+fn default_win_ir_full_load() -> bool { false }
 // 缺省开：Web Browser 是默认可用的能力，用户不想要时在 Tools 页关掉（真注销）。
 fn default_browser_enabled() -> bool { true }
 fn default_true() -> bool { true }
@@ -972,6 +982,7 @@ orchestration = "off"
             "computer_use" => config.agent.computer_use = enabled,
             "human_intervention" => config.agent.human_intervention = enabled,
             "linux_ir_tools" => config.agent.linux_ir_tools = enabled,
+            "win_ir_tools" => config.agent.win_ir_full_load = enabled,
             other => return Err(format!("unknown tool switch: {}", other).into()),
         }
         config.save(workspace_dir)
@@ -1034,6 +1045,7 @@ orchestration = "off"
         two_tier_memory: bool,
         budget_dashboard: bool,
         linux_ir_tools: bool,
+        win_ir_full_load: bool,
         enable_context_scaling: bool,
         max_inline_chars: usize,
         skill_listing_strategy: String,
@@ -1055,6 +1067,7 @@ orchestration = "off"
         config.agent.two_tier_memory = two_tier_memory;
         config.agent.budget_dashboard = budget_dashboard;
         config.agent.linux_ir_tools = linux_ir_tools;
+        config.agent.win_ir_full_load = win_ir_full_load;
         config.agent.enable_context_scaling = enable_context_scaling;
         config.agent.max_inline_chars = max_inline_chars;
         config.agent.skill_listing_strategy = skill_listing_strategy;
@@ -1265,7 +1278,7 @@ mod tests {
     #[test]
     fn builtin_tool_switch_persists() {
         let ws = tmp_ws("toolswitch");
-        for (key, want) in [("browser_cdp", false), ("computer_use", true), ("human_intervention", true), ("linux_ir_tools", true)] {
+        for (key, want) in [("browser_cdp", false), ("computer_use", true), ("human_intervention", true), ("linux_ir_tools", true), ("win_ir_tools", true)] {
             Config::set_builtin_tool_switch(&ws, key, want).unwrap();
         }
         let back = Config::load(&ws).unwrap();
@@ -1273,6 +1286,7 @@ mod tests {
         assert!(back.agent.computer_use);
         assert!(back.agent.human_intervention);
         assert!(back.agent.linux_ir_tools);
+        assert!(back.agent.win_ir_full_load);
         let _ = std::fs::remove_dir_all(&ws);
     }
 

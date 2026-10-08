@@ -7,6 +7,19 @@ use super::Tool;
 use crate::context::ToolContext;
 use crate::error::AgentResult;
 
+/// Actual HTTP server port, recorded once at startup (see main.rs) so `browser_open`
+/// can build a reachable absolute URL instead of assuming the default 7788. When unset
+/// (e.g. headless / tool-only runs) it falls back to 7788, the config default.
+static HTTP_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+pub fn set_http_port(port: u16) {
+    let _ = HTTP_PORT.set(port);
+}
+
+fn http_base() -> String {
+    format!("http://localhost:{}", HTTP_PORT.get().copied().unwrap_or(7788))
+}
+
 /// If `path` is an absolute path located under `workspace_dir`, returns its
 /// workspace-relative forward-slash path (e.g. E:/ws/output/a.html -> "output/a.html").
 /// Returns None otherwise (not absolute, outside workspace, or empty workspace_dir).
@@ -68,7 +81,7 @@ impl Tool for BrowserOpenTool {
         } else if let Some(rel) = absolute_path_under_workspace(&url, &ctx.workspace_dir) {
             // Absolute path inside workspace_dir -> served URL so relative assets
             // (CSS, other files) resolve the same way as file_write's output path.
-            url = format!("http://localhost:7788/workspace/{}", rel);
+            url = format!("{}/workspace/{}", http_base(), rel);
         } else if url.chars().nth(1) == Some(':') && url.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
             // Windows absolute path outside the workspace (e.g., C:\path\to\file)
             let path_normalized = url.replace("\\", "/");
@@ -80,7 +93,7 @@ impl Tool for BrowserOpenTool {
             } else {
                 url
             };
-            url = format!("http://localhost:7788/{}", workspace_path);
+            url = format!("{}/{}", http_base(), workspace_path);
         } else {
             // Assume it's a domain or URL without scheme
             url = format!("https://{}", url);

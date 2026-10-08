@@ -522,6 +522,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Linux 取证工具族全量载入开关（Settings，默认关 = 降为按需载入）。
     // 与 agent / AppState 共享同一原子，切换无需重启。
     let linux_ir_tools = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.linux_ir_tools));
+    // Windows 取证族冷工具全量载入开关（Settings，默认关 = 降为按需载入）。
+    let win_ir_full_load = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.win_ir_full_load));
     let debrief_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.debrief_enabled));
 
     // SDD v1.5 H2: main agent is always Instant; Expert mode is handled by
@@ -544,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skill_used_sessions(skill_used_sessions.clone())
         .sop_replay(sop_replay.clone())
         .linux_ir_tools(linux_ir_tools.clone())
+        .win_ir_full_load(win_ir_full_load.clone())
         .browser_enabled(browser_enabled.clone())
         .cleanup_session(browser_session.clone())
         .memory_store(memory_store.clone())
@@ -739,6 +742,7 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
         two_tier_memory: two_tier_memory.clone(),
         budget_dashboard: budget_dashboard.clone(),
         linux_ir_tools: linux_ir_tools.clone(),
+        win_ir_full_load: win_ir_full_load.clone(),
         browser_headless: browser_headless.clone(),
         browser_executable: browser_executable.clone(),
         browser_enabled: browser_enabled.clone(),
@@ -779,6 +783,8 @@ expert_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // Create router and start server
+    // Record the real port so browser_open builds a reachable URL (not the 7788 default).
+    crate::tool::browser_open::set_http_port(config.server.port);
     let app = server::create_router(state);
     let addr = format!("{}:{}", config.server.host, config.server.port);
 

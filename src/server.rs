@@ -211,6 +211,8 @@ pub struct AppState {
     pub budget_dashboard: Arc<AtomicBool>,
     /// Linux 取证工具族全量载入开关（默认关 = 降为按需载入）。与 agent 共享同一原子。
     pub linux_ir_tools: Arc<AtomicBool>,
+    /// Windows 取证族冷工具全量载入开关（默认关 = 降为按需）。与 agent 共享。
+    pub win_ir_full_load: Arc<AtomicBool>,
     /// browser_cdp 无头开关（默认开）。关掉后浏览器可见，用于完成一次登录。
     /// 与 BrowserSession 共享同一原子，切换不需重启。
     pub browser_headless: Arc<AtomicBool>,
@@ -955,6 +957,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "sop_replay": state.sop_replay.load(Ordering::SeqCst),
         "budget_dashboard": state.budget_dashboard.load(Ordering::SeqCst),
         "linux_ir_tools": state.linux_ir_tools.load(Ordering::SeqCst),
+        "win_ir_tools": state.win_ir_full_load.load(Ordering::SeqCst),
         "browser_headless": state.browser_headless.load(Ordering::SeqCst),
         "browser_executable": state.browser_executable.read().map(|g| g.clone()).unwrap_or_default(),
         "browser_enabled": state.browser_enabled.load(Ordering::SeqCst),
@@ -3513,6 +3516,15 @@ async fn tools_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
             "detail": "linux_ssh always stays loaded",
         }),
         json!({
+            "key": "win_ir_tools",
+            "name": "Windows Forensics Tools",
+            "description": "Windows IR cold set (artifact / deep-hunt / one-shot terminal tools). Off here does NOT mean unavailable: they move to the on-demand schema catalog and stay callable via load_tool_schema, which saves fixed context. The 7 core triage tools always stay resident.",
+            "enabled": state.win_ir_full_load.load(Ordering::SeqCst),
+            "on_label": "Full load (every request)",
+            "off_label": "On-demand (still callable)",
+            "detail": "7 core tools always loaded; 17 cold tools on demand",
+        }),
+        json!({
             "key": "human_intervention",
             "name": "Simulated Human Intervention",
             "description": "Expert mode: when blocked, let the LLM play the human responder instead of stalling.",
@@ -3543,6 +3555,7 @@ async fn builtin_tool_toggle_handler(
         "browser_cdp" => !state.browser_enabled.load(Ordering::SeqCst),
         "computer_use" => !state.computer_use_enabled.load(Ordering::SeqCst),
         "linux_ir_tools" => !state.linux_ir_tools.load(Ordering::SeqCst),
+        "win_ir_tools" => !state.win_ir_full_load.load(Ordering::SeqCst),
         "human_intervention" => !state.human_intervention_enabled.load(Ordering::SeqCst),
         other => {
             return Json(json!({ "success": false, "error": format!("unknown tool switch: {}", other) }))
@@ -3587,6 +3600,10 @@ async fn builtin_tool_toggle_handler(
         "linux_ir_tools" => {
             state.linux_ir_tools.store(next, Ordering::SeqCst);
             info!("Linux IR tools {}", if next { "full load" } else { "on-demand" });
+        }
+        "win_ir_tools" => {
+            state.win_ir_full_load.store(next, Ordering::SeqCst);
+            info!("Windows IR cold tools {}", if next { "full load" } else { "on-demand" });
         }
         _ => {
             // human_intervention：没有工具表可改，只是一个运行期开关。
@@ -3812,6 +3829,9 @@ async fn agent_settings_save_handler(
     let linux_ir_tools = body.get("linux_ir_tools")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.linux_ir_tools.load(Ordering::SeqCst));
+    let win_ir_full_load = body.get("win_ir_tools")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(state.win_ir_full_load.load(Ordering::SeqCst));
     let browser_headless = body.get("browser_headless")
         .and_then(|v| v.as_bool())
         .unwrap_or(state.browser_headless.load(Ordering::SeqCst));
@@ -3853,6 +3873,7 @@ async fn agent_settings_save_handler(
         two_tier_memory,
         budget_dashboard,
         linux_ir_tools,
+        win_ir_full_load,
         enable_context_scaling,
         max_inline_chars,
         skill_listing_strategy.as_str().to_string(),
@@ -3873,6 +3894,7 @@ async fn agent_settings_save_handler(
         state.two_tier_memory.store(two_tier_memory, Ordering::SeqCst);
         state.budget_dashboard.store(budget_dashboard, Ordering::SeqCst);
         state.linux_ir_tools.store(linux_ir_tools, Ordering::SeqCst);
+        state.win_ir_full_load.store(win_ir_full_load, Ordering::SeqCst);
             state.browser_headless.store(browser_headless, Ordering::SeqCst);
             if let Ok(mut g) = state.browser_executable.write() {
                 *g = browser_executable.clone();
@@ -3898,6 +3920,7 @@ async fn agent_settings_save_handler(
                 "two_tier_memory": two_tier_memory,
                 "budget_dashboard": budget_dashboard,
                 "linux_ir_tools": linux_ir_tools,
+                "win_ir_tools": win_ir_full_load,
                 "enable_context_scaling": enable_context_scaling,
                 "max_inline_chars": max_inline_chars,
                 "skill_listing_strategy": skill_listing_strategy.as_str().to_string(),

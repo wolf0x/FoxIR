@@ -80,6 +80,9 @@ prefetch-core = "0.1"
 whoami = "1"
 winrm-rs = "=1.1.2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+ignore = "0.4.33"
+globset = "0.4.20"
+encoding_rs = "0.8.42"
 
 [build-dependencies]
 winresource = "0.1"

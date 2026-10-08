@@ -1,4 +1,5 @@
 pub mod file_ops;
+pub mod file_grep;
 pub mod shell_exec;
 pub mod recycle;
 pub mod sys_info;
@@ -20,6 +21,7 @@ pub mod todo_update;
 pub mod browser_cdp;
 pub mod browser_launch;
 pub mod ir_scan;
+pub mod ir_win;
 pub mod ir_process;
 pub mod ir_account;
 pub mod ir_persistence;
@@ -429,6 +431,7 @@ impl ToolRegistry {
         registry.register(Arc::new(file_ops::FileDeleteTool));
         registry.register(Arc::new(file_ops::FileModifyTool));
         registry.register(Arc::new(file_ops::FileListTool));
+        registry.register(Arc::new(file_grep::FileGrepTool));
         registry.register(Arc::new(shell_exec::ShellExecTool));
         registry.register(Arc::new(sys_info::SysInfoTool));
         registry.register(Arc::new(sys_eventlog::SysEventLogTool));
