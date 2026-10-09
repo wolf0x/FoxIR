@@ -460,9 +460,9 @@ fn trim_history_by_value(history: &mut Vec<ChatMessage>, max_tokens: usize) {
 /// 2. Send messages + tool schemas to LLM (streaming)
 /// 3. If LLM returns tool_calls → execute tools → loop back
 /// 4. If LLM returns text → done
-/// Orchestration tool names. Hidden from the model via delivery gating unless
-/// the mode/depth allowset opens (SDD \u00a77.3). Step 1 keeps allowset empty
-/// for all modes (Expert included) so there is zero behavior diff.
+/// Orchestration tool names. Delivery is gated by the mode/depth allowset
+/// (SDD \u00a77.3): the Instant root run (depth 0) always gets all eight tools;
+/// Expert runs and workers (depth >= 1) get none.
 pub const ALL_ORCH: [&str; 8] = [
     "spawn_subagent",
     "wait_subagent",
@@ -474,14 +474,15 @@ pub const ALL_ORCH: [&str; 8] = [
     "wait_all_subagents",
 ];
 
-/// Delivery-gate truth table. Step 1: returns empty for every mode/depth.
-/// Step 2a opens `Instant && depth == 0` to ALL_ORCH.
+/// Whether a tool name belongs to the orchestration set. Actual delivery is
+/// decided by `orchestration_allowset`: Instant root opens ALL_ORCH,
+/// Expert / depth >= 1 stays empty.
 pub(crate) fn is_orchestration_name(name: &str) -> bool {
     ALL_ORCH.contains(&name)
 }
 
 pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec<String> {
-    // Step 2a opens the delivery gate for the Instant root run (depth 0) so the
+    // The delivery gate is open for the Instant root run (depth 0) so the
     // manager can call the orchestration tools. Workers (depth >= 1) never get them.
     if mode == crate::context::AgentMode::Instant && depth == 0 {
         ALL_ORCH.iter().map(|s| s.to_string()).collect()

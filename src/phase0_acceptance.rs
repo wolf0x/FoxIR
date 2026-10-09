@@ -234,41 +234,51 @@ async fn spawn_wait(orch: &Orchestrator, spec: &SubAgentSpec, root: &str) -> Str
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn phase0_wait_many_converges_all_workers_in_parallel() {
     // mock provider 每轮延迟 60ms、每 worker 数轮：N 个 worker 真并发跑完。
+    // 计时取 3 轮中位数抗单轮 CI 抖动；系数 *2 保持不动（可行区间 (1.34, 2.68)
+    // 内最居中，调大反而变严、调小丢串行拦截力，均非出路）。
+    const ROUNDS: usize = 3;
     let b = Bench::new(60).await;
-    let ms = b.mem_store();
-    let (orch, _prx) = make_orch(b.env(ms.clone()), "root-wm");
     let n = 4;
-    let t0 = Instant::now();
-    let mut ids = Vec::new();
-    for i in 0..n {
-        ids.push(orch.spawn(&b.spec(&format!("wm{i}")), 0, "root-wm", "sess", "parent").await.unwrap());
-    }
-    let results = orch.wait_many(&ids).await;
-    let elapsed = t0.elapsed();
+    let mut samples = Vec::new();
+    for round in 0..ROUNDS {
+        // 每轮独立 orch + 独立 role 前缀，避免跨轮角色复用污染计时。
+        let ms = b.mem_store();
+        let root = format!("root-wm{round}");
+        let (orch, _prx) = make_orch(b.env(ms.clone()), &root);
+        let t0 = Instant::now();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(orch.spawn(&b.spec(&format!("wm{round}{i}")), 0, &root, "sess", "parent").await.unwrap());
+        }
+        let results = orch.wait_many(&ids).await;
+        let elapsed = t0.elapsed();
 
-    assert_eq!(results.len(), n);
-    for (i, r) in results.iter().enumerate() {
-        let res = r.as_ref().unwrap();
-        assert_eq!(res.status, SubAgentStatus::Ok, "worker {i} must reach Ok via wait_many");
-        // 保序：wait_many 第 i 个结果必须对应第 i 个 run_id
-        assert_eq!(res.run_id, ids[i], "wait_many must preserve input order");
+        assert_eq!(results.len(), n);
+        for (i, res) in results.iter().enumerate() {
+            let res = res.as_ref().unwrap();
+            assert_eq!(res.status, SubAgentStatus::Ok, "round {round} worker {i} must reach Ok via wait_many");
+            // 保序：wait_many 第 i 个结果必须对应第 i 个 run_id
+            assert_eq!(res.run_id, ids[i], "wait_many must preserve input order");
+        }
+        samples.push(elapsed);
     }
-    // 并发证据：总耗时 ≈ 单 worker 耗时（最慢者），远小于 n × 串行下界。
-    // 串行下界 = n * (每 worker 至少一轮 * 60ms)。放宽所需裕度防 CI 抖动，
-    // 仍能把"真并发"与"顺序 await（必然 >= n*2*60ms）"区分开。
-    // 注：满载并发时 4 个后台 worker 实测 elapsed≈179ms（每 worker≈3 回合@60ms），
-    // 简报的 *3 裕度会压线误红；故按"保留量级差"原则反方向放宽到 *2：并行(≤180ms)
-    // 仍 *2=360<480 通过，而真串行(≈600ms+) *2≥1200≫480 仍判红，可区分性不变。
+    // 并发证据：中位耗时 ≈ 单 worker 耗时（最慢者），远小于 n × 串行下界。
+    // 串行下界 = n * (每 worker 至少一轮 * 60ms)。满载并发实测每轮 elapsed≈180ms
+    //（每 worker≈3 回合@60ms），中位数同样落在 *2=360<480 的安全区；
+    // 真串行(≈600ms+) *2≥1200≫480 仍判红，可区分性不变。
+    samples.sort();
+    let median = samples[ROUNDS / 2];
     let serial_floor = std::time::Duration::from_millis(60 * 2 * n as u64);
     eprintln!(
-        "PHASE0 wait_many e2e: n={n} elapsed={:?} serial_floor={:?} ratio={:.2}",
-        elapsed,
+        "PHASE0 wait_many e2e: n={n} samples={:?} median={:?} serial_floor={:?} ratio={:.2}",
+        samples,
+        median,
         serial_floor,
-        serial_floor.as_secs_f64() / elapsed.as_secs_f64()
+        serial_floor.as_secs_f64() / median.as_secs_f64()
     );
     assert!(
-        elapsed * 2 < serial_floor,
-        "wait_many looks serialized: elapsed={elapsed:?}, serial_floor={serial_floor:?}"
+        median * 2 < serial_floor,
+        "wait_many looks serialized: median={median:?}, serial_floor={serial_floor:?}"
     );
 }
 
