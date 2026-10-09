@@ -500,6 +500,17 @@ pub fn orchestration_delivered_for(
     if candidate { orchestration_allowset(mode, depth) } else { Vec::new() }
 }
 
+/// Task 8.1：orch_candidate 判定的纯函数化（回滚点唯一总闸）。
+/// 签名不含 prefilter——类型级自证“候选判定与预筛无关”。
+/// 一级回滚点在调用处：在调用末尾加 `&& prefilter` 即整体回退 v1.1-hardened。
+fn is_orch_candidate(
+    can_spawn: bool,
+    mode: crate::context::AgentMode,
+    depth: u8,
+) -> bool {
+    can_spawn && mode == crate::context::AgentMode::Instant && depth == 0
+}
+
 /// Cheap rule-based pre-filter (D2 layer 1 / D10). Zero LLM cost. Conservative:
 /// a false negative only means "stay on the main loop", never a wrong fan-out.
 pub fn orchestration_prefilter(user_message: &str) -> bool {
@@ -1740,11 +1751,9 @@ impl Agent for LlmAgent {
         // `user_message` 为借用 &str 处计算（它在下方被 shadow 成 String），供后续
         // Task 7 的扇出软提示使用。
         let prefilter = orchestration_prefilter(user_message); // 仅扇出提示/日志，不再门控
-        // 一级回滚点：在该行末尾恢复 `&& prefilter` 即整体回退到 v1.1-hardened 行为
+        // 一级回滚点：在下一行调用末尾加 `&& prefilter` 即整体回退到 v1.1-hardened 行为
         // （预筛硬门重新同时门控投递与构建）。
-        let orch_candidate = ctx.can_spawn
-            && ctx.mode == crate::context::AgentMode::Instant
-            && ctx.depth == 0;
+        let orch_candidate = is_orch_candidate(ctx.can_spawn, ctx.mode, ctx.depth);
         // F7: surface the orchestration fan-out hint for diagnosis — this is the
         // single line that records whether the run is a steady orchestration candidate.
         if ctx.can_spawn
@@ -4547,20 +4556,35 @@ mod tests {
     }
 
     /// Task 2 回归护栏：拆掉预筛硬门后，Instant 根常态候选（candidate 由
-    /// `can_spawn && Instant && depth==0` 给出，与 prefilter 无关）放行全部编排
-    /// 工具；Expert / depth≥1 恒空（隔离红线）。prefilter 降级为软提示/日志，
-    /// 不再作为投递硬门。
+    /// `is_orch_candidate`（`can_spawn && Instant && depth==0`）给出，与 prefilter
+    /// 无关）放行全部编排工具；Expert / depth≥1 恒空（隔离红线）。prefilter 降级为
+    /// 软提示/日志，不再作为投递硬门。
     #[test]
     fn orch_candidate_is_steady_for_instant_root_regardless_of_prefilter() {
         use crate::context::AgentMode;
         // trivial 措辞：预筛=false，证明它不再作为投递硬门
         assert!(!orchestration_prefilter("你好"));
-        // 常态候选下（candidate 由 can_spawn&&Instant&&depth0 给出=true），Instant 根放行全部编排工具
-        let allow = orchestration_delivered_for(AgentMode::Instant, 0, true);
+        // 常态候选：candidate 由 is_orch_candidate 真表达式给出（预筛假不影响候选真）
+        let candidate = is_orch_candidate(true, AgentMode::Instant, 0);
+        let allow = orchestration_delivered_for(AgentMode::Instant, 0, candidate);
         assert_eq!(allow.len(), ALL_ORCH.len());
-        // 隔离红线：Expert 即便 candidate 误传真，allowset 仍空；depth≥1 仍空
+        // 隔离红线：Expert / depth≥1 恒空
         assert!(orchestration_delivered_for(AgentMode::Expert, 0, true).is_empty());
         assert!(orchestration_delivered_for(AgentMode::Instant, 1, true).is_empty());
+    }
+
+    /// Task 8.1：真驱动 orch_candidate 判定本身（补 L1745 总闸的执行覆盖）。
+    #[test]
+    fn is_orch_candidate_truth_table() {
+        use crate::context::AgentMode;
+        // 唯一真值：can_spawn && Instant && depth==0
+        assert!(is_orch_candidate(true, AgentMode::Instant, 0));
+        // 逐维翻转各拦一次
+        assert!(!is_orch_candidate(false, AgentMode::Instant, 0)); // can_spawn=false 拦
+        assert!(!is_orch_candidate(true, AgentMode::Expert, 0));   // Expert 拦（隔离红线）
+        assert!(!is_orch_candidate(true, AgentMode::Instant, 1));  // depth≥1 拦（子代理不再扇出）
+        // Expert × depth 组合也恒假
+        assert!(!is_orch_candidate(true, AgentMode::Expert, 1));
     }
     // ── Loop-guard helpers (v1.0.11) ──
     fn tcd(name: &str, args: &str) -> crate::model::ToolCallDelta {
