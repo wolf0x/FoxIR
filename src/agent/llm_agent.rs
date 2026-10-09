@@ -489,8 +489,10 @@ pub fn orchestration_allowset(mode: crate::context::AgentMode, depth: u8) -> Vec
     }
 }
 
-/// D10: delivery gate AND route gate are one. Orchestration tools are delivered
-/// only when the cheap pre-filter flags the run as a fan-out candidate.
+/// D10（Task 2 修订）：投递门与路由门仍合一。candidate 的语义已从"预筛命中"
+/// 变宽为"Instant 根常态候选"（由 `can_spawn && Instant && depth==0` 给出，不再
+/// 依赖 prefilter）。签名与函数体不变：candidate 为真时按 mode/depth allowset 放行，
+/// 否则返回空——Expert / depth≥1 恒空（隔离红线）。
 pub fn orchestration_delivered_for(
     mode: crate::context::AgentMode, depth: u8, candidate: bool,
 ) -> Vec<String> {
@@ -1711,24 +1713,25 @@ impl Agent for LlmAgent {
         // (MCP / external) are exposed on demand via `load_tool_schema`, and a
         // peripheral tool is re-added once loaded. This bounds the per-request
         // tool payload regardless of how many servers/tools are registered.
-        // D10 pre-filter (P5): a single cheap boolean gates BOTH orchestration
-        // tool delivery and Orchestrator construction. Computed here while
-        // `user_message` is still the borrowed &str (it is shadowed to String
-        // further down). When false the allowset stays empty and no Orchestrator
-        // is built — the zero-overhead promise for non-fan-out runs.
-        let prefilter = orchestration_prefilter(user_message);
+        // D10 pre-filter (P5) 已降级：prefilter 现仅生成扇出软提示/日志，不再门控
+        // 编排工具投递与 Orchestrator 构建。投递与构建改由 `can_spawn && Instant &&
+        // depth==0` 常态决定——每个 Instant 根运行都常态具备编排能力。prefilter 仍在
+        // `user_message` 为借用 &str 处计算（它在下方被 shadow 成 String），供后续
+        // Task 7 的扇出软提示使用。
+        let prefilter = orchestration_prefilter(user_message); // 仅扇出提示/日志，不再门控
+        // 一级回滚点：在该行末尾恢复 `&& prefilter` 即整体回退到 v1.1-hardened 行为
+        // （预筛硬门重新同时门控投递与构建）。
         let orch_candidate = ctx.can_spawn
             && ctx.mode == crate::context::AgentMode::Instant
-            && ctx.depth == 0
-            && prefilter;
-        // F7: surface the orchestration gate for diagnosis — this is the single
-        // line that decides whether the run can fan out.
+            && ctx.depth == 0;
+        // F7: surface the orchestration fan-out hint for diagnosis — this is the
+        // single line that records whether the run is a steady orchestration candidate.
         if ctx.can_spawn
             && ctx.mode == crate::context::AgentMode::Instant
             && ctx.depth == 0
         {
             tracing::info!(
-                "[session:{}] orchestration gate: prefilter={prefilter} -> orchard={orch_candidate} (+7 orchestration tools if true)",
+                "[session:{}] orchestration 扇出提示: prefilter={prefilter} -> orchard={orch_candidate} (Instant 根常态投递编排工具集)",
                 session_id
             );
         }
@@ -1736,9 +1739,9 @@ impl Agent for LlmAgent {
             let reg = self.tools.read().await;
             let periph = reg.peripheral_tools();
             let mut defs = reg.core_definitions();
-            // Delivery gate: hide orchestration tools unless the cheap pre-filter
-            // flags this run as a fan-out candidate AND the mode/depth allowset
-            // opens them (SDD §7.3 / D10). Zero overhead when prefilter misses.
+            // Delivery gate: 投递不再受预筛硬门；orch_candidate 现由 mode/depth/can_spawn
+            // 常态给出（Instant 根候选），再叠加 mode/depth allowset（SDD §7.3 / D10）。
+            // Expert / depth≥1 仍恒空，隔离红线不变。
             let orch_allowset = orchestration_delivered_for(ctx.mode, ctx.depth, orch_candidate);
             defs.retain(|d| orchestration_delivered(&d.function.name, &orch_allowset));
             // Settings gate: the Linux IR family is a block of schemas that only
@@ -1845,11 +1848,7 @@ impl Agent for LlmAgent {
         // Orchestrator and register it under this invocation id so the
         // orchestration tools can resolve it during the run. It is unregistered
         // when the returned event stream is fully consumed.
-        let orch: Option<Arc<crate::agent::orchestration::Orchestrator>> = if ctx.can_spawn
-            && ctx.mode == crate::context::AgentMode::Instant
-            && ctx.depth == 0
-            && orch_candidate
-        {
+        let orch: Option<Arc<crate::agent::orchestration::Orchestrator>> = if orch_candidate {
             let env = crate::agent::orchestration::OrchestratorEnv {
                 provider: self.provider.clone(),
                 tools: self.tools.clone(),
@@ -4514,6 +4513,23 @@ mod tests {
         assert_eq!(orchestration_delivered_for(Instant, 0, true).len(), ALL_ORCH.len());
         assert!(orchestration_delivered_for(Expert, 0, true).is_empty());
         assert!(orchestration_delivered_for(Instant, 1, true).is_empty());
+    }
+
+    /// Task 2 回归护栏：拆掉预筛硬门后，Instant 根常态候选（candidate 由
+    /// `can_spawn && Instant && depth==0` 给出，与 prefilter 无关）放行全部编排
+    /// 工具；Expert / depth≥1 恒空（隔离红线）。prefilter 降级为软提示/日志，
+    /// 不再作为投递硬门。
+    #[test]
+    fn orch_candidate_is_steady_for_instant_root_regardless_of_prefilter() {
+        use crate::context::AgentMode;
+        // trivial 措辞：预筛=false，证明它不再作为投递硬门
+        assert!(!orchestration_prefilter("你好"));
+        // 常态候选下（candidate 由 can_spawn&&Instant&&depth0 给出=true），Instant 根放行全部编排工具
+        let allow = orchestration_delivered_for(AgentMode::Instant, 0, true);
+        assert_eq!(allow.len(), ALL_ORCH.len());
+        // 隔离红线：Expert 即便 candidate 误传真，allowset 仍空；depth≥1 仍空
+        assert!(orchestration_delivered_for(AgentMode::Expert, 0, true).is_empty());
+        assert!(orchestration_delivered_for(AgentMode::Instant, 1, true).is_empty());
     }
     // ── Loop-guard helpers (v1.0.11) ──
     fn tcd(name: &str, args: &str) -> crate::model::ToolCallDelta {
