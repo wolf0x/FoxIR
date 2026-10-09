@@ -218,7 +218,7 @@ pub struct HindsightConfig {
     pub auto_sync_read: bool,
     /// 写入超时（毫秒），默认 10000。
     pub write_timeout_ms: u64,
-    /// 读取超时（毫秒），默认 1500。
+    /// 读取超时（毫秒），默认 8000（远端向量搜索需要足够时间）。
     pub read_timeout_ms: u64,
     /// 熔断阈值（连续失败次数），默认 5。
     pub circuit_breaker_threshold: u32,
@@ -236,7 +236,7 @@ impl Default for HindsightConfig {
             auto_sync_write: true,
             auto_sync_read: true,
             write_timeout_ms: 10000,
-            read_timeout_ms: 1500,
+            read_timeout_ms: 8000,
             circuit_breaker_threshold: 5,
             circuit_breaker_cooldown_s: 60,
         }

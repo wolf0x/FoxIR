@@ -64,15 +64,22 @@ impl Tool for RecallMemoryTool {
 
         // Distilled, budget-capped block: top-k hits + a slim recent-summary tail.
         let budget_chars = (max_items * 450).min(6000);
+
+        // 本地召回与远端 Hindsight recall 并行执行，避免串行叠加延迟。
+        let hindsight_fut = self.hindsight_sync.as_ref().map(|sync| {
+            let sync = sync.clone();
+            let q = query.to_string();
+            tokio::spawn(async move { sync.recall(&q, 512).await })
+        });
+
         let mut block = self
             .memory_store
             .build_recall_context(query, days, budget_chars)
             .unwrap_or_else(|| "No relevant past conversations found.".to_string());
 
-        // Task #20 读融合：本地召回之后追加 Hindsight 远端 recall（严格超时、
-        // 优雅降级：未启用/熔断/超时均返回空，不影响本地结果）。
-        if let Some(sync) = &self.hindsight_sync {
-            let remote = sync.recall(query, 512).await;
+        // 收取远端结果（已并行，此处只等剩余时间）
+        if let Some(handle) = hindsight_fut {
+            let remote = handle.await.unwrap_or_default();
             if !remote.is_empty() {
                 block.push_str("\n\n## Remote Memory (Hindsight)\n");
                 for item in &remote {
