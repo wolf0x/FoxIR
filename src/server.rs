@@ -1393,9 +1393,18 @@ async fn hindsight_settings_test_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let base_url = body.get("base_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let bank_id = body.get("bank_id").and_then(|v| v.as_str()).unwrap_or("smoke-test").trim().to_string();
+    // 若前端传回遮蔽 key（含 '*'）或空，则使用已存储的真实 key。
+    let stored = state.hindsight_sync.get_config().await;
+    let base_url = body.get("base_url").and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        .unwrap_or_else(|| stored.base_url.clone());
+    let api_key = match body.get("api_key").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() && !k.contains('*') => k.trim().to_string(),
+        _ => stored.api_key.clone(),
+    };
+    let bank_id = body.get("bank_id").and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        .unwrap_or_else(|| stored.bank_id.clone());
     if base_url.is_empty() {
         return Json(json!({ "success": false, "error": "Missing base_url", "tools": [] }));
     }

@@ -171,7 +171,8 @@ impl HindsightSync {
         }
     }
 
-    /// Recall memories from Hindsight (strict timeout, graceful degradation)
+    /// Recall memories from Hindsight (strict timeout, graceful degradation).
+    /// Only returns items whose relevance score >= `min_score` (default 0.4).
     pub async fn recall(&self, query: &str, max_tokens: u32) -> Vec<RecallItem> {
         let config = self.config.read().await;
         if !config.enabled || !config.auto_sync_read {
@@ -199,7 +200,16 @@ impl HindsightSync {
         match result {
             Ok(Ok(val)) => {
                 self.breaker.record_success();
-                parse_recall_results(val)
+                debug!("Hindsight recall raw response: {}", serde_json::to_string(&val).unwrap_or_default().chars().take(500).collect::<String>());
+                let items = parse_recall_results(val);
+                // 过滤低相关度结果（score < 0.4 视为噪声）
+                let min_score = 0.4;
+                let filtered: Vec<RecallItem> = items.into_iter()
+                    .filter(|i| i.score >= min_score || i.score == 0.0 && i.fact_type != "unknown")
+                    .take(5)
+                    .collect();
+                debug!("Hindsight recall: {} items after score filter (>= {})", filtered.len(), min_score);
+                filtered
             }
             Ok(Err(e)) => {
                 warn!("Hindsight recall failed: {}", e);
