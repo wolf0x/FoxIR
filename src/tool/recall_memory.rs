@@ -33,8 +33,11 @@ impl Tool for RecallMemoryTool {
     fn name(&self) -> &str { "recall_memory" }
 
     fn description(&self) -> &str {
-        "Search past conversations stored in local memory for exchanges relevant to a query.\n\
-         Use this when you need to recall specific details ('what versions were affected?',\n\
+        "Search past conversations and durable memory for exchanges relevant to a query.\n\
+         Pass 'query' as a natural-language question or full sentence (e.g. 'Did we run a web\n\
+         scan against 112.5.155.133?') — never a pile of keywords/synonyms; keyword soup\n\
+         degrades semantic retrieval and usually matches nothing. Use this when you need to\n\
+         recall specific details ('what versions were affected?',\n\
          'what did we conclude earlier?') that may not be in the visible context. Returns a\n\
          bounded, relevance-ranked summary of matching past messages and recent daily summaries.\n\
          Answer directly from the returned content; do not re-read source archives to restate it."
@@ -48,7 +51,7 @@ impl Tool for RecallMemoryTool {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "What to recall (topic / question)" },
+                "query": { "type": "string", "description": "A natural-language question or sentence describing what to recall, e.g. 'Did we run a web scan against 112.5.155.133?'. Never concatenate keywords or synonyms." },
                 "days": { "type": "integer", "minimum": 1, "maximum": 90, "description": "Look-back window in days (default 14)" },
                 "max_items": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Max matching entries to return (default 8)" }
             },

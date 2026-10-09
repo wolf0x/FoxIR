@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::HindsightConfig;
 use crate::error::AgentResult;
@@ -127,7 +127,7 @@ impl HindsightSync {
         tags: &[String],
     ) -> AgentResult<Value> {
         let config = self.config.read().await;
-        if !config.enabled || !config.auto_sync_write {
+        if !config.enabled {
             return Ok(Value::Null);
         }
         if self.breaker.is_open() {
@@ -175,11 +175,12 @@ impl HindsightSync {
     /// Only returns items whose relevance score >= `min_score` (default 0.4).
     pub async fn recall(&self, query: &str, max_tokens: u32) -> Vec<RecallItem> {
         let config = self.config.read().await;
-        if !config.enabled || !config.auto_sync_read {
+        if !config.enabled {
+            info!("Hindsight recall skipped: enabled=false");
             return Vec::new();
         }
         if self.breaker.is_open() {
-            debug!("Hindsight circuit breaker open, skipping recall");
+            info!("Hindsight circuit breaker OPEN, skipping recall");
             return Vec::new();
         }
 
@@ -200,15 +201,16 @@ impl HindsightSync {
         match result {
             Ok(Ok(val)) => {
                 self.breaker.record_success();
-                debug!("Hindsight recall raw response: {}", serde_json::to_string(&val).unwrap_or_default().chars().take(500).collect::<String>());
+                info!("Hindsight recall raw response (first 500): {}", serde_json::to_string(&val).unwrap_or_default().chars().take(500).collect::<String>());
                 let items = parse_recall_results(val);
+                info!("Hindsight recall parsed {} items", items.len());
                 // 过滤低相关度结果（score < 0.4 视为噪声）
                 let min_score = 0.4;
                 let filtered: Vec<RecallItem> = items.into_iter()
                     .filter(|i| i.score >= min_score || i.score == 0.0 && i.fact_type != "unknown")
                     .take(5)
                     .collect();
-                debug!("Hindsight recall: {} items after score filter (>= {})", filtered.len(), min_score);
+                info!("Hindsight recall: {} items after score filter (>= {})", filtered.len(), min_score);
                 filtered
             }
             Ok(Err(e)) => {
@@ -276,7 +278,7 @@ impl HindsightSync {
 
     /// 写同步便捷方法：插入本地映射 → retain → 回填远端 id 与状态。
     ///
-    /// 仅在 `enabled && auto_sync_write` 时生效；否则直接返回，不污染映射表。
+    /// 仅在 `enabled` 时生效；否则直接返回，不污染映射表。
     /// 设计为“尽力而为”：任何一步失败都不向上抛错，只落 `failed` 状态。
     pub async fn sync_fact(
         &self,
@@ -288,7 +290,7 @@ impl HindsightSync {
     ) {
         {
             let c = self.config.read().await;
-            if !c.enabled || !c.auto_sync_write {
+            if !c.enabled {
                 return;
             }
         }
@@ -432,11 +434,28 @@ fn parse_recall_results(val: Value) -> Vec<RecallItem> {
                             text: r.get("text")?.as_str()?.to_string(),
                             fact_type: r
                                 .get("type")
+                                .or_else(|| r.get("fact_type"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("unknown")
                                 .to_string(),
-                            entities: Vec::new(),
-                            score: r.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
+                            entities: r
+                                .get("entities")
+                                .and_then(|e| e.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            // Hindsight returns relevance under `scores.final`; fall back
+                            // to a top-level `score`, then 0.0. Without this the high-relevance
+                            // items parsed here default to 0.0 and are wiped by the >=0.4 filter.
+                            score: r
+                                .get("scores")
+                                .and_then(|s| s.get("final"))
+                                .and_then(|f| f.as_f64())
+                                .or_else(|| r.get("score").and_then(|s| s.as_f64()))
+                                .unwrap_or(0.0),
                         })
                     })
                     .collect();
@@ -495,5 +514,35 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "just a memory");
         assert_eq!(items[0].fact_type, "unknown");
+    }
+
+    // Regression: Hindsight returns a top-level object {"results":[...]}, whose items
+    // carry relevance under `scores.final` and a `fact_type` field (not `type`/`score`).
+    // The object branch once read only `type`/`score`, so every high-relevance item
+    // defaulted to score=0.0/fact_type="unknown" and was wiped by the >=0.4 filter,
+    // making recall appear empty. This pins the correct extraction.
+    #[test]
+    fn parse_recall_results_extracts_scores_final_and_fact_type() {
+        let inner = serde_json::to_string(&json!({
+            "results": [{
+                "text": "asset JLLJJ33 ownership under review",
+                "fact_type": "world",
+                "entities": ["JLLJJ33"],
+                "scores": { "final": 1.0995, "reranker": 0.99 }
+            }]
+        }))
+        .unwrap();
+        let payload = json!([{ "type": "text", "text": inner }]);
+        let items = parse_recall_results(payload);
+        assert_eq!(items.len(), 1, "object/results branch must parse the item");
+        assert_eq!(items[0].fact_type, "world", "must read fact_type, not just type");
+        assert!(
+            (items[0].score - 1.0995).abs() < 1e-6,
+            "must read scores.final ({}), not default to 0.0",
+            items[0].score
+        );
+        assert_eq!(items[0].entities, vec!["JLLJJ33".to_string()]);
+        // The high-relevance item must survive the recall filter (>= 0.4).
+        assert!(items[0].score >= 0.4);
     }
 }

@@ -671,8 +671,7 @@ input:checked+.slider:before{transform:translateX(20px)}
   "conn  model"
   "prov  prov"
   "agent perms"
-  "agent session"
-  "memory memory"
+  "agent memory"
   "config config";
   gap:18px}
 .settings-grid .settings-section{margin-bottom:0}
@@ -681,10 +680,9 @@ input:checked+.slider:before{transform:translateX(20px)}
 .gs-prov{grid-area:prov}
 .gs-agent{grid-area:agent}
 .gs-perms{grid-area:perms}
-.gs-session{grid-area:session}
 .gs-config{grid-area:config}
 .gs-memory{grid-area:memory}
-@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "memory" "config"}}
+@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "memory" "config"}}
 
 .modern-page .settings-section h3{font-size:15px;font-weight:600;color:#1e293b;margin:0 0 18px 0;display:flex;align-items:center;gap:8px;border-bottom:none;padding-bottom:0}
 .form-card{margin-bottom:16px;padding:18px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:12px}
@@ -926,8 +924,7 @@ input:checked+.slider:before{transform:translateX(20px)}
   "conn  model"
   "prov  prov"
   "agent perms"
-  "agent session"
-  "memory memory"
+  "agent memory"
   "config config";
   gap:18px}
 .settings-grid .settings-section{margin-bottom:0}
@@ -936,10 +933,9 @@ input:checked+.slider:before{transform:translateX(20px)}
 .gs-prov{grid-area:prov}
 .gs-agent{grid-area:agent}
 .gs-perms{grid-area:perms}
-.gs-session{grid-area:session}
 .gs-config{grid-area:config}
 .gs-memory{grid-area:memory}
-@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "memory" "config"}}
+@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "memory" "config"}}
 
 .modern-page .settings-section h3{font-size:15px;font-weight:600;color:#1e293b;margin:0 0 18px 0;display:flex;align-items:center;gap:8px;border-bottom:none;padding-bottom:0}
 .form-card{margin-bottom:16px;padding:18px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:12px}
@@ -1542,61 +1538,6 @@ input:checked+.slider:before{transform:translateX(20px)}
             </div>
           </div>
         </div>
-        <div class="settings-section gs-memory">
-          <h3>&#129504; 记忆远端同步 (Hindsight)</h3>
-          <div class="form-card">
-            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
-              <div>
-                <label style="margin-bottom:0">启用远端记忆同步</label>
-                <small style="color:var(--t3)">将本地记忆异步同步到 Hindsight 远端，并在召回时融合远端结果</small>
-              </div>
-              <label class="perm-toggle">
-                <input type="checkbox" id="hindsightEnabled" onchange="saveHindsightSettings()">
-                <span class="slider"></span>
-              </label>
-            </div>
-          </div>
-          <div class="form-card">
-            <div class="form-group">
-              <label>服务地址</label>
-              <input type="text" id="hindsightBaseUrl" placeholder="http://localhost:8888" onchange="saveHindsightSettings()">
-            </div>
-            <div class="form-group">
-              <label>API Key</label>
-              <input type="password" id="hindsightApiKey" placeholder="Bearer token" onchange="saveHindsightSettings()">
-            </div>
-            <div class="form-group">
-              <label>Bank ID</label>
-              <input type="text" id="hindsightBankId" placeholder="smoke-test" value="smoke-test" onchange="saveHindsightSettings()">
-            </div>
-          </div>
-          <div class="form-card">
-            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
-              <div>
-                <label style="margin-bottom:0">自动同步写入</label>
-                <small style="color:var(--t3)">每次本地存储记忆时自动 retain 到远端</small>
-              </div>
-              <label class="perm-toggle">
-                <input type="checkbox" id="hindsightAutoWrite" checked onchange="saveHindsightSettings()">
-                <span class="slider"></span>
-              </label>
-            </div>
-            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
-              <div>
-                <label style="margin-bottom:0">召回融合</label>
-                <small style="color:var(--t3)">注入提示词时并行查询远端记忆，合并结果</small>
-              </div>
-              <label class="perm-toggle">
-                <input type="checkbox" id="hindsightAutoRead" checked onchange="saveHindsightSettings()">
-                <span class="slider"></span>
-              </label>
-            </div>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
-            <button class="btn btn-p" onclick="testHindsightConnection()">&#128279; 测试连接</button>
-            <span id="hindsightTestResult" style="font-size:12px;color:var(--t3)"></span>
-          </div>
-        </div>
         <div class="settings-section gs-config">
           <h3>&#128196; Config</h3>
           <p style="font-size:12px;color:var(--t3);margin-bottom:10px">
@@ -1618,14 +1559,38 @@ input:checked+.slider:before{transform:translateX(20px)}
           </div>
           <div id="configSaveStatus" style="margin-top:6px;font-size:12px;color:var(--t3)"></div>
         </div>
-        <div class="settings-section gs-session">
-          <h3>&#128190; Session</h3>
-          <div style="display:flex;flex-direction:column;gap:8px">
-            <button class="btn btn-d" onclick="clearChat()">Clear Conversation</button>
-            <button class="btn btn-s" onclick="exportChat()">Export Conversation</button>
-            <button class="btn btn-d" onclick="resetManagedPlans()" title="Clear unfinished Expert mode tasks and start fresh">Reset Managed Plans</button>
+        <div class="settings-section gs-memory">
+          <h3>&#129504; Remote Memory Sync (Hindsight)</h3>
+          <div class="form-card">
+            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+              <div>
+                <label style="margin-bottom:0">Enable Remote Memory Sync</label>
+                <small style="color:var(--t3)">Sync local memories to the Hindsight remote asynchronously and merge remote results during recall</small>
+              </div>
+              <label class="perm-toggle">
+                <input type="checkbox" id="hindsightEnabled" onchange="saveHindsightSettings()">
+                <span class="slider"></span>
+              </label>
+            </div>
           </div>
-          <div id="managedResetStatus" style="margin-top:8px;font-size:12px;color:var(--t3)"></div>
+          <div class="form-card">
+            <div class="form-group">
+              <label>Base URL</label>
+              <input type="text" id="hindsightBaseUrl" placeholder="http://localhost:8888" onchange="saveHindsightSettings()">
+            </div>
+            <div class="form-group">
+              <label>API Key</label>
+              <input type="password" id="hindsightApiKey" placeholder="Bearer token" onchange="saveHindsightSettings()">
+            </div>
+            <div class="form-group">
+              <label>Bank ID</label>
+              <input type="text" id="hindsightBankId" placeholder="smoke-test" value="smoke-test" onchange="saveHindsightSettings()">
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+            <button class="btn btn-p" onclick="testHindsightConnection()">&#128279; Test Connection</button>
+            <span id="hindsightTestResult" style="font-size:12px;color:var(--t3)"></span>
+          </div>
         </div>
         <div class="settings-section gs-perms">
           <h3>&#128274; Tool Permissions</h3>
@@ -1941,13 +1906,13 @@ input:checked+.slider:before{transform:translateX(20px)}
           <div class="grok-bar">
             <input type="file" id="attachFileInput" multiple tabindex="-1" style="display:none" accept="image/*,.pdf,.docx,.xlsx,.txt,.md,.csv,.json,.xml,.yaml,.py,.js,.ts,.rs,.go,.java,.c,.cpp,.sql,.sh,.html,.css">
             <!-- 附件按钮（最左）：点击 / 拖拽 / 粘贴 -->
-            <button class="grok-attach" id="attachBtn" type="button" title="附加文件（点击 / 拖拽 / 粘贴）">
+            <button class="grok-attach" id="attachBtn" type="button" title="Attach file (click / drag / paste)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
               <span class="grok-dot"></span>
             </button>
             <textarea id="msgInput" rows="1" placeholder="Type a message... (/ for skills, Shift+Enter for newline)" disabled onkeydown="handleInputKeydown(event)" oninput="handleInput(event)"></textarea>
             <!-- 发送 / 停止（狼头 LOGO） -->
-            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="发送">🐺</button>
+            <button class="grok-send" id="sendBtn" type="button" onclick="onSendClick()" disabled aria-label="Send">🐺</button>
             <button class="btn btn-stop" id="stopBtn" onclick="stopAgent()" style="display:none">Stop</button>
           </div>
           </div>
@@ -1969,8 +1934,8 @@ input:checked+.slider:before{transform:translateX(20px)}
             <div class="output-list" id="outputList"></div>
           </div>
           <div class="panel-ftr">
-                    <button id="themeToggle" type="button" title="切换亮暗" aria-label="切换亮暗"><span class="tt-ico">◐</span><span class="tt-opt tt-light">Light</span><span class="tt-sep">|</span><span class="tt-opt tt-dark">Dark</span></button>
-                    <button id="modeBtn" type="button" aria-pressed="false" title="Instant — 单轮直答 · 点击切到 Expert">
+                    <button id="themeToggle" type="button" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"><span class="tt-ico">◐</span><span class="tt-opt tt-light">Light</span><span class="tt-sep">|</span><span class="tt-opt tt-dark">Dark</span></button>
+                    <button id="modeBtn" type="button" aria-pressed="false" title="Instant — single-turn direct answer · click to switch to Expert">
                       <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span class="mode-opt mode-instant">Instant</span><span class="mode-sep">|</span><span class="mode-opt mode-expert">Expert</span>
                     </button>
                   </div>
@@ -2278,7 +2243,7 @@ async function deleteSession(btn){
   // Two-step inline confirm (no browser dialog): first click arms, second deletes.
   if(btn.getAttribute('data-armed')!=='1'){
     btn.setAttribute('data-armed','1');
-    btn.textContent='确认?';
+    btn.textContent='Confirm?';
     btn.style.color='#f87171';
     if(btn._armTimer)clearTimeout(btn._armTimer);
     btn._armTimer=setTimeout(()=>{btn.removeAttribute('data-armed');btn.textContent='\u2715';btn.style.color='';},2500);
@@ -3117,7 +3082,7 @@ function sendMsg(){
   }
   if(pendingFiles.length){
     const names=pendingFiles.map(f=>f.name).join(', ');
-    sendTxt=(txt?txt+'\n\n':'')+'[附件: '+names+']';
+    sendTxt=(txt?txt+'\n\n':'')+'[Attachment: '+names+']';
   }
   if((!sendTxt&&pendingImages.length===0)||!connected)return;
   const imgs=pendingImages.map(i=>i.data);
@@ -3160,7 +3125,7 @@ var lastUserLang='';
 var expertOpenCard=null;
 function isChinese(s){return /[\u4e00-\u9fff]/.test(s||'');}
 function showExpertPrompt(hasExpert,hasInstant,prior){
-  var zh = lastUserLang==='en'?false:true;
+  var zh = lastUserLang==='zh'; // default English unless the user writes Chinese
   var conv=document.getElementById('convArea');
   var agentMsg=document.createElement('div');
   agentMsg.className='msg assistant';
@@ -3206,7 +3171,7 @@ function showExpertPrompt(hasExpert,hasInstant,prior){
   setTimeout(tick,1000);
 }
 
-function expertZh(){return !(lastUserLang==='en');}
+function expertZh(){return lastUserLang==='zh';}
 // Start New Job: remove previously rendered Manager Plan bubbles so the chat
 // shows a clean slate before the new Expert job is planned.
 function clearOldManagerPlans(){
@@ -3222,7 +3187,7 @@ function clearOldManagerPlans(){
 }
 function sendExpertChoice(choice,btn){
   if(ws&&connected){ws.send(JSON.stringify({type:'expert_choice',choice:choice,session:SESSION_ID}));}
-  addLog('Expert choice: '+(choice==='new'?'开启新任务':'续接'),'info');
+  addLog('Expert choice: '+(choice==='new'?'start new job':'continue'),'info');
   if(choice==='new'){clearOldManagerPlans();}
   var zh=expertZh();
   var card = btn ? btn.closest('.perm-request') : expertOpenCard;
@@ -4403,7 +4368,7 @@ function setManagedMode(on){
   if(modeBtn){
     modeBtn.classList.toggle('expert',on);
     modeBtn.setAttribute('aria-pressed',on?'true':'false');
-    modeBtn.title=on?'Expert — 长任务循环 · 点击切回 Instant':'Instant — 单轮直答 · 点击切到 Expert';
+    modeBtn.title=on?'Expert — long-task loop · click to switch back to Instant':'Instant — single-turn direct answer · click to switch to Expert';
   }
   const sendBtn=document.getElementById('sendBtn');
   if(sendBtn)sendBtn.classList.toggle('expert',on);
@@ -4459,8 +4424,6 @@ async function loadHindsightSettings() {
     document.getElementById('hindsightBaseUrl').value = cfg.base_url || '';
     document.getElementById('hindsightApiKey').value = cfg.api_key || '';
     document.getElementById('hindsightBankId').value = cfg.bank_id || 'smoke-test';
-    document.getElementById('hindsightAutoWrite').checked = cfg.auto_sync_write !== false;
-    document.getElementById('hindsightAutoRead').checked = cfg.auto_sync_read !== false;
   } catch (e) { console.error('Load hindsight settings error:', e); }
 }
 
@@ -4470,8 +4433,6 @@ async function saveHindsightSettings() {
     base_url: document.getElementById('hindsightBaseUrl').value.trim(),
     api_key: document.getElementById('hindsightApiKey').value.trim(),
     bank_id: document.getElementById('hindsightBankId').value.trim() || 'smoke-test',
-    auto_sync_write: document.getElementById('hindsightAutoWrite').checked,
-    auto_sync_read: document.getElementById('hindsightAutoRead').checked,
   };
   try {
     const res = await fetch('/api/settings/hindsight', {
@@ -4481,18 +4442,18 @@ async function saveHindsightSettings() {
     });
     const data = await res.json();
     if (data.success) {
-      showToast('Hindsight 配置已保存', 'success');
+      showToast('Hindsight settings saved', 'success');
     } else {
-      showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+      showToast('Save failed: ' + (data.error || 'unknown error'), 'error');
     }
   } catch (e) {
-    showToast('保存失败: ' + e.message, 'error');
+    showToast('Save failed: ' + e.message, 'error');
   }
 }
 
 async function testHindsightConnection() {
   const resultEl = document.getElementById('hindsightTestResult');
-  resultEl.textContent = '⏳ 测试中...';
+  resultEl.textContent = '⏳ Testing...';
   resultEl.style.color = 'var(--t3)';
 
   const body = {
@@ -4509,10 +4470,10 @@ async function testHindsightConnection() {
     });
     const data = await res.json();
     if (data.success) {
-      resultEl.textContent = '✅ 连接成功 — 工具: ' + (data.tools || []).join(', ');
+      resultEl.textContent = '✅ Connected — tools: ' + (data.tools || []).join(', ');
       resultEl.style.color = '#10b981';
     } else {
-      resultEl.textContent = '❌ ' + (data.error || '连接失败');
+      resultEl.textContent = '❌ ' + (data.error || 'Connection failed');
       resultEl.style.color = '#ef4444';
     }
   } catch (e) {
@@ -5099,20 +5060,20 @@ function showSkillsPopup(filter){showSlashList(slashSkills, filter, 'skills', 'N
 // Top-level slash command menu, mirroring PCBuddy's set: the views you can lose
 // your place in, plus stop / new / help. The Skills *page* is deliberately not
 // listed — its word belongs to the skill picker, which is the more useful read.
-const SLASH_VIEWS=[['chat','聊天'],['dashboard','仪表盘'],['tools','工具'],
-                   ['knowledge','知识库'],['cron','定时任务'],['mcp','MCP'],['settings','设置']];
+const SLASH_VIEWS=[['chat','Chat'],['dashboard','Dashboard'],['tools','Tools'],
+                   ['knowledge','Knowledge'],['cron','CRON'],['mcp','MCP'],['settings','Settings']];
 function showCmdMenu(rest){
   const popup=document.getElementById('slashPopup');
   const r=(rest||'').toLowerCase();
   const menu=[];
   const add=(name,desc,mode)=>{ if(name.slice(1).startsWith(r)) menu.push({name,desc,mode}); };
-  add('/skills','列出全部技能，上下键选择后回车','skills');
-  add('/stop','停止当前回合','stop');
-  add('/new','开一个新会话','new');
-  add('/help','显示可用命令','help');
-  SLASH_VIEWS.forEach(([v,label])=>add('/'+v,'跳到 '+label,'goto:'+v));
+  add('/skills','List all skills — use arrow keys and Enter to pick','skills');
+  add('/stop','Stop the current round','stop');
+  add('/new','Start a new session','new');
+  add('/help','Show available commands','help');
+  SLASH_VIEWS.forEach(([v,label])=>add('/'+v,'Go to '+label,'goto:'+v));
   slashMode='commands';
-  if(!menu.length){popup.innerHTML='<div class="slash-popup-empty">没有匹配的命令</div>';popup.classList.add('show');slashOpen=true;slashIdx=-1;return;}
+  if(!menu.length){popup.innerHTML='<div class="slash-popup-empty">No matching commands</div>';popup.classList.add('show');slashOpen=true;slashIdx=-1;return;}
   slashIdx=0;
   popup.innerHTML=menu.map((c,i)=>{
     return '<div class="slash-popup-item'+(i===slashIdx?' active':'')+'" data-idx="'+i+'" data-name="'+c.name+'" onmousedown="selectSlashItem(\''+c.name+'\',\'commands\')">' +
@@ -5162,7 +5123,7 @@ function gotoView(v){
 function slashHelpLine(){
   const d=document.createElement('div'); d.className='msg assistant';
   d.innerHTML=asstPrefix()+'<div class="msg-content md-content">'+renderMd(
-    '可用命令：`/skills` 选技能 · `/stop` 停止回合 · `/new` 新会话 · `/help` 本条 · '+
+    'Available commands: `/skills` pick a skill · `/stop` stop the round · `/new` new session · `/help` this list · '+
     SLASH_VIEWS.map(v=>'`/'+v[0]+'`').join(' '))+'</div>';
   document.getElementById('convArea').appendChild(d);
   scrollBottom();

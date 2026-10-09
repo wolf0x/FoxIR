@@ -149,6 +149,7 @@ impl McpClientManager {
                 Ok(service) => {
                     let service = Arc::new(service);
                     let mut tools = Self::discover_tools(&service).await;
+                    Self::apply_tool_whitelist(&mut tools, config);
                     for t in &mut tools {
                         t.server_name = config.name.clone();
                     }
@@ -223,6 +224,7 @@ impl McpClientManager {
             Ok(service) => {
                 let service = Arc::new(service);
                 let mut tools = Self::discover_tools(&service).await;
+                Self::apply_tool_whitelist(&mut tools, config);
                 for t in &mut tools {
                     t.server_name = config.name.clone();
                 }
@@ -273,6 +275,27 @@ impl McpClientManager {
             Err(e) => {
                 warn!("tools/list failed: {}", e);
                 Vec::new()
+            }
+        }
+    }
+
+    /// 应用工具白名单：`Some` 时仅保留列表内的工具，其余从 FoxIR 侧剔除
+    /// （MCP 协议层仍全量可达，此处只收窄注册面与 LLM 工具表）。
+    fn apply_tool_whitelist(tools: &mut Vec<McpToolInfo>, config: &McpServerConfig) {
+        if let Some(ref whitelist) = config.tool_whitelist {
+            let total = tools.len();
+            tools.retain(|t| whitelist.iter().any(|w| w == &t.name));
+            info!(
+                "MCP server '{}': tool whitelist applied, kept {}/{} tool(s)",
+                config.name,
+                tools.len(),
+                total
+            );
+            if tools.is_empty() && total > 0 {
+                warn!(
+                    "MCP server '{}': whitelist matched none of {} tool(s) — check tool names",
+                    config.name, total
+                );
             }
         }
     }
@@ -355,6 +378,15 @@ impl McpClientManager {
     pub fn tool_names(&self) -> Vec<String> {
         self.servers.iter()
             .filter(|s| s.status == ServerStatus::Connected)
+            .flat_map(|s| s.tools.iter().map(|t| t.name.clone()))
+            .collect()
+    }
+
+    /// Get tool names of a specific server (matched by config name, any status).
+    /// 供注册表清理使用：连接/重连前取出旧工具名，避免已过滤工具残留。
+    pub fn tool_names_of(&self, server_name: &str) -> Vec<String> {
+        self.servers.iter()
+            .filter(|s| s.config.name == server_name)
             .flat_map(|s| s.tools.iter().map(|t| t.name.clone()))
             .collect()
     }
@@ -591,5 +623,58 @@ impl Tool for McpProxyTool {
 
         // Serialize content to JSON Value
         Ok(serde_json::to_value(&result.content).unwrap_or(Value::Null))
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_tool(name: &str) -> McpToolInfo {
+        McpToolInfo {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({}),
+            server_name: "hindsight".to_string(),
+        }
+    }
+
+    fn mk_config(whitelist: Option<Vec<&str>>) -> McpServerConfig {
+        McpServerConfig {
+            name: "hindsight".to_string(),
+            transport: "sse".to_string(),
+            command: None,
+            args: vec![],
+            url: None,
+            auth_token: None,
+            enabled: true,
+            tool_whitelist: whitelist.map(|v| v.into_iter().map(String::from).collect()),
+        }
+    }
+
+    #[test]
+    fn whitelist_keeps_only_listed_tools() {
+        let config = mk_config(Some(vec!["retain", "recall"]));
+        let mut tools = vec![
+            mk_tool("retain"),
+            mk_tool("recall"),
+            mk_tool("delete_bank"),
+            mk_tool("clear_memories"),
+        ];
+        McpClientManager::apply_tool_whitelist(&mut tools, &config);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["retain", "recall"]);
+    }
+
+    #[test]
+    fn no_whitelist_keeps_all_tools() {
+        let config = mk_config(None);
+        let mut tools = vec![mk_tool("retain"), mk_tool("delete_bank")];
+        McpClientManager::apply_tool_whitelist(&mut tools, &config);
+        assert_eq!(tools.len(), 2);
     }
 }

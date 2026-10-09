@@ -1289,6 +1289,8 @@ fn hindsight_mcp_config(cfg: &crate::config::HindsightConfig) -> McpServerConfig
             Some(cfg.api_key.clone())
         },
         enabled: true,
+        // 只暴露同步层实际调用的 4 个工具，管理类工具不进 LLM 工具表。
+        tool_whitelist: Some(crate::config::HindsightConfig::tool_whitelist()),
     }
 }
 
@@ -1304,8 +1306,6 @@ async fn hindsight_settings_get_handler(State(state): State<Arc<AppState>>) -> J
         "api_key": mask_api_key(&cfg.api_key),
         "api_key_set": !cfg.api_key.is_empty(),
         "bank_id": cfg.bank_id,
-        "auto_sync_write": cfg.auto_sync_write,
-        "auto_sync_read": cfg.auto_sync_read,
         "write_timeout_ms": cfg.write_timeout_ms,
         "read_timeout_ms": cfg.read_timeout_ms,
         "circuit_breaker_threshold": cfg.circuit_breaker_threshold,
@@ -1327,8 +1327,6 @@ async fn hindsight_settings_save_handler(
     let bank_id = body.get("bank_id").and_then(|v| v.as_str())
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
         .unwrap_or_else(|| current.bank_id.clone());
-    let auto_sync_write = body.get("auto_sync_write").and_then(|v| v.as_bool()).unwrap_or(current.auto_sync_write);
-    let auto_sync_read = body.get("auto_sync_read").and_then(|v| v.as_bool()).unwrap_or(current.auto_sync_read);
     // api_key：若前端回传遮蔽值（含 '*'）或空，则沿用已有 key，避免误抹。
     let api_key = match body.get("api_key").and_then(|v| v.as_str()) {
         Some(k) if !k.is_empty() && !k.contains('*') => k.trim().to_string(),
@@ -1340,8 +1338,6 @@ async fn hindsight_settings_save_handler(
         base_url: base_url.clone(),
         api_key: api_key.clone(),
         bank_id: bank_id.clone(),
-        auto_sync_write,
-        auto_sync_read,
         write_timeout_ms: current.write_timeout_ms,
         read_timeout_ms: current.read_timeout_ms,
         circuit_breaker_threshold: current.circuit_breaker_threshold,
@@ -1419,6 +1415,8 @@ async fn hindsight_settings_test_handler(
         url: Some(url),
         auth_token: if api_key.is_empty() { None } else { Some(api_key) },
         enabled: true,
+        // 测试连接与正式配置保持一致：只显示实际会暴露的工具。
+        tool_whitelist: Some(crate::config::HindsightConfig::tool_whitelist()),
     };
     let mut mgr = state.mcp_manager.lock().await;
     mgr.remove_server(test_name).await;
@@ -1470,6 +1468,7 @@ async fn mcp_create_handler(
         url: body["url"].as_str().map(|s| s.to_string()),
         auth_token: body["auth_token"].as_str().map(|s| s.to_string()),
         enabled: body["enabled"].as_bool().unwrap_or(true),
+        tool_whitelist: None,
     };
     let mut mgr = state.mcp_manager.lock().await;
     // Snapshot old MCP tool names before connecting
@@ -2349,8 +2348,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 if is_recall_query(&content) || is_continuation_task(&content) {
 let hint = "[memory] If you need specific past-conversation detail not already obvious from
 the session tail above (e.g. exact version numbers / earlier conclusions), call the read-only
-recall_memory tool with a query and answer directly from its result. Do not re-read source
-archives to restate what recall_memory already returns.";
+recall_memory tool and answer directly from its result. Pass the question itself as 'query',
+written as a natural-language sentence (e.g. 'Did we run a web scan against 112.5.155.133?') —
+never a stack of keywords or synonyms; keyword-stuffed queries match nothing. Do not re-read
+source archives to restate what recall_memory already returns.";
 info!("Injecting recall hint ({} chars)", hint.len());
 history.insert(0, ChatMessage::system(hint));
 }

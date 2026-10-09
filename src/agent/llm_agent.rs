@@ -801,6 +801,7 @@ impl LlmAgent {
     }
 
     /// Resolve the user's default reply language from USER.md (中文 -> Chinese, English -> English).
+    /// Falls back to English when USER.md is missing or carries no language signal.
     fn resolve_default_language(&self) -> String {
         if !self.workspace_dir.is_empty() {
             // 1) An explicit Language line in USER.md wins.
@@ -816,7 +817,10 @@ impl LlmAgent {
                 return "English".to_string();
             }
         }
-        "Chinese".to_string()
+        // Product default is English: a user who writes in Chinese is still
+        // mirrored per-turn by resolve_language_rule, so this fallback only
+        // applies when there is no USER.md and no other language signal.
+        "English".to_string()
     }
 
     /// A gentle, adaptive language instruction: default = USER.md, mirror the

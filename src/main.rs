@@ -423,7 +423,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             url: Some(mcp_url),
             auth_token: Some(hcfg.api_key.clone()),
             enabled: true,
+            // 只暴露同步层实际调用的 4 个工具（写入/召回/作废），其余管理类工具
+            // （bank、mental model、knowledge base 等）不进 LLM 工具表。
+            tool_whitelist: Some(crate::config::HindsightConfig::tool_whitelist()),
         };
+        // 先清理上一轮注册的旧工具名（旧配置/旧版本可能已把全量 36 个工具
+        // 注册进注册表，其中未过白名单的工具需要显式移除，否则会残留）。
+        let stale_names = mcp_manager.tool_names_of("hindsight");
+        if !stale_names.is_empty() {
+            registry.unregister_many(&stale_names);
+        }
         // 若持久化配置里已有同名 server，先移除再连接，避免重复 handle。
         mcp_manager.remove_server("hindsight").await;
         mcp_manager.connect_server(&hs_config).await;

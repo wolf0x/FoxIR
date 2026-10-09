@@ -612,7 +612,7 @@ pub async fn summarize_prior(
         return Ok(String::new());
     }
     let lang = crate::agent::llm_agent::detect_user_language(input);
-    let lang_note = if lang == "zh" {
+    let lang_note = if lang == "Chinese" {
         "用中文回复。"
     } else {
         "Reply in the same language as the content (default English)."

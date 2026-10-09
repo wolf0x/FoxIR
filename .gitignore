@@ -32,6 +32,9 @@ logs/
 .qoder/
 .superpowers/
 
+# Git worktrees (isolated execution sandboxes)
+.worktrees/
+
 # OS
 .DS_Store
 Thumbs.db

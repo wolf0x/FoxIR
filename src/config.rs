@@ -212,10 +212,6 @@ pub struct HindsightConfig {
     pub api_key: String,
     /// 记忆体 bank 标识，默认 `smoke-test`。
     pub bank_id: String,
-    /// 自动同步写入（retain），默认开。
-    pub auto_sync_write: bool,
-    /// 召回融合（recall），默认开。
-    pub auto_sync_read: bool,
     /// 写入超时（毫秒），默认 10000。
     pub write_timeout_ms: u64,
     /// 读取超时（毫秒），默认 8000（远端向量搜索需要足够时间）。
@@ -233,13 +229,24 @@ impl Default for HindsightConfig {
             base_url: "http://localhost:8888".to_string(),
             api_key: String::new(),
             bank_id: "smoke-test".to_string(),
-            auto_sync_write: true,
-            auto_sync_read: true,
             write_timeout_ms: 10000,
             read_timeout_ms: 8000,
             circuit_breaker_threshold: 5,
             circuit_breaker_cooldown_s: 60,
         }
+    }
+}
+
+impl HindsightConfig {
+    /// FoxIR 同步层实际只调用这 4 个工具（写入 / 召回 / 作废 + 作废回退，
+    /// 见 [`crate::hindsight_sync::HindsightSync`]）；mental model、directive、
+    /// bank、knowledge base、operations 等管理类工具不进入 LLM 工具表，
+    /// 避免误调用破坏远端数据。
+    pub fn tool_whitelist() -> Vec<String> {
+        ["retain", "recall", "invalidate_memory", "update_memory"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -530,6 +537,10 @@ pub struct McpServerConfig {
     /// Whether this server is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// 工具白名单（可选）：`Some` 时该 server 只保留列表内的工具。
+    /// 供内部集成（hindsight 同步层）收窄 LLM 暴露面；`None` = 全量注册。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_whitelist: Option<Vec<String>>,
 }
 
 fn default_transport() -> String { "stdio".to_string() }
@@ -895,6 +906,9 @@ impl Config {
                 );
             }
             config.agent.modes.validate_orchestration();
+            // Hindsight api_key 以密文落盘：内存中统一还原为明文（明文配置原样透传）。
+            config.agent.hindsight.api_key =
+                crate::crypto::decrypt(&config.agent.hindsight.api_key);
             Ok(config)
         } else {
             // Backward compatibility: try exe_dir config.toml
@@ -905,7 +919,9 @@ impl Config {
                     let _ = std::fs::copy(&old_config_path, &config_path);
                     let content = std::fs::read_to_string(&config_path)?;
                     // Parse with relaxed deserialization — ignore unknown fields from old format
-                    let config: Config = toml::from_str(&content).unwrap_or_default();
+                    let mut config: Config = toml::from_str(&content).unwrap_or_default();
+                    config.agent.hindsight.api_key =
+                        crate::crypto::decrypt(&config.agent.hindsight.api_key);
                     return Ok(config);
                 }
             }
@@ -1076,7 +1092,14 @@ orchestration = "off"
 
     pub fn save(&self, workspace_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = std::path::Path::new(workspace_dir).join("config.toml");
-        let content = toml::to_string_pretty(self)?;
+        // Hindsight api_key 加密落盘：序列化前包裹 `ENC:`，避免明文进入 config.toml；
+        // `self` 始终保持明文，已加密值原样写出（幂等，不会双重加壳）。
+        let mut to_persist = self.clone();
+        let key = to_persist.agent.hindsight.api_key.clone();
+        if !key.is_empty() && !crate::crypto::is_encrypted(&key) {
+            to_persist.agent.hindsight.api_key = crate::crypto::encrypt(&key);
+        }
+        let content = toml::to_string_pretty(&to_persist)?;
         std::fs::write(&config_path, content)?;
         tracing::info!("Saved config.toml to workspace: {}", config_path.display());
         Ok(())
@@ -1187,6 +1210,7 @@ orchestration = "off"
     ///
     /// 与 `set_builtin_tool_switch` 一致：load 失败直接向上报错，不用
     /// `unwrap_or_default()` 接走 —— 否则会把用户配好的 provider / 权限段整体抹平。
+    /// `api_key` 由 [`Config::save`] 统一加密（`ENC:` 前缀）后落盘。
     pub fn save_hindsight_settings(
         workspace_dir: &str,
         cfg: &HindsightConfig,
