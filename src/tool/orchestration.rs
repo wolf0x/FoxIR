@@ -1,6 +1,6 @@
 //! Orchestration tools (SDD v1.5 \u00a77.3 / Step 2a).
 //!
-//! These 7 tools hand the manager agent real sub-agent control: spawn a read-only
+//! These 8 tools hand the manager agent real sub-agent control: spawn a read-only
 //! worker, wait for/collect its result, list/cancel children, persist the shared
 //! plan, and read a worker's log. They resolve the current run's [`Orchestrator`]
 //! from the process-global registry keyed by the root invocation id. Workers have
@@ -12,13 +12,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolRegistry};
+use super::{TimeoutStage, Tool, ToolRegistry};
 use crate::agent::orchestration::get_orchestrator;
 use crate::context::{SubAgentSpec, ToolContext};
 use crate::error::{AgentError, AgentResult};
 
-/// The seven orchestration tool names (must match `ALL_ORCH` in llm_agent.rs).
-pub const ORCH_TOOL_NAMES: [&str; 7] = [
+/// The eight orchestration tool names (must match `ALL_ORCH` in llm_agent.rs).
+pub const ORCH_TOOL_NAMES: [&str; 8] = [
     "spawn_subagent",
     "wait_subagent",
     "list_subagents",
@@ -26,6 +26,7 @@ pub const ORCH_TOOL_NAMES: [&str; 7] = [
     "get_subagent_result",
     "update_plan",
     "read_subagent_log",
+    "wait_all_subagents",
 ];
 
 /// Register all orchestration tools.
@@ -37,6 +38,7 @@ pub fn register_orchestration_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GetSubagentResultTool));
     registry.register(Arc::new(UpdatePlanTool));
     registry.register(Arc::new(ReadSubagentLogTool));
+    registry.register(Arc::new(WaitAllSubagentsTool));
 }
 
 /// Execution-time double gate (SDD v1.5 §7.3): every orchestration tool must
@@ -62,7 +64,7 @@ pub struct SpawnSubagentTool;
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str { "spawn_subagent" }
     fn description(&self) -> &str {
-        "Spawn a read-only worker sub-agent that runs a delegated task in its own session and returns a structured SubAgentResult. Call with {role, prompt, [tools_allowlist], [allow_write], [allow_exec], [model], [max_iterations], [timeout]}. Then wait_subagent for the result."
+        "派遣一个子 Agent（fire-and-forget，返回 run_id）。复杂多目标任务：一轮内连续多次调用派遣多个【只读】worker（每个 role 必须唯一），随后用 wait_all_subagents 一次收齐。写/执行需 allow_write/allow_exec 并单独授权，且串行执行。"
     }
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {
@@ -107,12 +109,48 @@ impl Tool for WaitSubagentTool {
     fn name(&self) -> &str { "wait_subagent" }
     fn description(&self) -> &str { "Block until a previously spawned sub-agent reaches a terminal state and return its full SubAgentResult. Args: {run_id}." }
     fn parameters_schema(&self) -> Value { json!({ "type": "object", "properties": { "run_id": { "type": "string" } }, "required": ["run_id"] }) }
+    fn timeout_stage(&self) -> TimeoutStage {
+        // 等待子代理回收：worker 默认存活上限 300s；看门狗档静默容忍 600s > 300s，
+        // 且无硬墙钟，避免等待被主循环工具级超时/静默看门狗掐断。
+        TimeoutStage::Watchdog
+    }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         gate(ctx)?;
         let o = orch(ctx)?;
         let run_id = args.get("run_id").and_then(|v| v.as_str()).ok_or_else(|| AgentError::agent("wait_subagent: missing run_id"))?;
         let r = o.wait(run_id).await?;
         Ok(serde_json::to_value(r).unwrap_or(json!({})))
+    }
+}
+
+pub struct WaitAllSubagentsTool;
+#[async_trait]
+impl Tool for WaitAllSubagentsTool {
+    fn name(&self) -> &str { "wait_all_subagents" }
+    fn description(&self) -> &str {
+        "并发等待多个已派遣子代理到达终态，一次性返回全部 SubAgentResult。Args: {run_ids: [string]}."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type":"object","properties":{
+            "run_ids": { "type":"array", "items": { "type":"string" } } },"required":["run_ids"] })
+    }
+    fn timeout_stage(&self) -> TimeoutStage {
+        // 与 wait_subagent 同档：看门狗（无硬墙钟 + 600s 静默容忍），
+        // 避免多路并发等待被主循环工具级超时掐断。
+        TimeoutStage::Watchdog
+    }
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
+        gate(ctx)?;
+        let o = orch(ctx)?;
+        let ids: Vec<String> = args.get("run_ids").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let results = o.wait_many(&ids).await;
+        let arr: Vec<Value> = results.into_iter().map(|r| match r {
+            Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+            Err(e) => json!({ "error": e.to_string() }),
+        }).collect();
+        Ok(json!({ "results": arr }))
     }
 }
 
@@ -247,5 +285,29 @@ mod tests {
         assert!(!spec.allow_write);
         assert!(!spec.allow_exec);
         assert!(spec.skills.is_empty());
+    }
+
+    /// wait_subagent 必须走看门狗超时档：无硬墙钟（timeout_secs()==None），
+    /// 静默容忍 600s，避免常态并行下等待被主循环工具级/静默看门狗掐断。
+    #[test]
+    fn wait_subagent_uses_watchdog_timeout_stage() {
+        assert_eq!(WaitSubagentTool.timeout_stage(), TimeoutStage::Watchdog);
+        assert!(WaitSubagentTool.timeout_secs().is_none(), "看门狗档无硬墙钟");
+    }
+
+    /// wait_all_subagents 必须完成三处登记：工具本身、ORCH_TOOL_NAMES、ALL_ORCH，
+    /// 且注册表随名单动态增长到 8。
+    #[test]
+    fn wait_all_is_registered_and_delivered() {
+        use crate::tool::{Tool, TimeoutStage};
+        use crate::agent::llm_agent::ALL_ORCH;
+        assert_eq!(WaitAllSubagentsTool.name(), "wait_all_subagents");
+        assert!(ORCH_TOOL_NAMES.contains(&"wait_all_subagents"));
+        assert!(ALL_ORCH.contains(&"wait_all_subagents"));
+        assert_eq!(WaitAllSubagentsTool.timeout_stage(), TimeoutStage::Watchdog);
+        // 注册表随 ORCH_TOOL_NAMES 动态增长：注册后数量应等于名单长度
+        let mut reg = crate::tool::ToolRegistry::new();
+        register_orchestration_tools(&mut reg);
+        assert_eq!(reg.len(), ORCH_TOOL_NAMES.len());
     }
 }

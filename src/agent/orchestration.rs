@@ -195,6 +195,11 @@ pub struct Orchestrator {
     children: Arc<Mutex<HashMap<String, SubAgentHandle>>>,
     /// Registration channel to the EventPump (bounded, cap = max_concurrent*2).
     reg_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::mpsc::Receiver<AgentEvent>>>,
+    /// 待懒起的事件泵注册接收端；首次发射时 take 出并 spawn。构造后、发射前持有。
+    pending_reg_rx: std::sync::Arc<std::sync::Mutex<Option<
+        tokio::sync::mpsc::Receiver<tokio::sync::mpsc::Receiver<AgentEvent>>>>>,
+    /// 事件泵是否已懒起（并发安全，仅一个调用者能 take 到 rx）。
+    pump_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-run token budgets (SDD §7.7), keyed by run_id.
     budgets: Arc<Mutex<HashMap<String, BudgetSnapshot>>>,
     /// Serial gate for write/exec workers (SDD v1.5 §7.10 / §7.11 layer 2):
@@ -219,8 +224,10 @@ impl Orchestrator {
         max_depth: u8,
         parent_tx: Option<tokio::sync::mpsc::Sender<AgentResult<AgentEvent>>>,
     ) -> Self {
-        // SDD §7.4.2: start a single EventPump that drains every worker's own
-        // event channel (bounded by WORKER_CHANNEL_CAP) so workers never block.
+        // SDD §7.4.2: the EventPump drains every worker's own event channel
+        // (bounded by WORKER_CHANNEL_CAP) so workers never block. 泵不再在构造时
+        // 立即 spawn，而是改为首次发射时懒起（见 ensure_event_pump），以守住
+        // “无常驻后台任务”：构造但未发射的编排器不会挂着一个空闲泵任务。
         // Worker raw fragments are NOT forwarded to the parent stream (see
         // event_pump module docs — typed subagent_* events carry the milestones).
         // The registration channel is *bounded* (cap = max_concurrent*2) so the
@@ -229,15 +236,14 @@ impl Orchestrator {
         // spawn-time P4 authorization gate can emit its own `permission_request`
         // event back to the client.
         let event_tx = parent_tx.clone();
-        let reg_tx = if parent_tx.is_some() {
+        // 构造时仅建好注册通道并把接收端存入 pending_reg_rx，不 spawn 泵。
+        let (reg_tx, pending_reg_rx) = if parent_tx.is_some() {
             let cap = env.max_concurrent_subagents.max(1) * 2;
-            let (reg_tx, reg_rx) = tokio::sync::mpsc::channel::<
-                tokio::sync::mpsc::Receiver<AgentEvent>
-            >(cap);
-            tokio::spawn(EventPump::new(reg_rx).run());
-            Some(reg_tx)
+            let (tx, rx) = tokio::sync::mpsc::channel::<
+                tokio::sync::mpsc::Receiver<AgentEvent>>(cap);
+            (Some(tx), std::sync::Arc::new(std::sync::Mutex::new(Some(rx))))
         } else {
-            None
+            (None, std::sync::Arc::new(std::sync::Mutex::new(None)))
         };
         Self {
             env,
@@ -249,9 +255,22 @@ impl Orchestrator {
             plan_persist: None,
             children: Arc::new(Mutex::new(HashMap::new())),
             reg_tx,
+            pending_reg_rx,
+            pump_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             budgets: Arc::new(Mutex::new(HashMap::new())),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             event_tx,
+        }
+    }
+
+    /// 首次发射时懒起事件泵；并发安全（仅一个调用者 take 到 rx）。
+    /// 已在 spawn 内同步调用，故 `spawn().await` 返回即保证 `pump_started==true`。
+    fn ensure_event_pump(&self) {
+        if self.pump_started.load(std::sync::atomic::Ordering::SeqCst) { return; }
+        let rx = self.pending_reg_rx.lock().unwrap().take();
+        if let Some(rx) = rx {
+            tokio::spawn(EventPump::new(rx).run());
+            self.pump_started.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -459,6 +478,21 @@ impl Orchestrator {
         if let Some(existing) = self.try_reuse(&spec.role) {
             return Ok(existing);
         }
+        // 角色唯一（D-E / F7）：同一运行内已有非终值(Pending/Running)的同名 role 时，
+        // 拒绝再次发射，避免并行扇出下的聚合审计歧义与 try_reuse 误命中。
+        // 终值同名不在此列——上面 try_reuse 已优先复用。
+        {
+            let map = self.children.lock().unwrap();
+            if map.values().any(|h| h.role == spec.role && {
+                let s = h.status.lock().unwrap();
+                matches!(*s, SubAgentStatus::Pending | SubAgentStatus::Running)
+            }) {
+                return Err(AgentError::agent(format!(
+                    "spawn_subagent: duplicate role '{}'; use a unique role per worker",
+                    spec.role
+                )));
+            }
+        }
         // Enforce the per-orchestrator concurrency ceiling (P2): cap how many
         // workers may run at once so a single round can't spawn unbounded LLM
         // workers (cost / DoS guard). A reused role consumes no new slot.
@@ -586,6 +620,9 @@ impl Orchestrator {
         // so nothing borrowed escapes into the 'static spawned task.
         // Give the worker its own event channel and register it on the EventPump
         // (bounded reg channel => register hop carries backpressure, §7.4.2 delta).
+        // 首次发射懒起事件泵（必须在 `reg.send(rx).await` 之前，否则 bounded
+        // 注册通道无接收方会阻塞）。
+        self.ensure_event_pump();
         let (worker_tx, worker_rx) = if self.reg_tx.is_some() {
             let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(WORKER_CHANNEL_CAP);
             (Some(tx), Some(rx))
@@ -688,6 +725,13 @@ impl Orchestrator {
             map.get(run_id).and_then(|h| h.result.lock().unwrap().clone())
         };
         result.ok_or_else(|| AgentError::agent(format!("sub-agent {run_id} produced no result")))
+    }
+
+    /// 并发收敛多个子代理终值。复用单 wait 的「先查终值、否则订阅完成通知」，
+    /// 故对已完成/后到者均不丢通知；join_all 让多路等待真正并发。
+    pub async fn wait_many(&self, run_ids: &[String]) -> Vec<AgentResult<SubAgentResult>> {
+        let futs = run_ids.iter().map(|rid| self.wait(rid));
+        futures::future::join_all(futs).await
     }
 
     /// Non-blocking current status of a worker.
@@ -987,3 +1031,146 @@ pub(crate) fn unregister_orchestrator(root_invocation_id: &str) {
 /// Convenience: the parameter-free builder for a worker agent. (Re-exported so
 /// tools can share a single import surface.)
 pub use crate::agent::llm_agent::LlmAgentBuilder;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use crate::agent::{AgentEvent, AgentResult};
+    use crate::context::SubAgentSpec;
+    use crate::model::openai::OpenAiProvider;
+    use crate::permission::{PermissionResolver, default_permissions};
+    use crate::tool::ToolRegistry;
+
+    /// 只读子 Agent spec 工厂：read-only、空工具白名单、单轮、极短超时。
+    /// 供本 Task 及后续 Task 的编排测试复用（对齐 phase0 `Bench::spec`）。
+    fn read_only_spec(role: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            role: role.into(),
+            prompt: format!("probe {role}"),
+            system_prompt: None,
+            tools_allowlist: Vec::new(),
+            allow_write: false,
+            allow_exec: false,
+            model: Some("mock".into()),
+            timeout: Some(1),
+            max_tokens: None,
+            max_iterations: Some(1),
+            skills: Vec::new(),
+        }
+    }
+
+    /// 构造一个带 `parent_tx`（事件泵通道已就绪但尚未起）的最小根编排器。
+    /// provider 用空 models：`spawn` 只同步建 worker/注册通道，provider 调用发生在
+    /// 独立 tokio 任务里异步失败，不影响主线程对 `pump_started` 的断言。
+    /// 返回 `(Arc<Orchestrator>, Receiver<...>)`：把父端 Receiver 一并交回，调用方须
+    /// 让其存活于整个测试作用域（保持通道打开），否则 `emit` 与 worker 事件会因父
+    /// Receiver 已 drop 而静默失败。对齐 `phase0_acceptance::make_orch` 的 `OrchPair` 写法。
+    fn make_test_orchestrator(
+    ) -> (
+        Arc<Orchestrator>,
+        tokio::sync::mpsc::Receiver<AgentResult<AgentEvent>>,
+    ) {
+        let (_resolver, pending) = PermissionResolver::new();
+        let env = OrchestratorEnv {
+            provider: Arc::new(OpenAiProvider::new(vec![])),
+            tools: Arc::new(tokio::sync::RwLock::new(ToolRegistry::new())),
+            working_dir: ".".into(),
+            workspace_dir: ".".into(),
+            model_configs: vec![],
+            max_iterations: 1,
+            parallel_ir_tools: false,
+            user_given_name: "tester".into(),
+            two_tier_memory: false,
+            sop_replay: Arc::new(AtomicBool::new(false)),
+            linux_ir_tools: Arc::new(AtomicBool::new(false)),
+            win_ir_full_load: Arc::new(AtomicBool::new(false)),
+            browser_enabled: Arc::new(AtomicBool::new(false)),
+            parent_model: "mock".into(),
+            permissions: Arc::new(tokio::sync::Mutex::new(default_permissions())),
+            permission_pending: pending,
+            preauth_profile: None,
+            context_window: 128000,
+            enable_context_scaling: false,
+            max_inline_chars: 120000,
+            tool_timeout_secs: 1,
+            max_tool_retries: 0,
+            max_concurrent_subagents: 8,
+            default_timeout_secs: 1,
+            memory_store: None,
+        };
+        // parent_tx 必须为 Some 才会创建事件泵注册通道；父端 Receiver 交回调用方保活。
+        let (parent_tx, parent_rx) =
+            tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(256);
+        let orch = Arc::new(Orchestrator::new(
+            env,
+            "root".into(),
+            "sess".into(),
+            Arc::new(AtomicBool::new(false)),
+            DEFAULT_MAX_DEPTH,
+            Some(parent_tx),
+        ));
+        (orch, parent_rx)
+    }
+
+    #[tokio::test]
+    async fn event_pump_is_lazy_started_on_first_spawn() {
+        // 构造一个 parent_tx=Some 的根编排器：new() 后泵不得已起。
+        // _rx 须在整个测试作用域存活，保持父通道打开（否则 emit/worker 事件会静默丢失）。
+        let (orch, _rx) = make_test_orchestrator();
+        assert!(!orch.pump_started.load(std::sync::atomic::Ordering::SeqCst),
+            "构造编排器不得立即起事件泵");
+        // 首次 spawn 后（ensure_event_pump 在 spawn 内同步调用），泵应已起
+        let spec = read_only_spec("probe");
+        let _rid = orch.spawn(&spec, 0, "inv-root", "sess-root", "author").await.unwrap();
+        assert!(orch.pump_started.load(std::sync::atomic::Ordering::SeqCst),
+            "首次发射必须懒起事件泵");
+    }
+
+    #[tokio::test]
+    async fn wait_many_collects_all_terminal_results_in_order() {
+        let (orch, _rx) = make_test_orchestrator();
+        let mk = |rid: &str, role: &str| SubAgentResult {
+            run_id: rid.into(), role: role.into(), summary: "s".into(),
+            confidence: Confidence::Low, token_usage: 0, evidence_refs: vec![],
+            artifact_refs: vec![], case_ref: None, proposed_writes: vec![],
+            status: SubAgentStatus::Ok,
+        };
+        // 直插两个已终值 handle（不经 spawn，避免依赖 provider）
+        for (rid, role) in [("r1", "a"), ("r2", "b")] {
+            let h = SubAgentHandle::new(rid.into(), read_only_spec(role));
+            *h.result.lock().unwrap() = Some(mk(rid, role));
+            *h.status.lock().unwrap() = SubAgentStatus::Ok;
+            orch.children.lock().unwrap().insert(rid.into(), h);
+        }
+        let res = orch.wait_many(&["r1".to_string(), "r2".to_string()]).await;
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].as_ref().unwrap().role, "a", "顺序须与入参一致");
+        assert_eq!(res[1].as_ref().unwrap().role, "b");
+        // 空输入 → 空输出
+        assert!(orch.wait_many(&[] as &[String]).await.is_empty());
+        // 未知 run_id → 该项 Err（wait 返回 not_found），不 panic、不永久挂起
+        let miss = orch.wait_many(&["nope".to_string()]).await;
+        assert_eq!(miss.len(), 1);
+        assert!(miss[0].is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_duplicate_nonterminal_role() {
+        use crate::context::SubAgentStatus;
+        let (orch, _rx) = make_test_orchestrator();
+        // 直插一个「在飞(Running)、result=None」的同 role 合成句柄，确保 try_reuse 不命中、
+        // 从而走「非终值同名拒绝」分支（不依赖任何真 worker 的执行/失败时序）。
+        let spec = read_only_spec("same-role");
+        let busy = SubAgentHandle::new("busy-run".to_string(), spec.clone());
+        *busy.status.lock().unwrap() = SubAgentStatus::Running;
+        orch.children.lock().unwrap().insert("busy-run".to_string(), busy);
+        // 再次以同名 role 发射 → 必须被拒（而非并行派遣或误复用）。
+        let err = orch.spawn(&read_only_spec("same-role"), 0, "inv", "s", "au").await
+            .expect_err("非终值重名角色必须被拒");
+        assert!(err.to_string().contains("duplicate role"), "错误须含 'duplicate role'，实际：{err}");
+        // 异名 role 不受影响（对照，证明校验按 role 精确匹配）。
+        assert!(orch.spawn(&read_only_spec("other-role"), 0, "inv", "s", "au").await.is_ok());
+    }
+}
