@@ -16,16 +16,47 @@ use super::Tool;
 use crate::context::ToolContext;
 use crate::deep_memory::{self, DeepFact, FactType, MemoryScope, PinnedBy};
 use crate::error::AgentResult;
+use crate::hindsight_sync::HindsightSync;
 use crate::memory::MemoryStore;
 
 /// Tool for managing the Deep permanent-memory tier (SQLite `deep_facts`).
 pub struct DeepMemoryTool {
     memory_store: Arc<MemoryStore>,
+    /// Task #20：可选的 Hindsight 写同步器。为 None 时行为与本地一致。
+    hindsight_sync: Option<Arc<HindsightSync>>,
 }
 
 impl DeepMemoryTool {
-    pub fn new(memory_store: Arc<MemoryStore>) -> Self {
-        Self { memory_store }
+    pub fn new(memory_store: Arc<MemoryStore>, hindsight_sync: Option<Arc<HindsightSync>>) -> Self {
+        Self { memory_store, hindsight_sync }
+    }
+
+    /// Task #20：写同步——在 deep_store 成功后异步 retain 到 Hindsight（尽力而为）。
+    fn spawn_sync(&self, fact: &DeepFact) {
+        if let Some(sync) = &self.hindsight_sync {
+            let sync = sync.clone();
+            let mem = self.memory_store.clone();
+            let fid = fact.id.clone();
+            let body = fact.content.clone();
+            let subj = fact.subject_key.clone();
+            let mut tags = fact.tags.clone();
+            tags.push(fact.fact_type.as_str().to_string());
+            tokio::spawn(async move {
+                sync.sync_fact(&mem, &fid, &body, subj.as_deref(), &tags).await;
+            });
+        }
+    }
+
+    /// Task #20：遗忘同步——在 deep_forget 后作废对应远端记忆并清理映射。
+    fn spawn_forget(&self, id: &str) {
+        if let Some(sync) = &self.hindsight_sync {
+            let sync = sync.clone();
+            let mem = self.memory_store.clone();
+            let fid = id.to_string();
+            tokio::spawn(async move {
+                sync.forget_fact(&mem, &fid).await;
+            });
+        }
     }
 
     fn now() -> u64 {
@@ -174,6 +205,7 @@ impl Tool for DeepMemoryTool {
                     archived: false, loaded: 0, referenced: 0,
                 };
                 self.memory_store.deep_store(&fact)?;
+                self.spawn_sync(&fact);
                 Ok(json!({
                     "success": true,
                     "action": "remember",
@@ -196,6 +228,7 @@ impl Tool for DeepMemoryTool {
                 if let Some(e) = args["essence"].as_str() { if !e.is_empty() { fact.essence = e.to_string(); } }
                 fact.last_accessed = now;
                 self.memory_store.deep_store(&fact)?;
+                self.spawn_sync(&fact);
                 Ok(json!({
                     "success": true,
                     "action": "update",
@@ -208,6 +241,9 @@ impl Tool for DeepMemoryTool {
                 let id = args["id"].as_str().map(String::from);
                 if let Some(id) = id {
                     let hit = self.memory_store.deep_forget(&id)?;
+                    if hit {
+                        self.spawn_forget(&id);
+                    }
                     return Ok(json!({ "success": true, "action": "forget", "deleted": hit, "id": id }));
                 }
                 // Fallback: match by query across visible facts.
@@ -220,6 +256,9 @@ impl Tool for DeepMemoryTool {
                 match best {
                     Some(f) => {
                         let hit = self.memory_store.deep_forget(&f.id)?;
+                        if hit {
+                            self.spawn_forget(&f.id);
+                        }
                         Ok(json!({ "success": true, "action": "forget", "deleted": hit, "id": f.id, "content": f.content }))
                     }
                     None => Ok(json!({ "success": true, "action": "forget", "deleted": false, "message": "No matching fact" })),

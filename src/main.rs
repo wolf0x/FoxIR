@@ -405,6 +405,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Registered {} MCP tool(s) total", mcp_tools.len());
     }
 
+    // ── Task #20：Hindsight 远端记忆体自动注册 + 同步器初始化 ──
+    // 若 hindsight 已启用且 api_key 非空，自动注册（或更新）名为 "hindsight"
+    // 的 SSE MCP server，并把其暴露的工具并入注册表。
+    if config.agent.hindsight.enabled && !config.agent.hindsight.api_key.is_empty() {
+        let hcfg = &config.agent.hindsight;
+        let mcp_url = format!(
+            "{}/mcp/{}/",
+            hcfg.base_url.trim_end_matches('/'),
+            hcfg.bank_id
+        );
+        let hs_config = crate::config::McpServerConfig {
+            name: "hindsight".to_string(),
+            transport: "sse".to_string(),
+            command: None,
+            args: vec![],
+            url: Some(mcp_url),
+            auth_token: Some(hcfg.api_key.clone()),
+            enabled: true,
+        };
+        // 若持久化配置里已有同名 server，先移除再连接，避免重复 handle。
+        mcp_manager.remove_server("hindsight").await;
+        mcp_manager.connect_server(&hs_config).await;
+        mcp_manager.save_configs();
+        for tool in mcp_manager.get_tools() {
+            registry.register(tool.clone());
+        }
+        if mcp_manager.is_server_connected("hindsight") {
+            info!("Hindsight MCP server auto-registered and connected");
+        } else {
+            tracing::warn!("Hindsight configured but MCP server not connected (check base_url/api_key)");
+        }
+    }
+
+    // 将 MCP 管理器包成共享 Arc，并据此构建 Hindsight 同步器（供 AppState 与工具复用）。
+    let mcp_manager = Arc::new(Mutex::new(mcp_manager));
+    let hindsight_sync = Arc::new(crate::hindsight_sync::HindsightSync::new(
+        mcp_manager.clone(),
+        config.agent.hindsight.clone(),
+    ));
+
     // Load skills (resolve skills dir from workspace)
     let skills_dir = std::path::Path::new(&workspace_dir).join("skills");
     crate::skill::metrics::init(skills_dir.join(".metrics.json"));
@@ -676,8 +716,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !two_tier_memory.load(std::sync::atomic::Ordering::SeqCst) {
             reg.register(Arc::new(crate::tool::memory_md::MemoryMdTool::new(workspace_dir.clone())));
         }
-reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone())));
-reg.register(Arc::new(crate::tool::recall_memory::RecallMemoryTool::new(memory_store.clone())));
+reg.register(Arc::new(crate::tool::deep_memory::DeepMemoryTool::new(memory_store.clone(), Some(hindsight_sync.clone()))));
+reg.register(Arc::new(crate::tool::recall_memory::RecallMemoryTool::new(memory_store.clone(), Some(hindsight_sync.clone()))));
 reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::evidence::EvidenceTool::new(workspace_dir.clone())));
         reg.register(Arc::new(crate::tool::knowledge_search::KnowledgeSearchTool::new(workspace_dir.clone())));
@@ -722,7 +762,7 @@ reg.register(Arc::new(crate::tool::todo_update::TodoUpdateTool::new(workspace_di
     let state = Arc::new(AppState {
         runner: runner.clone(),
         skill_manager,
-        mcp_manager: Arc::new(Mutex::new(mcp_manager)),
+        mcp_manager: mcp_manager.clone(),
         tools: shared_tools,
         logger,
         memory_store,
@@ -782,6 +822,7 @@ expert_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         fallback_model: Arc::new(std::sync::RwLock::new(config.agent.fallback_model.clone())),
         expert_role_models: Arc::new(std::sync::RwLock::new(config.agent.expert_role_models.clone())),
         timezone_offset: Arc::new(std::sync::RwLock::new(config.agent.timezone_offset)),
+        hindsight_sync: hindsight_sync.clone(),
     });
 
     // Create router and start server

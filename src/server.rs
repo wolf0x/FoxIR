@@ -297,6 +297,9 @@ pub struct AppState {
     pub expert_role_models: Arc<std::sync::RwLock<crate::config::RoleModelsConfig>>,
     /// Timezone offset in hours (from config.toml) — RwLock for hot-reload from UI
     pub timezone_offset: Arc<std::sync::RwLock<i8>>,
+    /// Hindsight 远端记忆体同步器（Task #20）：写同步 retain / 读融合 recall。
+    /// 与 `mcp_manager` 共享同一份 MCP 连接，配置可经 Settings 热更新。
+    pub hindsight_sync: Arc<crate::hindsight_sync::HindsightSync>,
 }
 
 impl AppState {
@@ -425,6 +428,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/mcp/{name}", delete(mcp_delete_handler))
         .route("/api/mcp/{name}/toggle", post(mcp_toggle_handler))
         .route("/api/mcp/{name}/restart", post(mcp_restart_handler))
+        .route("/api/settings/hindsight", get(hindsight_settings_get_handler))
+        .route("/api/settings/hindsight", post(hindsight_settings_save_handler))
+        .route("/api/settings/hindsight/test", post(hindsight_settings_test_handler))
         .route("/api/logs", get(logs_handler))
         .route("/api/logs/dates", get(log_dates_handler))
         .route("/api/managed/reset", post(managed_reset_handler))
@@ -1248,6 +1254,192 @@ async fn skills_install_path_handler(State(state): State<Arc<AppState>>, Json(bo
 async fn mcp_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mgr = state.mcp_manager.lock().await;
     Json(json!({ "servers": mgr.server_info() }))
+}
+
+/// 遮蔽 api_key：仅保留前 4 后 4 位（短于 8 位全遮）。
+fn mask_api_key(key: &str) -> String {
+    let n = key.chars().count();
+    if key.is_empty() {
+        return String::new();
+    }
+    if n <= 8 {
+        return "*".repeat(n);
+    }
+    let head: String = key.chars().take(4).collect();
+    let tail: String = key.chars().skip(n - 4).collect();
+    format!("{}****{}", head, tail)
+}
+
+/// 根据 Hindsight 配置构造名为 "hindsight" 的 SSE MCP server 配置。
+fn hindsight_mcp_config(cfg: &crate::config::HindsightConfig) -> McpServerConfig {
+    let url = format!(
+        "{}/mcp/{}/",
+        cfg.base_url.trim_end_matches('/'),
+        cfg.bank_id
+    );
+    McpServerConfig {
+        name: "hindsight".to_string(),
+        transport: "sse".to_string(),
+        command: None,
+        args: vec![],
+        url: Some(url),
+        auth_token: if cfg.api_key.is_empty() {
+            None
+        } else {
+            Some(cfg.api_key.clone())
+        },
+        enabled: true,
+    }
+}
+
+async fn hindsight_settings_get_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let cfg = state.hindsight_sync.get_config().await;
+    let connected = {
+        let mgr = state.mcp_manager.lock().await;
+        mgr.is_server_connected("hindsight")
+    };
+    Json(json!({
+        "enabled": cfg.enabled,
+        "base_url": cfg.base_url,
+        "api_key": mask_api_key(&cfg.api_key),
+        "api_key_set": !cfg.api_key.is_empty(),
+        "bank_id": cfg.bank_id,
+        "auto_sync_write": cfg.auto_sync_write,
+        "auto_sync_read": cfg.auto_sync_read,
+        "write_timeout_ms": cfg.write_timeout_ms,
+        "read_timeout_ms": cfg.read_timeout_ms,
+        "circuit_breaker_threshold": cfg.circuit_breaker_threshold,
+        "circuit_breaker_cooldown_s": cfg.circuit_breaker_cooldown_s,
+        "connected": connected,
+    }))
+}
+
+async fn hindsight_settings_save_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // 以当前配置为基线（保留未在 body 中出现的超时/熔断参数）。
+    let current = state.hindsight_sync.get_config().await;
+
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(current.enabled);
+    let base_url = body.get("base_url").and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string()).unwrap_or_else(|| current.base_url.clone());
+    let bank_id = body.get("bank_id").and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        .unwrap_or_else(|| current.bank_id.clone());
+    let auto_sync_write = body.get("auto_sync_write").and_then(|v| v.as_bool()).unwrap_or(current.auto_sync_write);
+    let auto_sync_read = body.get("auto_sync_read").and_then(|v| v.as_bool()).unwrap_or(current.auto_sync_read);
+    // api_key：若前端回传遮蔽值（含 '*'）或空，则沿用已有 key，避免误抹。
+    let api_key = match body.get("api_key").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() && !k.contains('*') => k.trim().to_string(),
+        _ => current.api_key.clone(),
+    };
+
+    let new_cfg = crate::config::HindsightConfig {
+        enabled,
+        base_url: base_url.clone(),
+        api_key: api_key.clone(),
+        bank_id: bank_id.clone(),
+        auto_sync_write,
+        auto_sync_read,
+        write_timeout_ms: current.write_timeout_ms,
+        read_timeout_ms: current.read_timeout_ms,
+        circuit_breaker_threshold: current.circuit_breaker_threshold,
+        circuit_breaker_cooldown_s: current.circuit_breaker_cooldown_s,
+    };
+
+    // 热更新同步器配置。
+    state.hindsight_sync.update_config(new_cfg.clone()).await;
+
+    // 注册/更新或移除 MCP server，并同步工具注册表。
+    let mut mgr = state.mcp_manager.lock().await;
+    let old_names = mgr.tool_names();
+    if enabled && !api_key.is_empty() && !base_url.is_empty() {
+        // 已存在同名 → 先 remove 再 connect（避免重复 handle）。
+        mgr.remove_server("hindsight").await;
+        let hs_cfg = hindsight_mcp_config(&new_cfg);
+        mgr.connect_server(&hs_cfg).await;
+        mgr.save_configs();
+    } else {
+        // 未启用：断开并移除 "hindsight" MCP server。
+        if mgr.remove_server("hindsight").await {
+            mgr.save_configs();
+        }
+    }
+    let mcp_tools = mgr.get_tools();
+    let connected = mgr.is_server_connected("hindsight");
+    drop(mgr);
+    {
+        let mut registry = state.tools.write().await;
+        registry.unregister_many(&old_names);
+        for tool in &mcp_tools {
+            registry.register(tool.clone());
+        }
+    }
+
+    // 持久化到 config.toml。
+    let persist_ok = match crate::config::Config::save_hindsight_settings(&state.workspace_dir, &new_cfg) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Failed to persist hindsight settings: {}", e);
+            false
+        }
+    };
+
+    Json(json!({ "success": true, "persisted": persist_ok, "connected": connected }))
+}
+
+async fn hindsight_settings_test_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let base_url = body.get("base_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let bank_id = body.get("bank_id").and_then(|v| v.as_str()).unwrap_or("smoke-test").trim().to_string();
+    if base_url.is_empty() {
+        return Json(json!({ "success": false, "error": "Missing base_url", "tools": [] }));
+    }
+    // 临时探测名，不干扰已活跃的 "hindsight" 连接。
+    let test_name = "__hindsight_test__";
+    let url = format!("{}/mcp/{}/", base_url.trim_end_matches('/'), bank_id);
+    let cfg = McpServerConfig {
+        name: test_name.to_string(),
+        transport: "sse".to_string(),
+        command: None,
+        args: vec![],
+        url: Some(url),
+        auth_token: if api_key.is_empty() { None } else { Some(api_key) },
+        enabled: true,
+    };
+    let mut mgr = state.mcp_manager.lock().await;
+    mgr.remove_server(test_name).await;
+    mgr.connect_server(&cfg).await;
+    let connected = mgr.is_server_connected(test_name);
+    // 从 server_info 中取出该临时 server 的工具名。
+    let tools: Vec<String> = mgr
+        .server_info()
+        .into_iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(test_name))
+        .and_then(|s| s.get("tools").cloned())
+        .and_then(|t| t.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    mgr.remove_server(test_name).await;
+    drop(mgr);
+
+    if connected {
+        Json(json!({ "success": true, "tools": tools }))
+    } else {
+        Json(json!({
+            "success": false,
+            "error": "Failed to connect to Hindsight MCP endpoint",
+            "tools": tools,
+        }))
+    }
 }
 
 async fn mcp_create_handler(
@@ -2161,16 +2353,35 @@ history.insert(0, ChatMessage::system(hint));
 // 记忆 KPI 追踪：(fact_id, 注入行) — 传入 drain，在回复落地后统计 loaded/referenced。
 let mut eg_injected: Vec<(String, String)> = Vec::new();
 if state.two_tier_memory.load(Ordering::SeqCst) {
+    // Task #20 读融合：本地深层永久块与 Hindsight 远端 recall 并行。
+    // recall 走独立 task（真并行），本地块同步计算，随后合并注入。
+    let sync = state.hindsight_sync.clone();
+    let recall_query = content.clone();
+    let recall_handle = tokio::spawn(async move { sync.recall(&recall_query, 512).await });
     let (eg_block, _eg_tok, eg_ids, rel_ids) =
         state.memory_store.deep_permanent_block("global", &content, 1024, 60.0);
-    if !eg_block.trim().is_empty() {
-        info!("Injected deep permanent block ({} chars)", eg_block.len());
+    let remote_items = recall_handle.await.unwrap_or_default();
+
+    // 远端结果拼接到本地块之后；eg_injected 仅统计本地行（KPI 不受影响）。
+    let mut combined = eg_block.clone();
+    if !remote_items.is_empty() {
+        combined.push_str("\n\n## Remote Memory (Hindsight) — augmented recall\n");
+        for item in &remote_items {
+            combined.push_str(&format!("- [{}] {}\n", item.fact_type, item.text));
+        }
+    }
+    if !combined.trim().is_empty() {
+        info!(
+            "Injected deep permanent block ({} chars, {} remote)",
+            combined.len(),
+            remote_items.len()
+        );
         // picked_ids 与块内事实行同序（header 之后），zip 得到 (id, 注入行) 供 KPI 判定。
         eg_injected = eg_ids
             .into_iter()
             .zip(eg_block.lines().skip(1).map(|l| l.to_string()))
             .collect();
-        history.insert(0, ChatMessage::system(&eg_block));
+        history.insert(0, ChatMessage::system(&combined));
         // 仅"与当前问题相关"的事实才 touch，冷门条目自然退火（解"注入即续命"）。
         if let Ok(touched) = state.memory_store.deep_touch_batch(&rel_ids) {
             info!("Deep memory recall touched {} entries", touched);
@@ -3305,6 +3516,17 @@ Never record whether this assistant's OWN tools or capabilities work, are broken
                 fact.archived = false;
                 if state.memory_store.deep_store(&fact).is_ok() {
                     tracing::info!("[deep-curator] updated durable fact: {}", fcontent);
+                    // Task #20：写同步到 Hindsight（异步、尽力而为）。
+                    let sync = state.hindsight_sync.clone();
+                    let mem = state.memory_store.clone();
+                    let fid = fact.id.clone();
+                    let fbody = fact.content.clone();
+                    let fsubj = fact.subject_key.clone();
+                    let mut ftags = fact.tags.clone();
+                    ftags.push(fact.fact_type.as_str().to_string());
+                    tokio::spawn(async move {
+                        sync.sync_fact(&mem, &fid, &fbody, fsubj.as_deref(), &ftags).await;
+                    });
                 }
                 continue;
             }
@@ -3329,6 +3551,19 @@ Never record whether this assistant's OWN tools or capabilities work, are broken
                 continue;
             }
             tracing::info!("[deep-curator] captured durable fact: {}", fcontent);
+            // Task #20：写同步到 Hindsight（异步、尽力而为）。
+            {
+                let sync = state.hindsight_sync.clone();
+                let mem = state.memory_store.clone();
+                let fid = fact.id.clone();
+                let fbody = fact.content.clone();
+                let fsubj = fact.subject_key.clone();
+                let mut ftags = fact.tags.clone();
+                ftags.push(fact.fact_type.as_str().to_string());
+                tokio::spawn(async move {
+                    sync.sync_fact(&mem, &fid, &fbody, fsubj.as_deref(), &ftags).await;
+                });
+            }
         }
         // O2: refresh the read-only projection after a curator run so the on-disk
         // overview stays in sync with deep memory (small table, cheap rewrite).

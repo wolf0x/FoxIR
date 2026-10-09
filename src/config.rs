@@ -1182,6 +1182,19 @@ orchestration = "off"
         config.agent.expert_role_models = role_models.clone();
         config.save(workspace_dir)
     }
+
+    /// 持久化 Hindsight 远端记忆体集成配置到 config.toml。
+    ///
+    /// 与 `set_builtin_tool_switch` 一致：load 失败直接向上报错，不用
+    /// `unwrap_or_default()` 接走 —— 否则会把用户配好的 provider / 权限段整体抹平。
+    pub fn save_hindsight_settings(
+        workspace_dir: &str,
+        cfg: &HindsightConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = Self::load(workspace_dir)?;
+        config.agent.hindsight = cfg.clone();
+        config.save(workspace_dir)
+    }
 }
 
 

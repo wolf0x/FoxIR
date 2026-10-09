@@ -258,6 +258,103 @@ impl HindsightSync {
             } // Silent on timeout
         }
     }
+
+    /// 读取当前配置的快照（供 Settings GET 使用）。
+    pub async fn get_config(&self) -> HindsightConfig {
+        self.config.read().await.clone()
+    }
+
+    /// 写同步便捷方法：插入本地映射 → retain → 回填远端 id 与状态。
+    ///
+    /// 仅在 `enabled && auto_sync_write` 时生效；否则直接返回，不污染映射表。
+    /// 设计为“尽力而为”：任何一步失败都不向上抛错，只落 `failed` 状态。
+    pub async fn sync_fact(
+        &self,
+        mem: &Arc<crate::memory::MemoryStore>,
+        local_id: &str,
+        content: &str,
+        document_id: Option<&str>,
+        tags: &[String],
+    ) {
+        {
+            let c = self.config.read().await;
+            if !c.enabled || !c.auto_sync_write {
+                return;
+            }
+        }
+        let bank_id = {
+            let c = self.config.read().await;
+            c.bank_id.clone()
+        };
+        let _ = mem.hindsight_map_insert(local_id, &bank_id, document_id);
+        match self.retain(content, document_id, tags).await {
+            Ok(val) => {
+                let remote_id = extract_remote_id(&val);
+                let _ = mem.hindsight_map_update_remote(local_id, &remote_id, "synced");
+            }
+            Err(_) => {
+                let _ = mem.hindsight_map_update_remote(local_id, "", "failed");
+            }
+        }
+    }
+
+    /// 遗忘同步：本地记忆被删除时，作废对应远端记忆并清理映射。
+    pub async fn forget_fact(&self, mem: &Arc<crate::memory::MemoryStore>, local_id: &str) {
+        if let Some(entry) = mem.hindsight_map_get(local_id) {
+            if let Some(remote_id) = entry.remote_id.as_deref() {
+                if !remote_id.is_empty() {
+                    let _ = self.invalidate(remote_id).await;
+                }
+            }
+        }
+        let _ = mem.hindsight_map_remove(local_id);
+    }
+}
+
+/// 从 retain 返回值中尽力提取远端记忆 id。
+///
+/// Hindsight 的 MCP 返回可能是 content 数组（`[{type:text,text:"<json>"}]`）、
+/// 直接对象，或嵌套在 data/result/memory/fact 下。递归查找常见 id 字段。
+pub fn extract_remote_id(val: &Value) -> String {
+    const KEYS: [&str; 4] = ["id", "memory_id", "fact_id", "uuid"];
+    if let Some(arr) = val.as_array() {
+        let text = arr
+            .iter()
+            .filter_map(|i| {
+                if i.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    i.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+            return extract_remote_id(&parsed);
+        }
+        return String::new();
+    }
+    if let Some(obj) = val.as_object() {
+        for k in KEYS {
+            if let Some(s) = obj.get(k).and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        for k in ["data", "result", "memory", "fact"] {
+            if let Some(inner) = obj.get(k) {
+                let r = extract_remote_id(inner);
+                if !r.is_empty() {
+                    return r;
+                }
+            }
+        }
+    }
+    if let Some(s) = val.as_str() {
+        return s.to_string();
+    }
+    String::new()
 }
 
 /// Parse recall results from MCP tool response into RecallItems

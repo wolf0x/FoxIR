@@ -12,16 +12,19 @@ use std::sync::Arc;
 use super::Tool;
 use crate::context::ToolContext;
 use crate::error::AgentResult;
+use crate::hindsight_sync::HindsightSync;
 use crate::memory::MemoryStore;
 
 /// Tool for on-demand recall of past conversations from the local memory store.
 pub struct RecallMemoryTool {
     memory_store: Arc<MemoryStore>,
+    /// Task #20：可选的 Hindsight 读融合同步器。为 None 时仅返回本地召回。
+    hindsight_sync: Option<Arc<HindsightSync>>,
 }
 
 impl RecallMemoryTool {
-    pub fn new(memory_store: Arc<MemoryStore>) -> Self {
-        Self { memory_store }
+    pub fn new(memory_store: Arc<MemoryStore>, hindsight_sync: Option<Arc<HindsightSync>>) -> Self {
+        Self { memory_store, hindsight_sync }
     }
 }
 
@@ -61,10 +64,22 @@ impl Tool for RecallMemoryTool {
 
         // Distilled, budget-capped block: top-k hits + a slim recent-summary tail.
         let budget_chars = (max_items * 450).min(6000);
-        let block = self
+        let mut block = self
             .memory_store
             .build_recall_context(query, days, budget_chars)
             .unwrap_or_else(|| "No relevant past conversations found.".to_string());
+
+        // Task #20 读融合：本地召回之后追加 Hindsight 远端 recall（严格超时、
+        // 优雅降级：未启用/熔断/超时均返回空，不影响本地结果）。
+        if let Some(sync) = &self.hindsight_sync {
+            let remote = sync.recall(query, 512).await;
+            if !remote.is_empty() {
+                block.push_str("\n\n## Remote Memory (Hindsight)\n");
+                for item in &remote {
+                    block.push_str(&format!("- [{}] {}\n", item.fact_type, item.text));
+                }
+            }
+        }
 
         Ok(json!({
             "query": query,
