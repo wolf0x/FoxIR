@@ -1306,7 +1306,7 @@ input:checked+.slider:before{transform:translateX(20px)}
         <div class="sidebar-logo" id="sidebarLogo"><img class="logo-img" src="/static/foxir.ico" alt="FoxIR"></div>
         <div>
           <h2>FoxIR</h2>
-          <p>AI System Agent By W@L4</p>
+          <p>Your OPS Agent</p>
         </div>
       </div>
     </div>
@@ -1715,7 +1715,7 @@ input:checked+.slider:before{transform:translateX(20px)}
 
         <div class="settings-section cron-list-card">
           <h3>&#9200; Scheduled Tasks</h3>
-          <p style="font-size:12px;color:#94a3b8;margin:-8px 0 14px 0">Runs while RustAgent is open. For tasks that must run when the app is closed, use a Windows scheduled task (schtasks).</p>
+          <p style="font-size:12px;color:#94a3b8;margin:-8px 0 14px 0">Runs while FoxIR is open. For tasks that must run when the app is closed, use a Windows scheduled task (schtasks).</p>
           <div id="cronTaskList" class="cron-list">Loading...</div>
         </div>
       </div>
@@ -2301,9 +2301,9 @@ let permissions={};
 let permLocks=[];
 const PERM_STATE_HINT='Auto = never ask; Ask = ask unless a skill you approved covers it; Locked = ask, and approved skills do not apply';
 (function initPerms(){
-  const saved=localStorage.getItem('rustagent_perms');
+  const saved=localStorage.getItem('foxir_perms')||localStorage.getItem('rustagent_perms');
   if(saved){try{permissions=JSON.parse(saved)}catch(e){}}
-  const savedLocks=localStorage.getItem('rustagent_perm_locks');
+  const savedLocks=localStorage.getItem('foxir_perm_locks')||localStorage.getItem('rustagent_perm_locks');
   if(savedLocks){try{const p=JSON.parse(savedLocks);if(Array.isArray(p))permLocks=p}catch(e){}}
   PERM_CATEGORIES.forEach(c=>{if(permissions[c.id]===undefined)permissions[c.id]=c.def});
 })();
@@ -2930,7 +2930,7 @@ async function exportSelectedHtml(){
   // Embed the page's real stylesheet so the export looks identical to the chat.
   var css='';
   document.querySelectorAll('style').forEach(function(s){css+=s.textContent+'\n';});
-  var html='<!DOCTYPE html><html data-theme="'+(document.documentElement.getAttribute('data-theme')||'light')+'"><head><meta charset="utf-8"><title>RustAgent Chat Export</title><style>'
+  var html='<!DOCTYPE html><html data-theme="'+(document.documentElement.getAttribute('data-theme')||'light')+'"><head><meta charset="utf-8"><title>FoxIR Chat Export</title><style>'
     +css
     +'\n/* ── Export overrides ── */\n'
     +'html,body{height:auto;overflow:visible}\n'
@@ -2941,12 +2941,12 @@ async function exportSelectedHtml(){
     +'.ex-conv{background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.3);padding:20px;display:flex;flex-direction:column;gap:12px}\n'
     +':root[data-theme="dark"] .ex-conv{background:#0f131a;box-shadow:0 20px 60px rgba(0,0,0,.6)}\n'
     +'</style></head><body><div class="ex-page">'
-    +'<div class="ex-hdr">&#129302; RustAgent Chat Export</div>'
+    +'<div class="ex-hdr">&#129302; FoxIR Chat Export</div>'
     +'<div class="ex-sub">'+sel.length+' message(s) &middot; '+esc(new Date().toLocaleString())
     +' &middot; '+images+' image(s) inlined'+exportMetaTail()+'</div>'
     +'<div class="ex-conv">'+bodyHtml+'</div></div></body></html>';
   var blob=new Blob([html],{type:'text/html'});
-  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='rustagent-chat-'+Date.now()+'.html';a.click();
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='foxir-chat-'+Date.now()+'.html';a.click();
   setTimeout(function(){URL.revokeObjectURL(a.href)},1000);
   addLog('Exported '+sel.length+' message(s) to HTML ('+images+' image(s) inlined)','info');
   // 导出完成后自动清除选中，避免残留高亮
@@ -3307,7 +3307,7 @@ function clearChat(){
 function exportChat(){
   const txt=msgHist.map(m=>'['+m.time+'] '+m.role+': '+m.text).join('\n');
   const blob=new Blob([txt],{type:'text/plain'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='rustagent-'+Date.now()+'.txt';a.click();
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='foxir-'+Date.now()+'.txt';a.click();
 }
 function resetManagedPlans(){
   if(!confirm('Clear all unfinished Expert mode tasks? This will reset the Manager state so the next Expert task starts fresh. Completed tasks are preserved.'))return;
@@ -3396,8 +3396,8 @@ async function loadModels(){
     }
     if(Array.isArray(d.permission_locks)) permLocks = d.permission_locks.slice();
     if(typeof permissions !== 'undefined'){
-      localStorage.setItem('rustagent_perms',JSON.stringify(permissions));
-      localStorage.setItem('rustagent_perm_locks',JSON.stringify(permLocks));
+      localStorage.setItem('foxir_perms',JSON.stringify(permissions));
+      localStorage.setItem('foxir_perm_locks',JSON.stringify(permLocks));
     }
     if(typeof renderPerms === 'function') renderPerms();
   }catch(e){addLog('Load models failed','error')}
@@ -4247,9 +4247,9 @@ function showNotification(message, timestamp, skipHist){
   if(!skipHist){
     const plainText = message.replace(/[*#_~`\[\]]/g, '').substring(0, 200);
     if('Notification' in window && Notification.permission==='granted'){
-      new Notification('RustAgent Reminder',{body:plainText,icon:''});
+      new Notification('FoxIR Reminder',{body:plainText,icon:''});
     } else if('Notification' in window && Notification.permission!=='denied'){
-      Notification.requestPermission().then(p=>{if(p==='granted')new Notification('RustAgent Reminder',{body:plainText})});
+      Notification.requestPermission().then(p=>{if(p==='granted')new Notification('FoxIR Reminder',{body:plainText})});
     }
     addLog('Reminder delivered','info');
     // Persist notification to history
@@ -4338,8 +4338,8 @@ function setPermState(id,val){
     permLocks=permLocks.filter(function(x){return x!==id});
     permissions[id]=(val==='auto');
   }
-  localStorage.setItem('rustagent_perms',JSON.stringify(permissions));
-  localStorage.setItem('rustagent_perm_locks',JSON.stringify(permLocks));
+  localStorage.setItem('foxir_perms',JSON.stringify(permissions));
+  localStorage.setItem('foxir_perm_locks',JSON.stringify(permLocks));
   renderPerms();
   sendPerms();
   saveExtendedSettings();
@@ -4728,7 +4728,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   loadOutputs();
   loadTodos();
   renderQuickActions();
-  if(!msgHist.length)addLog('RustAgent ready','info');
+  if(!msgHist.length)addLog('FoxIR ready','info');
   updateStatus();
   refreshSidebarVersion(); // 启动即用同源 /api/health 填页脚版本，不依赖 WS 连接
   const modelSel=document.getElementById('modelSel');

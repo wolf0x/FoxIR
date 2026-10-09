@@ -116,7 +116,7 @@ impl Tool for SysRemindTool {
 fn show_fallback_notification(message: &str) {
     let escaped = message.replace("'", "''");
     let ps_cmd = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'RustAgent Reminder', 'OK', 'Information')",
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'FoxIR Reminder', 'OK', 'Information')",
         escaped
     );
     // Fire-and-forget: spawn PowerShell detached

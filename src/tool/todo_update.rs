@@ -290,7 +290,7 @@ mod tests {
     }
 
     fn tmp_ws(tag: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("rustagent_todo_test_{}_{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("foxir_todo_test_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir.to_string_lossy().into_owned()

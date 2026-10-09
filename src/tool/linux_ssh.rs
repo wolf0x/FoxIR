@@ -419,7 +419,7 @@ impl Tool for SshExecTool {
             LinuxIntentVerdict::Block { reason } => {
                 return Err(format!(
                     "BLOCKED (safety interlock): {}. \
-                     This operation is irreversible and cannot be executed through RustAgent. \
+                     This operation is irreversible and cannot be executed through FoxIR. \
                      If you truly need this, execute it manually outside the agent.",
                     reason
                 ).into());

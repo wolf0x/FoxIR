@@ -11,7 +11,7 @@ use crate::context::ToolContext;
 use crate::error::AgentResult;
 use crate::scheduler::{CronTask, Scheduler};
 
-/// Tool for managing RustAgent CRON tasks via chat.
+/// Tool for managing FoxIR CRON tasks via chat.
 pub struct CronManageTool {
     scheduler: Arc<Mutex<Scheduler>>,
 }
@@ -27,7 +27,7 @@ impl Tool for CronManageTool {
     fn name(&self) -> &str { "cron_manage" }
 
     fn description(&self) -> &str {
-        "Create, list, delete, or toggle RustAgent CRON tasks (application-level scheduled tasks). \
+        "Create, list, delete, or toggle FoxIR CRON tasks (application-level scheduled tasks). \
          Results are delivered back to the chat. Use schedule format like 'every 5m', 'every 1h', 'every 30s', 'every 1d'."
     }
 

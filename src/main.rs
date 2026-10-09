@@ -77,8 +77,8 @@ const EMBEDDED_FILES: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embe
 /// the currently open per-day file together with the day it belongs to.
 /// Shared per-process log state: the workspace logs directory, file prefix, and
 /// the currently open per-run file (one file per program launch,
-/// `rustagent-YYYY-MM-DD.N.log`) plus a stable dated alias
-/// (`rustagent-YYYY-MM-DD.log`) that always holds only the current run.
+/// `foxir-YYYY-MM-DD.N.log`) plus a stable dated alias
+/// (`foxir-YYYY-MM-DD.log`) that always holds only the current run.
 struct DailyLogShared {
     log_dir: std::path::PathBuf,
     prefix: String,
@@ -156,7 +156,7 @@ impl DailyLogShared {
 }
 
 /// A tracing writer that mirrors every formatted line to stdout, a fresh per-run
-/// file (`rustagent-YYYY-MM-DD.N.log`), and a stable dated alias. Keeps live
+/// file (`foxir-YYYY-MM-DD.N.log`), and a stable dated alias. Keeps live
 /// console output while persisting a copy under workspace/logs/, with one log
 /// file per program launch.
 struct TeeLogWriter {
@@ -233,10 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize logging: mirror to console AND a per-day file under workspace/logs/.
-    // A fresh rustagent-YYYY-MM-DD.log is created per day and rotated at midnight.
+    // A fresh foxir-YYYY-MM-DD.log is created per day and rotated at midnight.
     let logs_dir = std::path::Path::new(&workspace_dir).join("logs");
     let _ = std::fs::create_dir_all(&logs_dir);
-    let log_shared = std::sync::Arc::new(DailyLogShared::new(logs_dir.clone(), "rustagent".to_string()));
+    let log_shared = std::sync::Arc::new(DailyLogShared::new(logs_dir.clone(), "foxir".to_string()));
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide::handler=error")),
@@ -246,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    info!("Starting RustAgent (pid {})", std::process::id());
+    info!("Starting FoxIR (pid {})", std::process::id());
     info!("Executable directory: {}", exe_dir.display());
     info!("Workspace directory: {}", workspace_dir);
     info!(
@@ -840,7 +840,7 @@ expert_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     let app = server::create_router(state);
     let addr = format!("{}:{}", config.server.host, config.server.port);
 
-    info!("=== RustAgent is running ===");
+    info!("=== FoxIR is running ===");
     info!("Local:   http://localhost:{}", config.server.port);
     info!("Network: http://{}:{}", get_local_ip(), config.server.port);
     info!("Password: {}", password);

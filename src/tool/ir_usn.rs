@@ -320,7 +320,7 @@ impl Tool for IrUsnTool {
                     return Ok(json!({
                         "success": false,
                         "error": format!("Native: {}. PowerShell: {}", e, stderr.trim()),
-                        "hint": "Run RustAgent as Administrator (elevated) for direct USN access."
+                        "hint": "Run FoxIR as Administrator (elevated) for direct USN access."
                     }));
                 }
                 match serde_json::from_str::<Value>(stdout.trim()) {

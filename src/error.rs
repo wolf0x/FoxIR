@@ -99,7 +99,7 @@ impl RetryHint {
     }
 }
 
-/// The unified error type for RustAgent, modeled after ADK-RUST's AdkError.
+/// The unified error type for FoxIR, modeled after ADK-RUST's AdkError.
 #[derive(Debug, Clone)]
 pub struct AgentError {
     pub component: ErrorComponent,

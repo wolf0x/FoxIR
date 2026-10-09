@@ -110,7 +110,7 @@ impl Tool for WebFetchTool {
         // Build client with timeout
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent("RustAgent/0.1")
+            .user_agent("FoxIR/0.1")
             .build()
             .map_err(|e| crate::error::AgentError::tool("web_fetch", format!("Failed to build HTTP client: {}", e)))?;
 

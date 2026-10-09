@@ -615,7 +615,7 @@ pub struct LlmAgentBuilder {
 impl LlmAgentBuilder {
     pub fn new() -> Self {
         Self {
-            name: "RustAgent".to_string(),
+            name: "Fox".to_string(),
             description: "Local AI agent with Windows system tools".to_string(),
             provider: None,
             tools: None,
@@ -932,7 +932,7 @@ impl LlmAgent {
 
         // -- HEAD (Minimal tier = strict prefix of the Full prompt) --
         let mut prompt = format!(
-            "You are RustAgent, a powerful local AI assistant running on the user's Windows machine. \
+            "You are Fox, a powerful local AI assistant running on the user's Windows machine. \
 You have FULL ACCESS to the user's system via built-in tools.\n\n\
 ## CRITICAL: User Identity\n\
 The user's name is **{user_name}**. You MUST always address the user by their given name \"{user_name}\" \
@@ -1188,13 +1188,13 @@ When the user DENIES a tool permission (you receive 'PERMISSION DENIED'):\n\
 - A permission denial means the user does NOT want this action to happen — regardless of which tool performs it.\n",
         );
 
-        // ── Scheduled Tasks: RustAgent CRON vs Windows Schtasks ──
+        // ── Scheduled Tasks: Fox CRON vs Windows Schtasks ──
         prompt.push_str(
             "\n## Scheduled Tasks: CRON vs System Tasks\n\
 You have TWO ways to create scheduled tasks. You MUST distinguish between them:\n\n\
-### RustAgent CRON Tasks (Application-Level)\n\
+### Fox CRON Tasks (Application-Level)\n\
 - Results are fed back into the chat as notifications\n\
-- Run within RustAgent's context with access to all AI tools\n\
+- Run within Fox's context with access to all AI tools\n\
 - Use for: periodic monitoring, reports, data collection that the user wants to SEE in chat\n\
 - **Use the `cron_manage` tool to create/list/delete/toggle these tasks directly from chat**\n\
 - Schedule format: 'every Ns' (seconds), 'every Nm' (minutes), 'every Nh' (hours), 'every Nd' (days)\n\
@@ -1207,18 +1207,18 @@ You have TWO ways to create scheduled tasks. You MUST distinguish between them:\
   - User: '暂停那个任务' → cron_manage toggle, task_id=<id>\n\n\
 ### Windows Task Scheduler (System-Level)\n\
 - Managed via `schtasks.exe` command-line tool\n\
-- Run independently of RustAgent (even when RustAgent is closed)\n\
+- Run independently of Fox (even when Fox is closed)\n\
 - Results are NOT automatically fed back to chat\n\
-- Use for: system maintenance, cleanup, backups, scripts that should run regardless of RustAgent\n\
+- Use for: system maintenance, cleanup, backups, scripts that should run regardless of Fox\n\
 - Example: 'Create a scheduled task to clean temp files every Sunday at 2 AM'\n\
 - To create: use `shell_exec` with schtasks commands:\n\
   - Create: `schtasks /Create /TN \"TaskName\" /TR \"command\" /SC DAILY /ST 02:00 /F`\n\
   - List:   `schtasks /Query /FO LIST`\n\
   - Delete: `schtasks /Delete /TN \"TaskName\" /F`\n\n\
 **Decision guide:**\n\
-- User wants to **see results in chat** → RustAgent CRON (use `cron_manage` tool)\n\
-- Task should **run independently** or **survive RustAgent restarts** → Windows Schtasks\n\
-- Task requires **AI capabilities** → RustAgent CRON\n\
+- User wants to **see results in chat** → Fox CRON (use `cron_manage` tool)\n\
+- Task should **run independently** or **survive Fox restarts** → Windows Schtasks\n\
+- Task requires **AI capabilities** → Fox CRON\n\
 - Simple **system command** → Windows Schtasks\n",
         );
 
@@ -4223,7 +4223,7 @@ mod tests {
     }
 
     fn tmp_ws(tag: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("rustagent_llm_todo_{}_{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fox_llm_todo_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir.to_string_lossy().into_owned()

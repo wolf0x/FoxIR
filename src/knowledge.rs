@@ -1132,7 +1132,7 @@ mod tests {
     }
     #[test]
     fn bm25_search_ranks_and_sets_token_hits() {
-        let ws = std::env::temp_dir().join(format!("rustagent_know_bm25_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("foxir_know_bm25_{}", std::process::id()));
         let kdir = ws.join("knowledge");
         std::fs::create_dir_all(&kdir).unwrap();
         std::fs::write(kdir.join("a.md"), "## Network\nping troubleshooting: how to ping a host and test connectivity\n").unwrap();
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn preferred_filters_search() {
-        let ws = std::env::temp_dir().join(format!("rustagent_know_pref_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("foxir_know_pref_{}", std::process::id()));
         let kdir = ws.join("knowledge");
         std::fs::create_dir_all(&kdir).unwrap();
         std::fs::write(kdir.join("a.md"), "## Network\nhow to ping a host and test connectivity\n").unwrap();
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn create_delete_files_safe() {
-        let ws = std::env::temp_dir().join(format!("rustagent_know_crud_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("foxir_know_crud_{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
 
         // Create with a subfolder path.
@@ -1205,7 +1205,7 @@ mod tests {
 
     #[test]
     fn merge_legacy_into_single_experience() {
-        let ws = std::env::temp_dir().join(format!("rustagent_know_merge_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("foxir_know_merge_{}", std::process::id()));
         let kdir = knowledge_dir(ws.to_str().unwrap());
         std::fs::create_dir_all(&kdir).unwrap();
         // Simulate two legacy category files.
@@ -1238,7 +1238,7 @@ mod tests {
 
     #[test]
     fn routing_targets_methodology_file() {
-        let ws = std::env::temp_dir().join(format!("rustagent_know_route_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("foxir_know_route_{}", std::process::id()));
         let kdir = knowledge_dir(ws.to_str().unwrap());
         std::fs::create_dir_all(&kdir).unwrap();
         // A methodology doc plus the shared experience store.

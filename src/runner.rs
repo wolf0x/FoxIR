@@ -76,7 +76,7 @@ impl RunnerBuilder {
             agent: None,
             session_service: None,
             logger: None,
-            app_name: "RustAgent".to_string(),
+            app_name: "FoxIR".to_string(),
             checkpointer: None,
             trim_redundant_tool_calls: Arc::new(AtomicBool::new(true)),
             knowledge_pre_retrieval: Arc::new(AtomicBool::new(true)),
