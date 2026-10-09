@@ -62,7 +62,6 @@ pub fn parse_delete_paths(command: &str, shell: &str) -> Option<Vec<String>> {
     let flag_char = if is_ps { '-' } else { '/' };
     let mut paths: Vec<String> = Vec::new();
     // PowerShell `-LiteralPath <p>` / `-Path <p>` consumes the next token as ONE path.
-    let mut expect_literal_next = false;
     let mut i = 1;
     while i < tokens.len() {
         let raw = tokens[i].trim();

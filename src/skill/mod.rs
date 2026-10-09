@@ -697,7 +697,9 @@ impl SkillManager {
              skill files.\n\n",
         );
 
-        let mut activated = false;
+        // Catalog build never activates a skill inline; the flag is part of the
+        // return contract and stays false on this path.
+        let activated = false;
         match strategy {
             SkillListingStrategy::NamesOnly | SkillListingStrategy::DiscoverToolOnly => {
                 let names: Vec<&str> = enabled.iter().map(|s| s.metadata.name.as_str()).collect();

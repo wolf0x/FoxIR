@@ -12,6 +12,7 @@ mod forensics;
 mod context;
 #[allow(dead_code)]
 mod error;
+#[allow(dead_code)] // tiering API pre-staged, not yet wired into the bin
 mod deep_memory;
 mod context_arbiter;
 mod turn_decision;
@@ -20,11 +21,13 @@ mod external_tools;
 mod heartbeat;
 #[allow(dead_code)]
 mod hindsight_sync;
+#[allow(dead_code)] // consolidation/legacy-merge helpers pre-staged
 mod knowledge;
 mod interject;
 mod log;
 #[allow(dead_code)]
 mod managed;
+#[allow(dead_code)] // Hindsight sync & archive APIs partially pre-staged
 mod memory;
 mod model;
 mod model_store;
@@ -33,10 +36,14 @@ mod policy;
 #[allow(dead_code)]
 mod runner;
 mod scheduler;
+#[allow(dead_code)] // session-active accounting helper pre-staged
 mod server;
+#[allow(dead_code)] // ADK-style session API kept for future wiring
 mod session;
+#[allow(dead_code)] // verify/authoring chains pre-staged
 mod skill;
 mod debrief;
+#[allow(dead_code)] // SOP authoring chain pre-staged
 mod sop;
 mod security;
 #[allow(dead_code)]

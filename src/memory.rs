@@ -806,7 +806,7 @@ impl MemoryStore {
             let preview: String = e.content.chars().take(300).collect();
             // Indent continuation lines so role boundaries stay readable.
             let flat = preview.replace('\n', " ");
-            let mut line = format!("[{}] {}: {}\n", when, role_label, flat);
+            let line = format!("[{}] {}: {}\n", when, role_label, flat);
             if used + line.len() > budget_chars {
                 s.push_str(&format!("... ({} more rounds cut for budget; use `evidence list` / continue chatting to recall)\n", turns.len() - total_shown));
                 break;
@@ -996,8 +996,7 @@ impl MemoryStore {
                 }
                 if !rows.is_empty() {
                     let hdr = "\n## Confirmed durable facts (deep memory)".to_string();
-                    parts.push(hdr.clone());
-                    used += hdr.len();
+                    parts.push(hdr);
                     parts.extend(rows);
                 }
             }

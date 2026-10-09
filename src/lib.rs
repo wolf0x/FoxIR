@@ -5,6 +5,8 @@
 //! (T6.8: gate aggregation). The binary keeps its own copy of these modules
 //! and is left untouched; both compile the identical source.
 #![allow(dead_code)]
+// The crate/binary is intentionally branded `FoxIR` (non-snake-case by Rust convention).
+#![allow(non_snake_case)]
 
 pub mod agent;
 pub mod callbacks;
