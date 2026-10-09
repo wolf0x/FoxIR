@@ -524,6 +524,19 @@ pub fn orchestration_prefilter(user_message: &str) -> bool {
     SOURCES.iter().filter(|s| lower.contains(**s)).count() >= 3
 }
 
+/// Task 7（D10 降级收尾）：预筛命中时给模型一条并行扇出的软引导；
+/// 未命中返回空串。不决定工具交付（交付已由 can_spawn/Instant/depth==0 常态开启）。
+pub fn fanout_prompt_hint(user_message: &str) -> String {
+    if orchestration_prefilter(user_message) {
+        "\n## CURRENT TASK: Parallel Fan-out Signal\n\
+本条消息检测到多目标/多数据源并行信号：优先用 spawn_subagent 在一轮内连发多个【只读】worker\
+（每个 role 必须唯一），再用 wait_all_subagents 一次收齐全部结果。\n\n"
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Delivery-gate predicate (SDD §7.3). An orchestration tool is delivered
 /// to the model only when its name is *not* in `ALL_ORCH`, or when the allowset
 /// explicitly opens it. Step 1 returns an empty allowset so the gate strips all
@@ -1045,8 +1058,15 @@ Layer 2 — Execution Dispatch (HOW to run):\n\
 - Simple task / single Skill → main Agent Loop (no fan-out, zero orchestration overhead)\n\
 - Complex multi-target / multi-source task → Orchestration fan-out (spawn_subagent for parallel workers)\n\
 - Write/exec workers → require user authorization + serial execution via write_gate\n\
-- Decision signals: multiple IPs/hosts, multiple data sources, explicit parallel wording (\"分别/并行/各自/同时\")\n\n\
-## CRITICAL: Tool Usage Rules\n\
+- Decision signals: multiple IPs/hosts, multiple data sources, explicit parallel wording (\"分别/并行/各自/同时\")\n\n"
+        ));
+        // Task 7：预筛命中的扇出软提示，仅 Instant 根注入（Expert/子代理不注入；
+        // 软提示不影响交付门控——交付已常态开启）。Minimal tier 已提前 return，天然不含。
+        if self.mode == crate::context::AgentMode::Instant && self.depth == 0 {
+            prompt.push_str(&fanout_prompt_hint(user_message));
+        }
+        prompt.push_str(&format!(
+            "## CRITICAL: Tool Usage Rules\n\
 - When the user asks about their system (IP address, processes, services, files, disk space, etc.), \
   you **MUST** use the appropriate tool to get REAL data. Do NOT guess or provide hypothetical answers.\n\
 - Available tools include:\n\
@@ -4505,6 +4525,16 @@ mod tests {
     #[test]
     fn prefilter_many_sources_is_true() {
         assert!(orchestration_prefilter("把进程、服务、注册表和日志都拉一遍做时间线"));
+    }
+
+    /// Task 7：预筛命中时返回并行扇出软提示（含「并行」与 wait_all_subagents
+    /// 引导口径），未命中返回空串——软提示不改工具交付（交付已常态开启）。
+    #[test]
+    fn fanout_hint_present_when_prefilter_hits() {
+        // 预筛命中 → 提示串包含并行扇出引导；未命中 → 空（软提示，不改工具交付）
+        assert!(fanout_prompt_hint("分别检查这3台主机 1.1.1.1 2.2.2.2 3.3.3.3").contains("并行"));
+        assert!(fanout_prompt_hint("分别检查这3台主机 1.1.1.1 2.2.2.2 3.3.3.3").contains("wait_all_subagents"));
+        assert!(fanout_prompt_hint("你好").is_empty());
     }
 
     #[test]
