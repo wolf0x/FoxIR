@@ -7,7 +7,9 @@
 //! `can_spawn = false` and a different invocation id, so they can never reach the
 //! orchestrator (no deep nesting in Phase 0).
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -57,6 +59,28 @@ fn gate(ctx: &ToolContext) -> AgentResult<()> {
 fn orch(ctx: &ToolContext) -> AgentResult<Arc<crate::agent::orchestration::Orchestrator>> {
     get_orchestrator(&ctx.base.base.invocation_id)
         .ok_or_else(|| AgentError::not_available_in_mode(ctx.mode))
+}
+
+/// 看门狗心跳间隔（秒）：等待阻塞期间每 15s 向主循环上报一条进度，重置静默门。
+const WAIT_HEARTBEAT_SECS: u64 = 15;
+
+/// 看门狗心跳：包装 wait/wait_many，在阻塞等待期间周期性调用 `report_progress`。
+/// “等 worker 终值”是合法进展而非卡死，故自定义 spec.timeout > 600s 的长任务
+/// 也能安全等到终态，不再被静默门掐断。心跳有界：worker 自身超时硬上限会令
+/// 内层 future 必然收敛，收束后循环立即退出；超时仅丢弃外层 timeout，
+/// 内层订阅状态（wait 的 Notified 嵌入同一 future 状态机）跨轮保留，不丢通知。
+async fn wait_with_heartbeat_at<F: Future>(tick: Duration, fut: F, ctx: &ToolContext, msg: &str) -> F::Output {
+    tokio::pin!(fut);
+    loop {
+        match tokio::time::timeout(tick, fut.as_mut()).await {
+            Ok(v) => return v,
+            Err(_) => ctx.report_progress(msg),
+        }
+    }
+}
+
+async fn wait_with_heartbeat<F: Future>(fut: F, ctx: &ToolContext, msg: &str) -> F::Output {
+    wait_with_heartbeat_at(Duration::from_secs(WAIT_HEARTBEAT_SECS), fut, ctx, msg).await
 }
 
 pub struct SpawnSubagentTool;
@@ -118,7 +142,7 @@ impl Tool for WaitSubagentTool {
         gate(ctx)?;
         let o = orch(ctx)?;
         let run_id = args.get("run_id").and_then(|v| v.as_str()).ok_or_else(|| AgentError::agent("wait_subagent: missing run_id"))?;
-        let r = o.wait(run_id).await?;
+        let r = wait_with_heartbeat(o.wait(run_id), ctx, "wait_subagent: 等待子代理终值中").await?;
         Ok(serde_json::to_value(r).unwrap_or(json!({})))
     }
 }
@@ -145,7 +169,7 @@ impl Tool for WaitAllSubagentsTool {
         let ids: Vec<String> = args.get("run_ids").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        let results = o.wait_many(&ids).await;
+        let results = wait_with_heartbeat(o.wait_many(&ids), ctx, "wait_all_subagents: 等待多个子代理终值中").await;
         let arr: Vec<Value> = results.into_iter().map(|r| match r {
             Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
             Err(e) => json!({ "error": e.to_string() }),
@@ -256,6 +280,27 @@ mod tests {
         let ctx2 = crate::context::ToolContext::simple(".".to_string(), ".".to_string());
         let err2 = ListSubagentsTool.execute(json!({}), &ctx2).await.unwrap_err();
         assert!(err2.to_string().contains("unavailable"), "got {err2}");
+    }
+
+    /// 心跳 helper：慢 future 在等待期间必须向进度通道发出心跳（真实短时钟：
+    /// 50ms 间隔 × 130ms 延迟 ≈ 2 拍），且完成后停止、结果原样透传。
+    #[tokio::test]
+    async fn wait_heartbeat_reports_progress_during_slow_wait() {
+        use tokio::sync::mpsc;
+        let (ptx, mut prx) = mpsc::channel::<String>(16);
+        let ctx = crate::context::ToolContext::simple(".".to_string(), ".".to_string())
+            .with_progress(ptx);
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let join = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(130)).await;
+            let _ = tx.send(7);
+        });
+        let v = wait_with_heartbeat_at(Duration::from_millis(50), rx, &ctx, "ping").await;
+        assert_eq!(v.unwrap(), 7, "helper must pass the inner result through unchanged");
+        join.await.unwrap();
+        let mut beats = 0;
+        while prx.try_recv().is_ok() { beats += 1; }
+        assert!((1..=4).contains(&beats), "expect 1~4 heartbeats in 130ms@50ms, got {beats}");
     }
 
     /// Without a registered orchestrator for this invocation, orchestration
