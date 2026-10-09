@@ -478,6 +478,21 @@ impl Orchestrator {
         if let Some(existing) = self.try_reuse(&spec.role) {
             return Ok(existing);
         }
+        // 角色唯一（D-E / F7）：同一运行内已有非终值(Pending/Running)的同名 role 时，
+        // 拒绝再次发射，避免并行扇出下的聚合审计歧义与 try_reuse 误命中。
+        // 终值同名不在此列——上面 try_reuse 已优先复用。
+        {
+            let map = self.children.lock().unwrap();
+            if map.values().any(|h| h.role == spec.role && {
+                let s = h.status.lock().unwrap();
+                matches!(*s, SubAgentStatus::Pending | SubAgentStatus::Running)
+            }) {
+                return Err(AgentError::agent(format!(
+                    "spawn_subagent: duplicate role '{}'; use a unique role per worker",
+                    spec.role
+                )));
+            }
+        }
         // Enforce the per-orchestrator concurrency ceiling (P2): cap how many
         // workers may run at once so a single round can't spawn unbounded LLM
         // workers (cost / DoS guard). A reused role consumes no new slot.
@@ -1139,5 +1154,23 @@ mod tests {
         let miss = orch.wait_many(&["nope".to_string()]).await;
         assert_eq!(miss.len(), 1);
         assert!(miss[0].is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_duplicate_nonterminal_role() {
+        use crate::context::SubAgentStatus;
+        let (orch, _rx) = make_test_orchestrator();
+        // 直插一个「在飞(Running)、result=None」的同 role 合成句柄，确保 try_reuse 不命中、
+        // 从而走「非终值同名拒绝」分支（不依赖任何真 worker 的执行/失败时序）。
+        let spec = read_only_spec("same-role");
+        let busy = SubAgentHandle::new("busy-run".to_string(), spec.clone());
+        *busy.status.lock().unwrap() = SubAgentStatus::Running;
+        orch.children.lock().unwrap().insert("busy-run".to_string(), busy);
+        // 再次以同名 role 发射 → 必须被拒（而非并行派遣或误复用）。
+        let err = orch.spawn(&read_only_spec("same-role"), 0, "inv", "s", "au").await
+            .expect_err("非终值重名角色必须被拒");
+        assert!(err.to_string().contains("duplicate role"), "错误须含 'duplicate role'，实际：{err}");
+        // 异名 role 不受影响（对照，证明校验按 role 精确匹配）。
+        assert!(orch.spawn(&read_only_spec("other-role"), 0, "inv", "s", "au").await.is_ok());
     }
 }

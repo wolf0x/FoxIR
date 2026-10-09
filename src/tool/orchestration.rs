@@ -64,7 +64,7 @@ pub struct SpawnSubagentTool;
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str { "spawn_subagent" }
     fn description(&self) -> &str {
-        "Spawn a read-only worker sub-agent that runs a delegated task in its own session and returns a structured SubAgentResult. Call with {role, prompt, [tools_allowlist], [allow_write], [allow_exec], [model], [max_iterations], [timeout]}. Then wait_subagent for the result."
+        "派遣一个子 Agent（fire-and-forget，返回 run_id）。复杂多目标任务：一轮内连续多次调用派遣多个【只读】worker（每个 role 必须唯一），随后用 wait_all_subagents 一次收齐。写/执行需 allow_write/allow_exec 并单独授权，且串行执行。"
     }
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {
