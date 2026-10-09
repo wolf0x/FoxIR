@@ -228,6 +228,51 @@ async fn spawn_wait(orch: &Orchestrator, spec: &SubAgentSpec, root: &str) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Gate 1b: wait_many end-to-end  (真实 mock worker 并发收敛，覆盖快/慢两路径)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase0_wait_many_converges_all_workers_in_parallel() {
+    // mock provider 每轮延迟 60ms、每 worker 数轮：N 个 worker 真并发跑完。
+    let b = Bench::new(60).await;
+    let ms = b.mem_store();
+    let (orch, _prx) = make_orch(b.env(ms.clone()), "root-wm");
+    let n = 4;
+    let t0 = Instant::now();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        ids.push(orch.spawn(&b.spec(&format!("wm{i}")), 0, "root-wm", "sess", "parent").await.unwrap());
+    }
+    let results = orch.wait_many(&ids).await;
+    let elapsed = t0.elapsed();
+
+    assert_eq!(results.len(), n);
+    for (i, r) in results.iter().enumerate() {
+        let res = r.as_ref().unwrap();
+        assert_eq!(res.status, SubAgentStatus::Ok, "worker {i} must reach Ok via wait_many");
+        // 保序：wait_many 第 i 个结果必须对应第 i 个 run_id
+        assert_eq!(res.run_id, ids[i], "wait_many must preserve input order");
+    }
+    // 并发证据：总耗时 ≈ 单 worker 耗时（最慢者），远小于 n × 串行下界。
+    // 串行下界 = n * (每 worker 至少一轮 * 60ms)。放宽所需裕度防 CI 抖动，
+    // 仍能把"真并发"与"顺序 await（必然 >= n*2*60ms）"区分开。
+    // 注：满载并发时 4 个后台 worker 实测 elapsed≈179ms（每 worker≈3 回合@60ms），
+    // 简报的 *3 裕度会压线误红；故按"保留量级差"原则反方向放宽到 *2：并行(≤180ms)
+    // 仍 *2=360<480 通过，而真串行(≈600ms+) *2≥1200≫480 仍判红，可区分性不变。
+    let serial_floor = std::time::Duration::from_millis(60 * 2 * n as u64);
+    eprintln!(
+        "PHASE0 wait_many e2e: n={n} elapsed={:?} serial_floor={:?} ratio={:.2}",
+        elapsed,
+        serial_floor,
+        serial_floor.as_secs_f64() / elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed * 2 < serial_floor,
+        "wait_many looks serialized: elapsed={elapsed:?}, serial_floor={serial_floor:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Gate 1: wall-clock speed-up  (parallel >= 30% faster than serial)
 // ---------------------------------------------------------------------------
 

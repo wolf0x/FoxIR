@@ -537,10 +537,10 @@ pub fn fanout_prompt_hint(user_message: &str) -> String {
     }
 }
 
-/// Delivery-gate predicate (SDD §7.3). An orchestration tool is delivered
-/// to the model only when its name is *not* in `ALL_ORCH`, or when the allowset
-/// explicitly opens it. Step 1 returns an empty allowset so the gate strips all
-/// seven orchestration tools from every mode (zero behavior diff).
+/// 投递门谓词（SDD §7.3）。某个编排工具仅当「其名字不在 `ALL_ORCH` 中」
+/// 或「被 allowset 显式放行」时才投递给模型。allowset 由 `orchestration_delivered_for`
+/// 决定：对 Instant 根常态候选（can_spawn && Instant && depth==0）全量放行
+/// 全部八个编排工具；Expert（及 depth≥1 / 非候选）恒为空 allowset。
 pub fn orchestration_delivered(name: &str, allowset: &[String]) -> bool {
     !ALL_ORCH.contains(&name) || allowset.iter().any(|n| n == name)
 }

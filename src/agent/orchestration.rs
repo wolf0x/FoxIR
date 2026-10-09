@@ -1139,7 +1139,7 @@ mod tests {
         };
         // 直插两个已终值 handle（不经 spawn，避免依赖 provider）
         for (rid, role) in [("r1", "a"), ("r2", "b")] {
-            let mut h = SubAgentHandle::new(rid.into(), read_only_spec(role));
+            let h = SubAgentHandle::new(rid.into(), read_only_spec(role));
             *h.result.lock().unwrap() = Some(mk(rid, role));
             *h.status.lock().unwrap() = SubAgentStatus::Ok;
             orch.children.lock().unwrap().insert(rid.into(), h);
