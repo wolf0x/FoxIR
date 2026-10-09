@@ -672,6 +672,7 @@ input:checked+.slider:before{transform:translateX(20px)}
   "prov  prov"
   "agent perms"
   "agent session"
+  "memory memory"
   "config config";
   gap:18px}
 .settings-grid .settings-section{margin-bottom:0}
@@ -682,7 +683,8 @@ input:checked+.slider:before{transform:translateX(20px)}
 .gs-perms{grid-area:perms}
 .gs-session{grid-area:session}
 .gs-config{grid-area:config}
-@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "config"}}
+.gs-memory{grid-area:memory}
+@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "memory" "config"}}
 
 .modern-page .settings-section h3{font-size:15px;font-weight:600;color:#1e293b;margin:0 0 18px 0;display:flex;align-items:center;gap:8px;border-bottom:none;padding-bottom:0}
 .form-card{margin-bottom:16px;padding:18px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:12px}
@@ -925,6 +927,7 @@ input:checked+.slider:before{transform:translateX(20px)}
   "prov  prov"
   "agent perms"
   "agent session"
+  "memory memory"
   "config config";
   gap:18px}
 .settings-grid .settings-section{margin-bottom:0}
@@ -935,7 +938,8 @@ input:checked+.slider:before{transform:translateX(20px)}
 .gs-perms{grid-area:perms}
 .gs-session{grid-area:session}
 .gs-config{grid-area:config}
-@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "config"}}
+.gs-memory{grid-area:memory}
+@media(max-width:980px){.settings-grid{grid-template-columns:1fr;grid-template-areas:"conn" "model" "prov" "agent" "perms" "session" "memory" "config"}}
 
 .modern-page .settings-section h3{font-size:15px;font-weight:600;color:#1e293b;margin:0 0 18px 0;display:flex;align-items:center;gap:8px;border-bottom:none;padding-bottom:0}
 .form-card{margin-bottom:16px;padding:18px;background:linear-gradient(135deg,#f8fafc,#f1f5f9);border:1px solid #e2e8f0;border-radius:12px}
@@ -1536,6 +1540,61 @@ input:checked+.slider:before{transform:translateX(20px)}
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+        <div class="settings-section gs-memory">
+          <h3>&#129504; 记忆远端同步 (Hindsight)</h3>
+          <div class="form-card">
+            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+              <div>
+                <label style="margin-bottom:0">启用远端记忆同步</label>
+                <small style="color:var(--t3)">将本地记忆异步同步到 Hindsight 远端，并在召回时融合远端结果</small>
+              </div>
+              <label class="perm-toggle">
+                <input type="checkbox" id="hindsightEnabled" onchange="saveHindsightSettings()">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+          <div class="form-card">
+            <div class="form-group">
+              <label>服务地址</label>
+              <input type="text" id="hindsightBaseUrl" placeholder="http://localhost:8888" onchange="saveHindsightSettings()">
+            </div>
+            <div class="form-group">
+              <label>API Key</label>
+              <input type="password" id="hindsightApiKey" placeholder="Bearer token" onchange="saveHindsightSettings()">
+            </div>
+            <div class="form-group">
+              <label>Bank ID</label>
+              <input type="text" id="hindsightBankId" placeholder="smoke-test" value="smoke-test" onchange="saveHindsightSettings()">
+            </div>
+          </div>
+          <div class="form-card">
+            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+              <div>
+                <label style="margin-bottom:0">自动同步写入</label>
+                <small style="color:var(--t3)">每次本地存储记忆时自动 retain 到远端</small>
+              </div>
+              <label class="perm-toggle">
+                <input type="checkbox" id="hindsightAutoWrite" checked onchange="saveHindsightSettings()">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+              <div>
+                <label style="margin-bottom:0">召回融合</label>
+                <small style="color:var(--t3)">注入提示词时并行查询远端记忆，合并结果</small>
+              </div>
+              <label class="perm-toggle">
+                <input type="checkbox" id="hindsightAutoRead" checked onchange="saveHindsightSettings()">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+            <button class="btn btn-p" onclick="testHindsightConnection()">&#128279; 测试连接</button>
+            <span id="hindsightTestResult" style="font-size:12px;color:var(--t3)"></span>
           </div>
         </div>
         <div class="settings-section gs-config">
@@ -2293,7 +2352,7 @@ function switchPage(name,btn){
   if(name==='skills')loadSkills();
   if(name==='mcp')loadMcp();
   if(name==='cron')loadCron();
-  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();initHeartbeatToggle();}
+  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();initHeartbeatToggle();loadHindsightSettings();}
   if(name==='tools')loadTools();
   if(name==='knowledge')loadKnowledge();
   if(name==='dashboard')loadDashboard();
@@ -4381,6 +4440,87 @@ function saveAgentSettings(){
     .catch(e=>addLog('Settings save error: '+e,'error'));
 }
 
+// ── Hindsight Settings ──────────────────────────────
+function showToast(msg, type) {
+  const toast = document.createElement('div');
+  toast.className = 'toast-' + (type || 'info');
+  toast.textContent = msg;
+  toast.style.cssText = 'position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:99999;animation:fadeIn .3s;background:' + (type === 'error' ? '#ef4444' : '#10b981') + ';color:#fff;box-shadow:0 4px 12px rgba(0,0,0,.15)';
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+async function loadHindsightSettings() {
+  try {
+    const res = await fetch('/api/settings/hindsight');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    document.getElementById('hindsightEnabled').checked = cfg.enabled !== false;
+    document.getElementById('hindsightBaseUrl').value = cfg.base_url || '';
+    document.getElementById('hindsightApiKey').value = cfg.api_key || '';
+    document.getElementById('hindsightBankId').value = cfg.bank_id || 'smoke-test';
+    document.getElementById('hindsightAutoWrite').checked = cfg.auto_sync_write !== false;
+    document.getElementById('hindsightAutoRead').checked = cfg.auto_sync_read !== false;
+  } catch (e) { console.error('Load hindsight settings error:', e); }
+}
+
+async function saveHindsightSettings() {
+  const body = {
+    enabled: document.getElementById('hindsightEnabled').checked,
+    base_url: document.getElementById('hindsightBaseUrl').value.trim(),
+    api_key: document.getElementById('hindsightApiKey').value.trim(),
+    bank_id: document.getElementById('hindsightBankId').value.trim() || 'smoke-test',
+    auto_sync_write: document.getElementById('hindsightAutoWrite').checked,
+    auto_sync_read: document.getElementById('hindsightAutoRead').checked,
+  };
+  try {
+    const res = await fetch('/api/settings/hindsight', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast('Hindsight 配置已保存', 'success');
+    } else {
+      showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    showToast('保存失败: ' + e.message, 'error');
+  }
+}
+
+async function testHindsightConnection() {
+  const resultEl = document.getElementById('hindsightTestResult');
+  resultEl.textContent = '⏳ 测试中...';
+  resultEl.style.color = 'var(--t3)';
+
+  const body = {
+    base_url: document.getElementById('hindsightBaseUrl').value.trim(),
+    api_key: document.getElementById('hindsightApiKey').value.trim(),
+    bank_id: document.getElementById('hindsightBankId').value.trim() || 'smoke-test',
+  };
+
+  try {
+    const res = await fetch('/api/settings/hindsight/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.success) {
+      resultEl.textContent = '✅ 连接成功 — 工具: ' + (data.tools || []).join(', ');
+      resultEl.style.color = '#10b981';
+    } else {
+      resultEl.textContent = '❌ ' + (data.error || '连接失败');
+      resultEl.style.color = '#ef4444';
+    }
+  } catch (e) {
+    resultEl.textContent = '❌ ' + e.message;
+    resultEl.style.color = '#ef4444';
+  }
+}
+
 // Save Expert mode settings to config.toml
 function saveExpertSettings(){
   const expertMaxIter=parseInt(document.getElementById('expertMaxIterInput').value)||200;
@@ -4629,6 +4769,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   renderQuickActions();
   if(!msgHist.length)addLog('RustAgent ready','info');
   updateStatus();
+  refreshSidebarVersion(); // 启动即用同源 /api/health 填页脚版本，不依赖 WS 连接
   const modelSel=document.getElementById('modelSel');
   const fallbackSel=document.getElementById('fallbackSel');
   if(modelSel)modelSel.addEventListener('change',()=>localStorage.setItem(MODEL_KEY,modelSel.value||''));
