@@ -463,7 +463,7 @@ fn trim_history_by_value(history: &mut Vec<ChatMessage>, max_tokens: usize) {
 /// Orchestration tool names. Hidden from the model via delivery gating unless
 /// the mode/depth allowset opens (SDD \u00a77.3). Step 1 keeps allowset empty
 /// for all modes (Expert included) so there is zero behavior diff.
-pub const ALL_ORCH: [&str; 7] = [
+pub const ALL_ORCH: [&str; 8] = [
     "spawn_subagent",
     "wait_subagent",
     "list_subagents",
@@ -471,6 +471,7 @@ pub const ALL_ORCH: [&str; 7] = [
     "get_subagent_result",
     "update_plan",
     "read_subagent_log",
+    "wait_all_subagents",
 ];
 
 /// Delivery-gate truth table. Step 1: returns empty for every mode/depth.
