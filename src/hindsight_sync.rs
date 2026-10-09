@@ -234,12 +234,12 @@ impl HindsightSync {
 
         let result = tokio::time::timeout(timeout_dur, async {
             let mgr = mcp.lock().await;
-            // Try "update" or "patch" tool name — discover at runtime
-            // Fallback: try common names
-            if let Ok(val) = mgr.call_tool("hindsight", "update_memory", args.clone()).await {
+            // Hindsight MCP 实际工具名为 "invalidate_memory"
+            if let Ok(val) = mgr.call_tool("hindsight", "invalidate_memory", args.clone()).await {
                 return Ok(val);
             }
-            mgr.call_tool("hindsight", "forget", args).await
+            // 回退：尝试 update_memory 设置状态
+            mgr.call_tool("hindsight", "update_memory", args).await
         })
         .await;
 
