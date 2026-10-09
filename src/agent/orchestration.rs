@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentEvent, EventStream, LlmAgent};
 use crate::agent::event_pump::{EventPump, WORKER_CHANNEL_CAP};
 use crate::config::ModelConfig;
-use crate::context::{AgentMode, Confidence, InvocationContext, SessionKind, SubAgentResult, SubAgentSpec, SubAgentStatus};
+use crate::context::{AgentMode, Confidence, InvocationContext, SubAgentResult, SubAgentSpec, SubAgentStatus};
 use crate::error::{AgentError, AgentResult};
 use crate::model::openai::OpenAiProvider;
 use crate::permission::PendingMap;
@@ -1010,6 +1010,37 @@ pub fn has_inflight_workers(root_invocation_id: &str) -> bool {
     })
 }
 
+/// Cancel every in-flight worker owned by the given root SESSION id.
+///
+/// The STOP button only reaches the server-side drain (which drops the event
+/// consumer). Without this, the agent loop's orchestration-resilience guards
+/// (`tx.is_closed()` + in-flight workers → keep collecting) would deliberately
+/// keep the run alive after the drop, so the user could not stop it. Signalling
+/// cancel on each handle makes workers reach terminal states, which in turn lets
+/// every guard pass and the run tear down promptly. Returns how many workers
+/// were in flight. Lock order matches the rest of this module (children → status).
+pub fn cancel_all_for_session(root_session_id: &str) -> usize {
+    let map = registry().lock().unwrap();
+    let mut cancelled = 0usize;
+    for orch in map.values() {
+        if orch.root_session_id != root_session_id {
+            continue;
+        }
+        let children = orch.children.lock().unwrap();
+        for h in children.values() {
+            let inflight = {
+                let status = h.status.lock().unwrap();
+                matches!(*status, SubAgentStatus::Pending | SubAgentStatus::Running)
+            };
+            if inflight {
+                h.cancel.store(true, Ordering::SeqCst);
+                cancelled += 1;
+            }
+        }
+    }
+    cancelled
+}
+
 /// Cancel a sub-agent across every live root orchestrator by its run id.
 /// Used by the frontend's Agent Card Cancel button, which only knows `run_id`.
 pub fn cancel_subagent_any(run_id: &str) -> bool {
@@ -1172,5 +1203,44 @@ mod tests {
         assert!(err.to_string().contains("duplicate role"), "错误须含 'duplicate role'，实际：{err}");
         // 异名 role 不受影响（对照，证明校验按 role 精确匹配）。
         assert!(orch.spawn(&read_only_spec("other-role"), 0, "inv", "s", "au").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_for_session_marks_only_inflight_workers() {
+        use crate::context::SubAgentStatus;
+        let (orch, _rx) = make_test_orchestrator(); // root_session_id = "sess"
+        {
+            let mut map = orch.children.lock().unwrap();
+            for (rid, st) in [
+                ("run-a", SubAgentStatus::Running),
+                ("run-b", SubAgentStatus::Pending),
+                ("run-c", SubAgentStatus::Ok),
+            ] {
+                let h = SubAgentHandle::new(rid.into(), read_only_spec(rid));
+                *h.status.lock().unwrap() = st;
+                map.insert(rid.into(), h);
+            }
+        }
+        let key = "root-cancel-all-test".to_string();
+        register_orchestrator(key.clone(), orch.clone());
+        // 非匹配会话：一个标志都不能碰
+        assert_eq!(cancel_all_for_session("other-session"), 0);
+        {
+            let map = orch.children.lock().unwrap();
+            for rid in ["run-a", "run-b", "run-c"] {
+                assert!(!map[rid].cancel.load(Ordering::SeqCst), "{rid} 不该被误置取消标志");
+            }
+        }
+        // 匹配会话：只置在飞的两项并如实计数
+        let n = cancel_all_for_session("sess");
+        assert_eq!(n, 2, "只应计入 Pending/Running 的 worker");
+        {
+            let map = orch.children.lock().unwrap();
+            assert!(map["run-a"].cancel.load(Ordering::SeqCst), "Running worker 须被置取消");
+            assert!(map["run-b"].cancel.load(Ordering::SeqCst), "Pending worker 须被置取消");
+            assert!(!map["run-c"].cancel.load(Ordering::SeqCst), "已终值的 worker 不得被置取消");
+        }
+        // 自清理：避免全局注册表污染其他并行测试
+        unregister_orchestrator(&key);
     }
 }

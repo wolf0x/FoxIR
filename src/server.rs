@@ -1947,6 +1947,13 @@ async fn drain_session_stream(
             || cancelled.load(std::sync::atomic::Ordering::SeqCst);
         if stop_requested {
             info!("Agent execution stopped by user");
+            // STOP 级联：先取消该会话在飞的子代理。否则 agent 循环的
+            // 编排韧性守卫（消费端已关 + 子代理在飞 → 继续收敛）会让
+            // 运行在 rx 被丢弃后依然存活，表现为"停不下来"。
+            let n_cancel = crate::agent::orchestration::cancel_all_for_session(&session_id);
+            if n_cancel > 0 {
+                info!("[session:{}] STOP cascaded cancel to {} in-flight sub-agent(s)", session_id, n_cancel);
+            }
             if managed {
                 state.memory_store.set_contract_stopped(&session_id);
                 info!("[managed:{}] Set USER_STOPPED marker on TaskContract", session_id);
@@ -2885,6 +2892,13 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                         }
                                         if cancelled.load(Ordering::SeqCst) {
                                             info!("Agent execution stopped by user (resume)");
+                                            // Same STOP cascade as the drain path: cancel
+                                            // in-flight workers so the agent loop's
+                                            // resilience guards can let the run tear down.
+                                            let n_cancel = crate::agent::orchestration::cancel_all_for_session(&session_id);
+                                            if n_cancel > 0 {
+                                                info!("[session:{}] STOP cascaded cancel to {} in-flight sub-agent(s) (resume)", session_id, n_cancel);
+                                            }
                                             let stop_event = AgentEvent::text("\n\n*[Stopped by user]*", &session_id, "system");
                                             let msg_str = stop_event.to_ws_message();
                                             let _ = ws_send_bounded(&ws_sink, msg_str).await;
@@ -3417,7 +3431,7 @@ fn deep_fact_disables_a_capability(content: &str) -> bool {
 fn spawn_deep_curator(
     state: Arc<AppState>,
     model: &str,
-    session_id: &str,
+    _session_id: &str,
     user_text: &str,
     assistant_text: &str,
 ) {
