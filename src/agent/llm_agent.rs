@@ -2149,6 +2149,8 @@ impl Agent for LlmAgent {
             let mut reprompt_count = 0u32;
             // pending-action 补发计数（模式 B：宣告动作却收场）。全 run 上限 1 次，最坏多花一轮。
             let mut nudge_count = 0u32;
+            // 在飞子代理收敛轻推计数：模型派了子代理却想直接收尾时，至多推 2 次。
+            let mut child_nudge_count = 0u32;
             // 传输层截断补救计数器。流被传输错误切断时把已流出的残文并入历史，并要求模型从中断处继续。
             // 上限为 1，避免同一次故障反复触发、堆叠出不可控的额外轮次。
             const MAX_STREAM_RECOVERIES: u32 = 1;
@@ -2534,6 +2536,33 @@ impl Agent for LlmAgent {
                                 },
                                 &invocation_id, &author
                             ))).await;
+                            continue;
+                        }
+                        // 在飞子代理守门：模型 spawn 后不发等待工具、想用一句文本回答收尾
+                        // （"已派出去，稍后汇总"）。此时接受 Answer 会结束运行并销毁事件
+                        // 消费端，在飞的 worker 会被就地掐死、结果全丢。轻推其当轮收敛。
+                        if tool_calls.is_empty()
+                            && crate::agent::orchestration::has_inflight_workers(&invocation_id)
+                            && !tx.is_closed()
+                            && child_nudge_count < 2
+                            && cut != Some(StreamCutRecovery::Exhausted)
+                        {
+                            child_nudge_count += 1;
+                            warn!("[session:{}] INFLIGHT_CHILDREN_NUDGE (iter {}): turn ended with text while sub-agents still running; nudge {}/2",
+                                  session_id, iteration, child_nudge_count);
+                            let _ = tx.send(Ok(AgentEvent::thinking(
+                                "[子代理仍在运行，正在要求收敛结果...]",
+                                &invocation_id, &author
+                            ))).await;
+                            history.push(ChatMessage::assistant(&combined));
+                            history.push(ChatMessage::user(
+                                "You ended the turn with a text answer while sub-agents spawned via `spawn_subagent` are STILL RUNNING. \
+                                 Ending now drops their event consumer and cancels them mid-flight — every result is lost.\n\n\
+                                 Do exactly ONE of these now, inside this single message:\n\
+                                 1. Emit the tool call `wait_all_subagents` (preferred) or `wait_subagent` to collect their results, or\n\
+                                 2. Emit `cancel_subagent` for each one you deliberately no longer need.\n\n\
+                                 Never leave a turn with in-flight sub-agents and no collect/cancel step. Do not narrate — emit the tool call.",
+                            ));
                             continue;
                         }
                         if tool_calls.is_empty() {
