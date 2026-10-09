@@ -1042,8 +1042,14 @@ mod tests {
     /// 构造一个带 `parent_tx`（事件泵通道已就绪但尚未起）的最小根编排器。
     /// provider 用空 models：`spawn` 只同步建 worker/注册通道，provider 调用发生在
     /// 独立 tokio 任务里异步失败，不影响主线程对 `pump_started` 的断言。
-    /// 返回的 Receiver 直接丢弃（父通道 256 缓冲，避免 emit 阻塞）。
-    fn make_test_orchestrator() -> Arc<Orchestrator> {
+    /// 返回 `(Arc<Orchestrator>, Receiver<...>)`：把父端 Receiver 一并交回，调用方须
+    /// 让其存活于整个测试作用域（保持通道打开），否则 `emit` 与 worker 事件会因父
+    /// Receiver 已 drop 而静默失败。对齐 `phase0_acceptance::make_orch` 的 `OrchPair` 写法。
+    fn make_test_orchestrator(
+    ) -> (
+        Arc<Orchestrator>,
+        tokio::sync::mpsc::Receiver<AgentResult<AgentEvent>>,
+    ) {
         let (_resolver, pending) = PermissionResolver::new();
         let env = OrchestratorEnv {
             provider: Arc::new(OpenAiProvider::new(vec![])),
@@ -1072,23 +1078,25 @@ mod tests {
             default_timeout_secs: 1,
             memory_store: None,
         };
-        // parent_tx 必须为 Some 才会创建事件泵注册通道。
-        let (parent_tx, _parent_rx) =
+        // parent_tx 必须为 Some 才会创建事件泵注册通道；父端 Receiver 交回调用方保活。
+        let (parent_tx, parent_rx) =
             tokio::sync::mpsc::channel::<AgentResult<AgentEvent>>(256);
-        Arc::new(Orchestrator::new(
+        let orch = Arc::new(Orchestrator::new(
             env,
             "root".into(),
             "sess".into(),
             Arc::new(AtomicBool::new(false)),
             DEFAULT_MAX_DEPTH,
             Some(parent_tx),
-        ))
+        ));
+        (orch, parent_rx)
     }
 
     #[tokio::test]
     async fn event_pump_is_lazy_started_on_first_spawn() {
-        // 构造一个 parent_tx=Some 的根编排器：new() 后泵不得已起
-        let orch = make_test_orchestrator();
+        // 构造一个 parent_tx=Some 的根编排器：new() 后泵不得已起。
+        // _rx 须在整个测试作用域存活，保持父通道打开（否则 emit/worker 事件会静默丢失）。
+        let (orch, _rx) = make_test_orchestrator();
         assert!(!orch.pump_started.load(std::sync::atomic::Ordering::SeqCst),
             "构造编排器不得立即起事件泵");
         // 首次 spawn 后（ensure_event_pump 在 spawn 内同步调用），泵应已起
