@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolRegistry};
+use super::{TimeoutStage, Tool, ToolRegistry};
 use crate::agent::orchestration::get_orchestrator;
 use crate::context::{SubAgentSpec, ToolContext};
 use crate::error::{AgentError, AgentResult};
@@ -107,6 +107,11 @@ impl Tool for WaitSubagentTool {
     fn name(&self) -> &str { "wait_subagent" }
     fn description(&self) -> &str { "Block until a previously spawned sub-agent reaches a terminal state and return its full SubAgentResult. Args: {run_id}." }
     fn parameters_schema(&self) -> Value { json!({ "type": "object", "properties": { "run_id": { "type": "string" } }, "required": ["run_id"] }) }
+    fn timeout_stage(&self) -> TimeoutStage {
+        // 等待子代理回收：worker 默认存活上限 300s；看门狗档静默容忍 600s > 300s，
+        // 且无硬墙钟，避免等待被主循环工具级超时/静默看门狗掐断。
+        TimeoutStage::Watchdog
+    }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         gate(ctx)?;
         let o = orch(ctx)?;
@@ -247,5 +252,13 @@ mod tests {
         assert!(!spec.allow_write);
         assert!(!spec.allow_exec);
         assert!(spec.skills.is_empty());
+    }
+
+    /// wait_subagent 必须走看门狗超时档：无硬墙钟（timeout_secs()==None），
+    /// 静默容忍 600s，避免常态并行下等待被主循环工具级/静默看门狗掐断。
+    #[test]
+    fn wait_subagent_uses_watchdog_timeout_stage() {
+        assert_eq!(WaitSubagentTool.timeout_stage(), TimeoutStage::Watchdog);
+        assert!(WaitSubagentTool.timeout_secs().is_none(), "看门狗档无硬墙钟");
     }
 }
