@@ -712,6 +712,13 @@ impl Orchestrator {
         result.ok_or_else(|| AgentError::agent(format!("sub-agent {run_id} produced no result")))
     }
 
+    /// 并发收敛多个子代理终值。复用单 wait 的「先查终值、否则订阅完成通知」，
+    /// 故对已完成/后到者均不丢通知；join_all 让多路等待真正并发。
+    pub async fn wait_many(&self, run_ids: &[String]) -> Vec<AgentResult<SubAgentResult>> {
+        let futs = run_ids.iter().map(|rid| self.wait(rid));
+        futures::future::join_all(futs).await
+    }
+
     /// Non-blocking current status of a worker.
     pub fn status(&self, run_id: &str) -> Option<(String, SubAgentStatus)> {
         let map = self.children.lock().unwrap();
@@ -1104,5 +1111,33 @@ mod tests {
         let _rid = orch.spawn(&spec, 0, "inv-root", "sess-root", "author").await.unwrap();
         assert!(orch.pump_started.load(std::sync::atomic::Ordering::SeqCst),
             "首次发射必须懒起事件泵");
+    }
+
+    #[tokio::test]
+    async fn wait_many_collects_all_terminal_results_in_order() {
+        let (orch, _rx) = make_test_orchestrator();
+        let mk = |rid: &str, role: &str| SubAgentResult {
+            run_id: rid.into(), role: role.into(), summary: "s".into(),
+            confidence: Confidence::Low, token_usage: 0, evidence_refs: vec![],
+            artifact_refs: vec![], case_ref: None, proposed_writes: vec![],
+            status: SubAgentStatus::Ok,
+        };
+        // 直插两个已终值 handle（不经 spawn，避免依赖 provider）
+        for (rid, role) in [("r1", "a"), ("r2", "b")] {
+            let mut h = SubAgentHandle::new(rid.into(), read_only_spec(role));
+            *h.result.lock().unwrap() = Some(mk(rid, role));
+            *h.status.lock().unwrap() = SubAgentStatus::Ok;
+            orch.children.lock().unwrap().insert(rid.into(), h);
+        }
+        let res = orch.wait_many(&["r1".to_string(), "r2".to_string()]).await;
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].as_ref().unwrap().role, "a", "顺序须与入参一致");
+        assert_eq!(res[1].as_ref().unwrap().role, "b");
+        // 空输入 → 空输出
+        assert!(orch.wait_many(&[] as &[String]).await.is_empty());
+        // 未知 run_id → 该项 Err（wait 返回 not_found），不 panic、不永久挂起
+        let miss = orch.wait_many(&["nope".to_string()]).await;
+        assert_eq!(miss.len(), 1);
+        assert!(miss[0].is_err());
     }
 }
