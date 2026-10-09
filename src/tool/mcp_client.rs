@@ -473,6 +473,65 @@ impl McpClientManager {
             server.service.take(); // Drop -> rmcp cancels task + closes transport
         }
     }
+
+    // ── Programmatic tool invocation (Task #19: Hindsight) ──────
+
+    /// Whether a server with the given name is currently connected.
+    pub fn is_server_connected(&self, name: &str) -> bool {
+        self.servers
+            .iter()
+            .any(|s| s.config.name == name && s.status == ServerStatus::Connected)
+    }
+
+    /// 按 server_name + tool_name 编程式调用 MCP 工具（不经过 LLM）。
+    ///
+    /// 供 Hindsight 等内部集成直接复用已建立的 rmcp 连接。错误处理与
+    /// [`McpProxyTool::execute`] 一致：字符串错误经 `From<String>` 转为 `AgentError`。
+    pub async fn call_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> AgentResult<Value> {
+        let handle = self
+            .servers
+            .iter()
+            .find(|s| s.config.name == server_name && s.status == ServerStatus::Connected)
+            .ok_or_else(|| format!("MCP server '{}' not connected", server_name))?;
+        let service = handle
+            .service
+            .as_ref()
+            .ok_or_else(|| format!("MCP server '{}' has no service", server_name))?;
+        let tool_info = handle
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| format!("Tool '{}' not found on '{}'", tool_name, server_name))?;
+
+        // Convert args to rmcp's JsonObject (Map<String, Value>)
+        let arguments = match args {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        let params = CallToolRequestParams::new(tool_info.name.clone()).with_arguments(arguments);
+
+        let result = service
+            .call_tool(params)
+            .await
+            .map_err(|e| format!("MCP call failed: {}", e))?;
+
+        if result.is_error == Some(true) {
+            let msg = result
+                .content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                .collect::<Vec<&str>>()
+                .join("\n");
+            return Err(format!("MCP tool error: {}", msg).into());
+        }
+
+        Ok(serde_json::to_value(&result.content).unwrap_or(Value::Null))
+    }
 }
 
 // ============================================================

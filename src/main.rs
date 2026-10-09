@@ -18,6 +18,8 @@ mod turn_decision;
 mod event_log;
 mod external_tools;
 mod heartbeat;
+#[allow(dead_code)]
+mod hindsight_sync;
 mod knowledge;
 mod interject;
 mod log;

@@ -47,6 +47,20 @@ pub struct TaskCheckpoint {
     pub updated_at: String,
 }
 
+/// 本地记忆与 Hindsight 远端记忆的映射条目（Task #19）。
+///
+/// `local_id` 为本地主键；`remote_id` / `document_id` 在 retain 成功后回填；
+/// `status` 取 `pending` / `synced` / `failed` 等，`pending` 的条目会被批量补同步。
+#[derive(Debug, Clone)]
+pub struct HindsightMapEntry {
+    pub local_id: String,
+    pub remote_id: Option<String>,
+    pub bank_id: String,
+    pub document_id: Option<String>,
+    pub synced_at: Option<i64>,
+    pub status: String,
+}
+
 pub struct MemoryStore {
     conn: Mutex<Connection>,
 }
@@ -487,6 +501,28 @@ impl MemoryStore {
             info!("Schema v9 migration: cached_tokens column added to usage_stats");
         }
 
+        // ── Schema v10: Hindsight 远端记忆映射表（Task #19）──
+        // 本地记忆 id ↔ Hindsight bank/document/remote id 的映射，支持
+        // 异步写入、补同步与失效回收。bank_id 默认 'smoke-test'。
+        if version < 10 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS hindsight_map (
+                    local_id TEXT PRIMARY KEY,
+                    remote_id TEXT,
+                    bank_id TEXT NOT NULL DEFAULT 'smoke-test',
+                    document_id TEXT,
+                    synced_at INTEGER,
+                    status TEXT DEFAULT 'pending'
+                );
+                CREATE INDEX IF NOT EXISTS idx_hindsight_status ON hindsight_map(status);"
+            ).map_err(|e| format!("v10 migration failed: {}", e))?;
+
+            conn.execute("INSERT INTO schema_version(version) VALUES(10)", [])
+                .map_err(|e| format!("Version 10 insert failed: {}", e))?;
+
+            info!("Schema v10 migration: hindsight_map table created");
+        }
+
         Ok(())
     }
 
@@ -530,6 +566,100 @@ impl MemoryStore {
             }
         }
         Ok(out)
+    }
+
+    // ── Hindsight 映射表 CRUD（Task #19）─────────────────────
+
+    /// 登记一条待同步的本地记忆（status = 'pending'）。local_id 冲突时覆盖。
+    pub fn hindsight_map_insert(
+        &self,
+        local_id: &str,
+        bank_id: &str,
+        document_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO hindsight_map (local_id, bank_id, document_id, status)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![local_id, bank_id, document_id],
+        ).map_err(|e| format!("hindsight_map_insert failed: {}", e))?;
+        Ok(())
+    }
+
+    /// retain 成功后回填远端 id 并更新状态，同时写入 synced_at 时间戳。
+    pub fn hindsight_map_update_remote(
+        &self,
+        local_id: &str,
+        remote_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hindsight_map SET remote_id = ?2, status = ?3, synced_at = ?4 WHERE local_id = ?1",
+            params![local_id, remote_id, status, now],
+        ).map_err(|e| format!("hindsight_map_update_remote failed: {}", e))?;
+        Ok(())
+    }
+
+    /// 读取单条映射；不存在返回 None。
+    pub fn hindsight_map_get(&self, local_id: &str) -> Option<HindsightMapEntry> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT local_id, remote_id, bank_id, document_id, synced_at, status
+             FROM hindsight_map WHERE local_id = ?1",
+            params![local_id],
+            |row| Ok(HindsightMapEntry {
+                local_id: row.get(0)?,
+                remote_id: row.get(1)?,
+                bank_id: row.get(2)?,
+                document_id: row.get(3)?,
+                synced_at: row.get(4)?,
+                status: row.get(5)?,
+            }),
+        ).ok()
+    }
+
+    /// 取出待同步（status = 'pending'）的映射，按插入顺序，最多 limit 条。
+    pub fn hindsight_map_pending(&self, limit: usize) -> Vec<HindsightMapEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT local_id, remote_id, bank_id, document_id, synced_at, status
+             FROM hindsight_map WHERE status = 'pending' ORDER BY rowid ASC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("hindsight_map_pending prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![limit as i64], |row| {
+            Ok(HindsightMapEntry {
+                local_id: row.get(0)?,
+                remote_id: row.get(1)?,
+                bank_id: row.get(2)?,
+                document_id: row.get(3)?,
+                synced_at: row.get(4)?,
+                status: row.get(5)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("hindsight_map_pending query failed: {}", e);
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// 删除一条映射（本地记忆被清理时同步移除）。
+    pub fn hindsight_map_remove(&self, local_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM hindsight_map WHERE local_id = ?1",
+            params![local_id],
+        ).map_err(|e| format!("hindsight_map_remove failed: {}", e))?;
+        Ok(())
     }
 
     /// Store a conversation entry and update the FTS5 index.

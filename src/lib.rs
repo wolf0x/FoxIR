@@ -20,6 +20,7 @@ pub mod turn_decision;
 pub mod event_log;
 pub mod external_tools;
 pub mod heartbeat;
+pub mod hindsight_sync;
 pub mod knowledge;
 pub mod interject;
 pub mod log;

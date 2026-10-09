@@ -191,6 +191,56 @@ pub struct AgentConfig {
     /// gate / spawn depth) lands in Step 2a.
     #[serde(default)]
     pub modes: ModesConfig,
+    /// Hindsight 远端记忆体集成配置（Task #19 基础设施）。
+    #[serde(default)]
+    pub hindsight: HindsightConfig,
+}
+
+/// Hindsight 远端记忆体集成配置。
+///
+/// Hindsight 通过 MCP 端点（`http://{host}:{port}/mcp/{bank_id}/`）暴露
+/// retain / recall 能力。FoxIR 复用既有 MCP 客户端编程式调用，本结构承载
+/// 开关、超时与熔断参数，支持 Settings 页热更新。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HindsightConfig {
+    /// 总开关，默认开。
+    pub enabled: bool,
+    /// Hindsight 服务基址，默认 `http://localhost:8888`。
+    pub base_url: String,
+    /// Bearer token（加密存储）。
+    pub api_key: String,
+    /// 记忆体 bank 标识，默认 `smoke-test`。
+    pub bank_id: String,
+    /// 自动同步写入（retain），默认开。
+    pub auto_sync_write: bool,
+    /// 召回融合（recall），默认开。
+    pub auto_sync_read: bool,
+    /// 写入超时（毫秒），默认 10000。
+    pub write_timeout_ms: u64,
+    /// 读取超时（毫秒），默认 1500。
+    pub read_timeout_ms: u64,
+    /// 熔断阈值（连续失败次数），默认 5。
+    pub circuit_breaker_threshold: u32,
+    /// 熔断冷却（秒），默认 60。
+    pub circuit_breaker_cooldown_s: u64,
+}
+
+impl Default for HindsightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "http://localhost:8888".to_string(),
+            api_key: String::new(),
+            bank_id: "smoke-test".to_string(),
+            auto_sync_write: true,
+            auto_sync_read: true,
+            write_timeout_ms: 10000,
+            read_timeout_ms: 1500,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_cooldown_s: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -546,6 +596,7 @@ impl Default for Config {
                 expert_max_managed_rounds: default_expert_max_managed_rounds(),
                 expert_role_models: RoleModelsConfig::default(),
                 modes: ModesConfig::default(),
+                hindsight: HindsightConfig::default(),
             },
         }
     }
