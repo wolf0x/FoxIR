@@ -328,6 +328,9 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .think-body:not(.open){max-height:0;padding:0 12px;overflow:hidden}
 .think-body.open{padding:0 12px 10px;overflow-y:auto}
 .think-text{font-size:12px;color:var(--t2);font-style:italic;line-height:1.5;white-space:pre-wrap}
+/* E8 修复：done 态给可见边框，思考块不再"渲染了但看不见" */
+.think-block.done{border:1px solid rgba(118,75,162,.18);background:rgba(118,75,162,.03)}
+:root[data-theme="dark"] .think-block.done{border-color:rgba(196,181,253,.16);background:rgba(196,181,253,.04)}
 
 /* 閳光偓閳光偓 Tool Block 閳光偓閳光偓 */
 .tool-block{border-radius:var(--rs);margin:6px 0;transition:all .3s}
@@ -472,24 +475,24 @@ input:checked+.slider:before{transform:translateX(20px)}
 }
 .grok-attach.has-file .grok-dot{display:block}
 /* 模式按钮 + 下拉 */
-/* 模式切换：右下角分段钮 = 闪电 + Instant|Expert 两态文字，当前态高亮；整枚点击互切（沿用 #modeBtn + .expert class，JS 不变） */
-#modeBtn{margin-left:6px;height:24px;flex:none;padding:0 2px;border-radius:20px;cursor:pointer;
+/* 输出样式切换：右下角分段钮 = 图标 + Turn|Grouped 两态文字，当前态高亮；整枚点击互切（取代原 Instant|Expert 入口，Expert 由续接弹窗进入） */
+#styleBtn{margin-left:6px;height:24px;flex:none;padding:0 2px;border-radius:20px;cursor:pointer;
   display:inline-flex;align-items:center;
   border:1px solid #34495e;background:transparent;color:#95a5a6;font-family:system-ui,"Segoe UI",sans-serif;font-size:11px;line-height:1}
-#modeBtn .grok-bolt{width:11px;height:11px;color:#8fb4d6;margin:0 4px 0 6px}
-#modeBtn .mode-opt{padding:0 6px;opacity:.45;font-weight:600}
-#modeBtn .mode-sep{opacity:.3}
-#modeBtn .mode-instant{color:#3498db}
-#modeBtn .mode-expert{color:#8e44ad}
-#modeBtn:not(.expert) .mode-instant{opacity:1}
-#modeBtn.expert .mode-expert{opacity:1}
-#modeBtn.expert .grok-bolt{color:#b39ddb}
-#modeBtn:hover{border-color:var(--accent)}
-:root[data-theme="dark"] #modeBtn{border-color:#2a3442;color:#8b97a8}
-:root[data-theme="dark"] #modeBtn .grok-bolt{color:#7a5312}
-:root[data-theme="dark"] #modeBtn .mode-instant{color:#38bdf8}
-:root[data-theme="dark"] #modeBtn .mode-expert{color:#c4b5fd}
-:root[data-theme="dark"] #modeBtn.expert .grok-bolt{color:#c4b5fd}
+#styleBtn .sb-ico{width:11px;height:11px;color:#8fb4d6;margin:0 4px 0 6px}
+#styleBtn .style-opt{padding:0 6px;opacity:.45;font-weight:600}
+#styleBtn .style-sep{opacity:.3}
+#styleBtn .style-turn{color:#3498db}
+#styleBtn .style-grouped{color:#8e44ad}
+#styleBtn:not(.grouped) .style-turn{opacity:1}
+#styleBtn.grouped .style-grouped{opacity:1}
+#styleBtn.grouped .sb-ico{color:#b39ddb}
+#styleBtn:hover{border-color:var(--accent)}
+:root[data-theme="dark"] #styleBtn{border-color:#2a3442;color:#8b97a8}
+:root[data-theme="dark"] #styleBtn .sb-ico{color:#7a5312}
+:root[data-theme="dark"] #styleBtn .style-turn{color:#38bdf8}
+:root[data-theme="dark"] #styleBtn .style-grouped{color:#c4b5fd}
+:root[data-theme="dark"] #styleBtn.grouped .sb-ico{color:#c4b5fd}
 /* 发送 / 停止（狼头 LOGO 呼吸 ↔ 红色停止脉冲） */
 .grok-send{
   flex-shrink:0; width:34px; height:34px; border-radius:50%; border:none; cursor:pointer;
@@ -537,6 +540,62 @@ input:checked+.slider:before{transform:translateX(20px)}
 ::-webkit-scrollbar-track{background:#ecf0f1}
 ::-webkit-scrollbar-thumb{background:#bdc3c7;border-radius:4px}
 ::-webkit-scrollbar-thumb:hover{background:#95a5a6}
+
+/* ── 输出样式子系统：状态 pill / 事件行 / 组合式（spec 2026-10-10；类名隔离 .turngroup/.tcard/.tstrip/.tgevt，不复用 .tool-block）── */
+.tpill{font-size:10px;font-weight:600;padding:2px 8px;border-radius:9px;margin-left:6px;white-space:nowrap;flex:none}
+.tpill.ok{background:rgba(46,204,113,.14);color:#27ae60}
+.tpill.fail{background:rgba(231,76,60,.14);color:var(--red)}
+.tpill.running{background:rgba(52,152,219,.14);color:var(--accent)}
+:root[data-theme="dark"] .tpill.ok{color:var(--green)}
+.tdur{font-size:10px;color:var(--t3);margin-left:2px;font-family:var(--mono);flex:none}
+.evt-line{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--t2);padding:3px 12px;margin:4px 0;border-left:2px solid var(--border)}
+.evt-line.warn{color:var(--red);border-left-color:var(--red)}
+.turngroup{border:1px solid var(--border);border-radius:10px;margin:8px 0;background:var(--bg2);overflow:hidden}
+.turngroup.has-bad{border-color:rgba(231,76,60,.4)}
+:root[data-theme="dark"] .turngroup{border-color:#1f2733;background:#10161e}
+:root[data-theme="dark"] .turngroup.has-bad{border-color:rgba(248,113,113,.35)}
+.tg-hdr{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;user-select:none;flex-wrap:wrap}
+.tg-hdr:hover{background:rgba(52,152,219,.05)}
+:root[data-theme="dark"] .tg-hdr:hover{background:#141922}
+.tg-title{font-size:12px;font-weight:700;color:var(--t1)}
+.tg-stat{font-size:11px;color:var(--t2)}
+.tg-hist{display:flex;gap:4px;margin-left:2px}
+.tg-dur{font-size:11px;color:var(--t3);margin-left:auto;font-family:var(--mono)}
+.tg-drop{font-size:10px;color:var(--orange)}
+.tg-arrow{font-size:10px;color:var(--t3);transition:transform .25s}
+.turngroup.open>.tg-hdr .tg-arrow{transform:rotate(180deg)}
+.turngroup.open>.tg-body{display:block}
+.tg-body{display:none;padding:4px 12px 12px}
+.hchip{font-size:10px;font-weight:700;padding:1px 7px;border-radius:8px;font-family:var(--mono);background:rgba(127,140,141,.14);color:var(--t2)}
+.hchip.PS{background:rgba(52,152,219,.13);color:var(--accent)}
+.hchip.SH{background:rgba(26,188,156,.14);color:#148f77}
+.hchip.IR{background:rgba(118,75,162,.14);color:var(--purple)}
+.hchip.SYS{background:rgba(230,126,34,.15);color:#b9770e}
+.hchip.FS{background:rgba(46,204,113,.14);color:#27ae60}
+.hchip.NET{background:rgba(22,160,133,.14);color:#16a085}
+:root[data-theme="dark"] .hchip.SH{color:var(--cyan)}
+:root[data-theme="dark"] .hchip.SYS{color:var(--orange)}
+:root[data-theme="dark"] .hchip.FS{color:var(--green)}
+:root[data-theme="dark"] .hchip.NET{color:var(--cyan)}
+.tstrip{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--purple);padding:5px 10px;margin:4px 0;border-radius:var(--rs);background:rgba(118,75,162,.05);cursor:pointer;user-select:none}
+:root[data-theme="dark"] .tstrip{color:var(--purple);background:rgba(196,181,253,.05)}
+.tstrip:hover{background:rgba(118,75,162,.1)}
+.tstrip .peek{color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.tstrip .full{display:none;white-space:pre-wrap;color:var(--t2);line-height:1.7;font-style:italic}
+.tstrip.open{align-items:flex-start;flex-wrap:wrap}
+.tstrip.open .peek{display:none}
+.tstrip.open .full{display:block;flex:1 1 100%}
+.tcard{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:4px 0;border:1px solid var(--border);border-radius:var(--rs);background:var(--bg);cursor:pointer;flex-wrap:wrap}
+.tcard:hover{border-color:var(--accent)}
+:root[data-theme="dark"] .tcard{background:#0d1117;border-color:#1f2733}
+.tcard .region{flex:none}
+.tcard .nm{font-size:12px;font-family:var(--mono);color:var(--t1);font-weight:600}
+.tcard .clause{font-size:12px;color:var(--t2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:60px}
+.tcard .out{flex:1 1 100%;display:none;font-family:var(--mono);font-size:11px;color:var(--t2);background:var(--bg2);border-radius:var(--rs);padding:8px 10px;white-space:pre-wrap;line-height:1.6;max-height:320px;overflow-y:auto}
+:root[data-theme="dark"] .tcard .out{background:#0a0d12}
+.tcard.open .out{display:block}
+.tgevt{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--t2);padding:3px 10px;margin:4px 0}
+.tgevt .t{color:var(--t3);font-family:var(--mono);font-size:10px}
 
 /* Responsive */
 @media(max-width:1000px){.log-panel{display:none}.sidebar{width:160px}}
@@ -1954,8 +2013,8 @@ input:checked+.slider:before{transform:translateX(20px)}
           </div>
           <div class="panel-ftr">
                     <button id="themeToggle" type="button" title="Toggle light / dark theme" aria-label="Toggle light / dark theme"><span class="tt-ico">◐</span><span class="tt-opt tt-light">Light</span><span class="tt-sep">|</span><span class="tt-opt tt-dark">Dark</span></button>
-                    <button id="modeBtn" type="button" aria-pressed="false" title="Instant — single-turn direct answer · click to switch to Expert">
-                      <svg class="grok-bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span class="mode-opt mode-instant">Instant</span><span class="mode-sep">|</span><span class="mode-opt mode-expert">Expert</span>
+                    <button id="styleBtn" type="button" aria-pressed="false" title="Turn-by-turn view — click to switch to grouped">
+                      <svg class="sb-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/></svg><span class="style-opt style-turn">Turn</span><span class="style-sep">|</span><span class="style-opt style-grouped">Grouped</span>
                     </button>
                   </div>
         </div>
@@ -2024,6 +2083,10 @@ function snapshotCurrentSession(){
     msgHist: msgHist.slice(),
     logHist: logHist.slice(),
     html: streamingNow ? '' : ((document.getElementById('convArea')||{}).innerHTML||''),
+    log: OUT.log.slice(),
+    style: OUT.style,
+    dropped: OUT.dropped,
+    htmlAt: OUT.log.length,
   };
 }
 function restoreCurrentSession(){
@@ -2031,13 +2094,17 @@ function restoreCurrentSession(){
   const conv=document.getElementById('convArea');
   if(s){
     msgHist=s.msgHist.slice();logHist=s.logHist.slice();
+    OUT.log=(s.log||[]).slice();OUT.dropped=s.dropped||0;gsReset();
     if(conv){
-      if(s.html){
-        // Normal case: the snapshot captured a stable DOM.
+      if(OUT.log.length&&s.style===OUT.style&&s.html&&s.htmlAt>=OUT.log.length){
+        // html 快速路径：风格未变且日志未增长（spec §4）
+        conv.innerHTML=s.html;
+      } else if(OUT.log.length){
+        // 风格变了或有后台新事件 → 从事件日志重建（内容无损）
+        rebuild();
+      } else if(s.html){
         conv.innerHTML=s.html;
       } else if(msgHist.length){
-        // Snapshot carried no DOM because it was taken mid-stream. Re-render
-        // from stored text so user/assistant history is NOT lost on switch-back.
         conv.innerHTML='';
         renderHistMessages(msgHist);
       } else {
@@ -2045,7 +2112,8 @@ function restoreCurrentSession(){
       }
     }
   }
-  else{msgHist=[];logHist=[];if(conv)conv.innerHTML='';}
+  else{msgHist=[];logHist=[];OUT.log=[];OUT.dropped=0;gsReset();if(conv)conv.innerHTML='';}
+  renderStyleBtn(!OUT.log.length)
 }
 function clearCurrentSessionUI(){
   curToolMap={};curThinkEl=null;curTextEl=null;textAccum='';lastInvId=null;
@@ -2207,8 +2275,9 @@ async function newSession(){
     const conv=document.getElementById('convArea');
     if(conv)conv.innerHTML='';
     msgHist=[];logHist=[];clearCurrentSessionUI();
+    OUT.log=[];OUT.dropped=0;gsReset();
     setManagedMode(currentSessionMode()); // new session defaults to Instant
-    sessionSnapshots[d.id]={msgHist:[],logHist:[],html:''};
+    sessionSnapshots[d.id]={msgHist:[],logHist:[],html:'',log:[],style:OUT.style,dropped:0,htmlAt:0};
     if(ws&&connected){ws.send(JSON.stringify({type:'clear',session:SESSION_ID}));}
     loadSessions();
     loadTodos(SESSION_ID);
@@ -2362,7 +2431,7 @@ function connectWs(){
   addLog('Connecting...','info');
   ws=new WebSocket(url);
   ws.onopen=()=>{addLog('Authenticating...','info');ws.send(JSON.stringify({type:'auth',password:pwd}))};
-  ws.onmessage=e=>{try{handleMsg(JSON.parse(e.data))}catch(err){console.error(err)}};
+  ws.onmessage=e=>{try{emit(JSON.parse(e.data))}catch(err){console.error(err)}};
   ws.onerror=()=>{addLog('Connection failed','error')};
   ws.onclose=()=>{
     const wasConnected=connected;
@@ -2422,6 +2491,238 @@ function updateStatus(){
 }
 
 // 閳光偓閳光偓 Message Handler 閳光偓閳光偓
+// ════════ 输出样式子系统（spec 2026-10-10：事件日志为真相，HTML 快照降级为缓存）════════
+const OUT={log:[],style:'turn',replaying:false,dropped:0};
+const OUT_LOG_CAP=2000,OUT_BODY_REF=65536;
+try{var _ost=localStorage.getItem('foxir.outstyle');if(_ost==='grouped'||_ost==='turn')OUT.style=_ost}catch(e){}
+// 重放期间不得重复提交历史/副作用（msgHist、saveHist、原生通知）
+function histPush(m){if(OUT.replaying)return;msgHist.push(m);saveHist()}
+// 有界日志：单条正文 >64KB 只存引用与摘要；丢弃必须可见
+ function outLogPush(m){
+  var e=m;
+  try{
+    var big=(typeof m.result==='string'&&m.result.length>OUT_BODY_REF)||(typeof m.content==='string'&&m.content.length>OUT_BODY_REF)||(m.imgs&&m.imgs.some(function(s){return typeof s==='string'&&s.length>OUT_BODY_REF}));
+    if(big){e=JSON.parse(JSON.stringify(m));
+      if(typeof e.result==='string'&&e.result.length>OUT_BODY_REF)e.result=e.result.slice(0,4096)+'\n…[truncated '+(e.result.length-4096)+' chars — re-run the tool for full output]';
+      if(typeof e.content==='string'&&e.content.length>OUT_BODY_REF)e.content=e.content.slice(0,4096)+'\n…[truncated]';
+      if(e.imgs)e.imgs=e.imgs.map(function(s){return s.length>OUT_BODY_REF?'[image too large to regroup]':s});
+      e._trunc=true}
+  }catch(err){e=m}
+  OUT.log.push(e);
+  if(OUT.log.length>OUT_LOG_CAP){OUT.dropped+=OUT.log.length-OUT_LOG_CAP;OUT.log.splice(0,OUT.log.length-OUT_LOG_CAP)}
+}
+// 唯一入口：跨会话流事件走 handleMsg 的 bgBuffer 路由（不入本会话日志）；其余先入日志再装配。
+// worker 碎片抑制留在装配层（硬约束1），日志永远记原始事件。
+function emit(msg){
+  if(!msg||!msg.type)return;
+  var _stream=['thinking','text','tool_call','tool_result','progress'];
+  var _sid=msg.session||taskSessionId||SESSION_ID;
+  if(_stream.indexOf(msg.type)>=0&&_sid!==SESSION_ID){handleMsg(msg);return}
+  outLogPush(msg);paintOne(msg);
+}
+function paintOne(msg){
+  try{
+    if(msg.type.charAt(0)==='_'){paintSynthetic(msg);return}
+    if(OUT.style==='grouped')paintGrouped(msg);else handleMsg(msg)
+  }catch(err){
+    console.error('paintOne',msg&&msg.type,err);
+    var c=document.getElementById('convArea');
+    if(c){var w=document.createElement('div');w.className='evt-line warn';w.textContent='⚠ 事件渲染失败，已跳过: '+((msg&&msg.type)||'?');c.appendChild(w)}
+  }
+}
+// 非 WS 事件的本地渲染（用户/助手泡泡）也进日志，保证重建无损
+function paintSynthetic(msg){
+  finalizeThink();finalizeTextBlock();
+  if(msg.type==='_user')showUserMsg(msg.content,(msg.imgs&&msg.imgs.length)?msg.imgs:(msg.time||''));
+  else if(msg.type==='_assistant')showAssistantMsg(msg.content,msg.time)
+}
+// 全量重建：先复位装配状态袋（硬约束2），再逐条重放日志
+function rebuild(){
+  var log=OUT.log.slice(),prev=OUT.replaying;
+  OUT.replaying=true;
+  try{
+    clearCurrentSessionUI();gsReset();
+    var c=document.getElementById('convArea');if(c)c.innerHTML='';
+    for(var i=0;i<log.length;i++)paintOne(log[i])
+  }catch(err){console.error('rebuild',err);addLog('Rebuild failed midway: '+err,'error')}
+  OUT.replaying=prev;
+  scrollBottom(false)
+}
+function setOutStyle(s){
+  if(s!=='turn'&&s!=='grouped')return;
+  if(s===OUT.style)return;
+  if(!OUT.log.length){
+    // 历史恢复的会话没有可重放事件：不切换，按钮标注（spec §7）
+    addLog('Output style: nothing to regroup in this session (restored from history)','warn');
+    renderStyleBtn(true);return
+  }
+  OUT.style=s;
+  try{localStorage.setItem('foxir.outstyle',s)}catch(e){}
+  rebuild();renderStyleBtn()
+}
+function renderStyleBtn(noEvents){
+  var b=document.getElementById('styleBtn');if(!b)return;
+  b.classList.toggle('grouped',OUT.style==='grouped');
+  b.setAttribute('aria-pressed',OUT.style==='grouped'?'true':'false');
+  b.title=OUT.style==='grouped'
+    ?(noEvents?'Grouped — this session was restored from history; no events to regroup':'Grouped view — click to switch to turn-by-turn')
+    :'Turn-by-turn view — click to switch to grouped'
+}
+
+// ── 组合式装配器：一个 invocation 一个组；invocation 缺失/恒定时（Instant）一个用户回合一个组 ──
+var gs={grp:null,cards:{},strip:null,striping:false,seq:0};
+function gsReset(){gs={grp:null,cards:{},strip:null,striping:false,seq:0}}
+var REGION_PREFIX=[['ir_','IR'],['malware_','IR'],['yara','IR'],['sys_','SYS'],['svc_','SYS'],['cron_','SYS'],['app_','SYS'],['file_','FS'],['dir_','FS'],['net_','NET'],['pcap_','NET'],['winrm','SH'],['shell_exec','SH'],['cmd_exec','SH'],['powershell','PS']];
+function regionOf(n){n=n||'tool';for(var i=0;i<REGION_PREFIX.length;i++){if(n.indexOf(REGION_PREFIX[i][0])===0)return REGION_PREFIX[i][1]}return 'TOOL'}
+// 参数摘要（回合式/组合式共用）
+function toolSummary(args){
+  var summary='';
+  try{
+    const a=typeof args==='string'?JSON.parse(args):args;
+    if(a.command)summary=a.command.substring(0,60);
+    else if(a.path)summary=a.path;
+    else if(a.url)summary=a.url;
+    else if(a.app||a.program)summary=a.app||a.program;
+    else{const k=Object.keys(a||{});if(k.length)summary=k.map(k=>k+':'+JSON.stringify(a[k]).substring(0,20)).join(', ').substring(0,60)}
+  }catch(e){}
+  return summary
+}
+// E7 修复（部分）：只认结果里的显式错误信号；超时/被杀需后端字段（P4），不猜不编（spec §4）
+function toolStatus(result){
+  var p=result;
+  if(typeof result==='string'){try{p=JSON.parse(result)}catch(e){p=null}}
+  if(p&&typeof p==='object'){
+    if(p.error||p.ok===false||p.success===false||p.status==='error')return 'fail'
+  }
+  return 'ok'
+}
+function pillEl(st){
+  var sp=document.createElement('span');
+  sp.className='tpill '+(st==='fail'?'fail':st==='running'?'running':'ok');
+  sp.textContent=st==='fail'?'✗ failed':st==='running'?'▶':'✓';
+  return sp
+}
+function gsClose(){
+  if(!gs.grp)return;
+  if(!gs.grp.dataset.bad)gs.grp.classList.remove('open'); // 无失败即折叠：“失败就是新闻”（spec §8）
+  gs.grp=null;gs.cards={};gs.strip=null;gs.striping=false
+}
+function gsOpen(inv){
+  gsClose();
+  var c=document.getElementById('convArea');if(!c)return null;
+  var g=document.createElement('div');g.className='turngroup open';
+  if(inv)g.dataset.inv=inv;
+  var drop=++gs.seq===1&&OUT.dropped?'<span class="tg-drop">… '+OUT.dropped+' earlier events omitted</span>':'';
+  g.innerHTML='<div class="tg-hdr" onclick="this.parentElement.classList.toggle(\'open\')">'+
+    '<span class="tg-title">🗂 '+gs.seq+'</span>'+
+    '<span class="tg-stat">0 tool calls</span><span class="tg-hist"></span>'+drop+
+    '<span class="tg-dur">Total —</span><span class="tg-arrow">▾</span></div><div class="tg-body"></div>';
+  c.appendChild(g);gs.grp=g;gs.cards={};gs.strip=null;gs.striping=false;
+  scrollBottom();return g
+}
+function gsBody(){var g=gs.grp;return g?g.querySelector('.tg-body'):null}
+function gsNeed(inv){
+  if(!gs.grp){gsOpen(inv);return}
+  if(inv&&gs.grp.dataset.inv&&gs.grp.dataset.inv!==inv)gsOpen(inv); // Expert 多 invocation 按调用切组
+  if(inv&&!gs.grp.dataset.inv)gs.grp.dataset.inv=inv
+}
+function tgUpd(){
+  var g=gs.grp;if(!g)return;
+  var body=g.querySelector('.tg-body');
+  var cards=body.querySelectorAll('.tcard');
+  g.querySelector('.tg-stat').textContent=cards.length+' tool call'+(cards.length===1?'':'s');
+  var cnt={};
+  Array.prototype.forEach.call(cards,function(cd){var r=cd.dataset.region||'TOOL';cnt[r]=(cnt[r]||0)+1});
+  var hs=g.querySelector('.tg-hist');
+  hs.innerHTML=Object.keys(cnt).map(function(r){return '<span class="hchip '+r+'">'+r+'·'+cnt[r]+'</span>'}).join('');
+  // 总时长与 bypass 计数：后端字段第二笔（P4）落地前显示 — / 隐藏，不显示假数（spec §4/§6）
+}
+function gsNewStrip(inv){
+  gsNeed(inv);
+  var body=gsBody();if(!body)return null;
+  if(gs.strip&&gs.striping)return gs.strip;
+  var s=document.createElement('div');s.className='tstrip';
+  s.innerHTML='💭 <span class="peek"></span><span class="full"></span>';
+  s.addEventListener('click',function(ev){ev.stopPropagation();s.classList.toggle('open')});
+  body.appendChild(s);gs.strip=s;gs.striping=true;
+  return s
+}
+function gsStopStrip(){if(gs.strip)gs.striping=false}
+function gsMakeCard(name,callId,args){
+  var d=document.createElement('div');d.className='tcard';
+  var region=regionOf(name);d.dataset.region=region;d.dataset.callId=callId||'';
+  var sum=toolSummary(args);
+  var argsStr=typeof args==='string'?args:JSON.stringify(args||{},null,2);
+  d.innerHTML='<span class="region hchip '+region+'">'+region+'</span><span class="nm">'+esc(name||'tool')+'</span>'+
+    '<span class="clause">'+esc(sum||'—')+'</span>';
+  d.appendChild(pillEl('running'));
+  var td=document.createElement('span');td.className='tdur';td.textContent='—';d.appendChild(td);
+  var out=document.createElement('div');out.className='out';out.textContent=argsStr;d.appendChild(out);
+  d.addEventListener('click',function(){d.classList.toggle('open')});
+  gsBody().appendChild(d);
+  if(callId)gs.cards[callId]=d;
+  return d
+}
+function paintGrouped(msg){
+  if(isWorkerFragment(msg))return; // 抑制在装配层；事件已入日志，切回合式时重现（硬约束1）
+  var inv=msg.invocation_id||'';
+  switch(msg.type){
+    case 'thinking':
+      if(!msg.content||!msg.content.trim())break;
+      var s=gsNewStrip(inv);if(!s)break;
+      var full=s.querySelector('.full'),peek=s.querySelector('.peek');
+      full.textContent+=msg.content;
+      if(!peek.textContent)peek.textContent=msg.content.trim().substring(0,42)+'…';
+      break;
+    case 'tool_call':
+      gsStopStrip();
+      gsMakeCard(msg.name,msg.call_id,msg.args);tgUpd();
+      break;
+    case 'tool_result':{
+      var card=gs.cards[msg.call_id];
+      if(!card){
+        // 找不到 call_id：记 warn 并新建，绝不静默丢（spec §6/§7）
+        console.warn('grouped: orphan tool_result',msg.call_id);
+        gsNeed(inv);
+        card=gsMakeCard(msg.name,msg.call_id||('orphan-'+msg.call_id),{note:'re-attached result (card was not in this view)'});
+      }
+      var st=toolStatus(msg.result);
+      var pl=card.querySelector('.tpill');if(pl)pl.remove();
+      var newPill=pillEl(st);var dur=card.querySelector('.tdur');
+      card.insertBefore(newPill,dur);
+      var resTxt=typeof msg.result==='string'?msg.result:JSON.stringify(msg.result,null,2);
+      var out=card.querySelector('.out');
+      if(out)out.textContent+='\n→ '+resTxt;
+      if(st==='fail'){
+        if(gs.grp){gs.grp.dataset.bad='1';gs.grp.classList.add('has-bad')}
+        card.classList.add('open')
+      }
+      tgUpd();break}
+    case 'progress':
+      if(msg.message){
+        gsNeed(inv);
+        var ln=document.createElement('div');ln.className='tgevt';
+        ln.innerHTML='ℹ️ '+esc(msg.message)+' <span class="t">'+nowTimeStr()+'</span>';
+        gsBody().appendChild(ln)
+      }
+      break;
+    case 'permission_request':
+      gsStopStrip();gsNeed(inv);
+      renderPermRequest(msg,gsBody());
+      break;
+    case 'subagent_spawned':case 'subagent_completed':case 'subagent_failed':case 'budget_update':case 'plan_updated':
+      gsStopStrip();gsNeed(inv);
+      expertHandleMsg(msg);handleSubAgentCard(msg,gsBody());
+      break;
+    case 'text':case 'done':case 'error':case 'notification':case 'expert_prompt':case 'usage':
+      gsClose();handleMsg(msg); // 正文气泡与状态类不进组，复用现有画家
+      break;
+    default:
+      handleMsg(msg)
+  }
+  scrollBottom()
+}
+
 function handleMsg(msg){
   if(!msg||!msg.type)return;
   // P0-B: suppress raw worker fragments (thinking/text/tool/progress) from the
@@ -2445,7 +2746,7 @@ function handleMsg(msg){
       addLog('Session running in background: '+_bgSess.slice(0,8)+'…','info');
     }
     var _b=bgBuffer[_bgSess];
-    _b.events.push({type:msg.type,content:msg.content,name:msg.name,call_id:msg.call_id,args:msg.args,result:msg.result});
+    _b.events.push({type:msg.type,content:msg.content,name:msg.name,call_id:msg.call_id,args:msg.args,result:msg.result,invocation_id:msg.invocation_id,tool_name:msg.tool_name,message:msg.message});
     if(msg.type==='text'&&msg.content){_b.text+=msg.content;}
     markSessionRunning(_bgSess,true);
     return;
@@ -2466,6 +2767,18 @@ function handleMsg(msg){
       if(_b&&_b.events&&_b.events.length){
         var _toolEv=_b.events.filter(function(ev){return ev.type==='tool_call'||ev.type==='tool_result';});
         if(_toolEv.length){_snap.pendingEvents=_snap.pendingEvents.concat(_toolEv);}
+        // Spec 2026-10-10: fold the background stream into that session's event log
+        // (minus text, which lives in msgHist as a single committed message) so the
+        // view can be REBUILT from events when switching back — this is what fixes
+        // E2 (tool cards lost on switch-back). Longer log than the html cache was
+        // taken at forces the rebuild instead of the stale-DOM fast path.
+        _snap.log=_snap.log||[];
+        for(var _ei=0;_ei<_b.events.length;_ei++){
+          var _ev=_b.events[_ei];
+          if(_ev.type==='text')continue;
+          _snap.log.push(_ev)
+        }
+        _snap.pendingEvents=[];
       }
       delete bgBuffer[_fin];
     }
@@ -2475,7 +2788,7 @@ function handleMsg(msg){
   // Expert mode multi-round: when the invocation_id changes (Manager Plan vs
   // Executor round, or between Executor rounds), finalize the current text
   // block so the next segment starts a fresh bubble instead of appending.
-  if(managedMode&&msg.invocation_id&&lastInvId&&msg.invocation_id!==lastInvId){if(textAccum&&textAccum.trim()){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}finalizeTextBlock();}
+  if(managedMode&&msg.invocation_id&&lastInvId&&msg.invocation_id!==lastInvId){if(textAccum&&textAccum.trim()){histPush({role:'assistant',text:textAccum.trim(),time:nowTimeStr()})}finalizeTextBlock();}
   if(msg.invocation_id){lastInvId=msg.invocation_id;}
   switch(msg.type){
     case 'auth_ok':connected=true;reconnectAttempts=0;updateStatus();addLog('Authenticated','info');loadModels();sendPerms();renderPerms();sendAttach();break;
@@ -2510,20 +2823,31 @@ function handleMsg(msg){
       scrollBottom();break;
     case 'tool_result':
       let blk=curToolMap[msg.call_id];
-      if(blk)updateToolResult(blk,msg.result);
+      if(!blk){
+        // E7 修复：孤儿结果不再静默丢弃——记 warn 并补建卡片（spec §6/§7）
+        console.warn('orphan tool_result in turn view',msg.call_id);
+        blk=createToolBlock(msg.name||'tool',msg.call_id,{});
+        appendToConv(blk);curToolMap[msg.call_id]=blk
+      }
+      updateToolResult(blk,msg.result);
       addLog('Tool: '+msg.name,'tool');
       scrollBottom();break;
     case 'progress':
       // Update the current tool block header with progress/heartbeat info
-      if(msg.tool_name){
+      if(msg.tool_name||msg.message){
         let pblk=curToolMap[Object.keys(curToolMap).pop()];
-        if(pblk){
+        if(pblk&&msg.tool_name){
           let sumEl=pblk.querySelector('.tool-summary');
           if(sumEl)sumEl.textContent=msg.message||'Running...';
           else{
             let hdr=pblk.querySelector('.tool-hdr');
             if(hdr){let s=document.createElement('span');s.className='tool-summary';s.textContent=msg.message||'Running...';hdr.insertBefore(s,hdr.querySelector('.arrow'));}
           }
+        } else if(!pblk&&msg.message){
+          // E6 修复：回合开始前到达的状态行不再静默丢弃，落到独立事件行
+          var _ln=document.createElement('div');_ln.className='evt-line';
+          _ln.textContent='ℹ️ '+msg.message;
+          appendToConv(_ln)
         }
       }
       break;
@@ -2576,8 +2900,7 @@ function handleMsg(msg){
           if(msg.content){
             // Render it as a user-side bubble so it does not vanish.
             showUserMsg(msg.content,[]);
-            msgHist.push({role:'user',text:msg.content,time:nowTimeStr()});
-            saveHist();
+            histPush({role:'user',text:msg.content,time:nowTimeStr()});
             // It is no longer pending in the inject bar.
             var lij=curInterjects();var qi=lij.indexOf(msg.content);
             if(qi>=0){lij.splice(qi,1);renderInterjectBar();updateSendState();}
@@ -2595,7 +2918,7 @@ function handleMsg(msg){
       // active one. When a background session finishes while another is still
       // streaming, do not clobber the active session's live tool cards/text.
       if(_doneSid===null||_doneSid===SESSION_ID){
-        if(textAccum){msgHist.push({role:'assistant',text:textAccum.trim(),time:nowTimeStr()});saveHist()}
+        if(textAccum){histPush({role:'assistant',text:textAccum.trim(),time:nowTimeStr()})}
         finalizeTextBlock();
         curToolMap={};
         lastInvId=null;
@@ -2731,15 +3054,7 @@ function finalizeThink(){
 // 閳光偓閳光偓 Tool Block 閳光偓閳光偓
 function createToolBlock(name,callId,args){
   const d=document.createElement('div');d.className='tool-block active';
-  let summary='';
-  try{
-    const a=typeof args==='string'?JSON.parse(args):args;
-    if(a.command)summary=a.command.substring(0,60);
-    else if(a.path)summary=a.path;
-    else if(a.url)summary=a.url;
-    else if(a.app||a.program)summary=a.app||a.program;
-    else{const k=Object.keys(a);if(k.length)summary=k.map(k=>k+':'+JSON.stringify(a[k]).substring(0,20)).join(', ').substring(0,60)}
-  }catch(e){}
+  const summary=toolSummary(args);
   const argsStr=typeof args==='string'?args:JSON.stringify(args,null,2);
   d.innerHTML='<div class="tool-hdr" onclick="toggleBlock(this)">&#9881; '+esc(name)+(summary?' <span class="tool-summary">'+esc(summary)+'</span>':'')+' <span class="arrow">&#9660;</span></div><div class="tool-body"><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Arguments</div><pre>'+esc(argsStr)+'</pre><div class="tool-result" style="display:none"><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Result</div><pre class="tool-res"></pre></div></div>';
   d.dataset.callId=callId;
@@ -2748,6 +3063,14 @@ function createToolBlock(name,callId,args){
 function updateToolResult(blk,result){
   blk.classList.remove('active');
   blk.classList.add('done');
+  // E7 修复：成功/失败在卡片上可区分（fail 基于显式错误信号；超时/被杀等后端字段 P4）
+  var _hdr=blk.querySelector('.tool-hdr');
+  if(_hdr&&!_hdr.querySelector('.tpill')){
+    var _st=toolStatus(result);
+    var _tp=pillEl(_st);
+    _hdr.insertBefore(_tp,_hdr.querySelector('.arrow'));
+    if(_st==='fail')blk.style.borderColor='rgba(231,76,60,.45)'
+  }
   const rs=blk.querySelector('.tool-result');
   if(rs){
     rs.style.display='block';
@@ -3061,9 +3384,10 @@ document.addEventListener('DOMContentLoaded',function(){
   if(attInput)attInput.addEventListener('change',function(e){handleAttachFiles(e.target.files);e.target.value='';});
   const attBtn=document.getElementById('attachBtn');
   if(attBtn)attBtn.addEventListener('click',function(){attInput.click();});
-  // 模式切换：左下角那颗按钮，两态直接点击互切
-  const modeBtn=document.getElementById('modeBtn');
-  if(modeBtn)modeBtn.addEventListener('click',function(){setManagedMode(!managedMode);});
+  // 输出样式切换：右下角分段钮 Turn|Grouped 点击互切（取代原 Instant|Expert 入口；Expert 由任务启动弹窗进入）
+  const styleBtn=document.getElementById('styleBtn');
+  if(styleBtn)styleBtn.addEventListener('click',function(){setOutStyle(OUT.style==='grouped'?'turn':'grouped')});
+  renderStyleBtn(!OUT.log.length);
   // 拖拽上传
   const bar=document.querySelector('.grok-bar');
   if(bar){
@@ -3107,6 +3431,8 @@ function sendMsg(){
   if((!sendTxt&&pendingImages.length===0)||!connected)return;
   const imgs=pendingImages.map(i=>i.data);
   showUserMsg(txt,imgs);inp.value='';inp.style.height='auto';
+  // 用户泡泡是本地渲染、不进 WS 事件流：必须记成合成事件，否则 rebuild 后丢失
+  outLogPush({type:'_user',content:txt,imgs:imgs,time:nowTimeStr()});
   msgHist.push({role:'user',text:txt,time:nowTimeStr(),images:imgs.length?imgs:undefined});saveHist();
   // 先提取附件数据，再清空 pending 数组
   var atts=[];
@@ -3286,6 +3612,7 @@ function injectInterject(i){
   // The user explicitly chose to inject now: it is entering execution, so it
   // is rendered as a user-side bubble immediately (unlike a plain queued one).
   showUserMsg(content,[]);
+  outLogPush({type:'_user',content:content,imgs:[],time:nowTimeStr()});
   msgHist.push({role:'user',text:content,time:nowTimeStr()});
   saveHist();
   renderInterjectBar();updateSendState();
@@ -3318,6 +3645,7 @@ function clearChat(){
   document.getElementById('convArea').innerHTML='';
   document.getElementById('logArea').innerHTML='';
   msgHist=[];logHist=[];curToolMap={};curThinkEl=null;curTextEl=null;textAccum='';msgQueue=[];lastInvId=null;
+  OUT.log=[];OUT.dropped=0;gsReset();
   // Keep the same session id; only clear the active session's transcript.
   if(sessionSnapshots[SESSION_ID])sessionSnapshots[SESSION_ID].msgHist=[];
   saveHist();
@@ -4264,7 +4592,7 @@ function showNotification(message, timestamp, skipHist){
   const nc=d.querySelector('.msg-content');if(nc)addCopyBtns(nc);
   if(!skipHist)scrollBottom(false);
   // Also try browser native notification (plain text only) 鈥?skip when restoring history
-  if(!skipHist){
+  if(!skipHist&&!OUT.replaying){
     const plainText = message.replace(/[*#_~`\[\]]/g, '').substring(0, 200);
     if('Notification' in window && Notification.permission==='granted'){
       new Notification('FoxIR Reminder',{body:plainText,icon:''});
@@ -4273,8 +4601,7 @@ function showNotification(message, timestamp, skipHist){
     }
     addLog('Reminder delivered','info');
     // Persist notification to history
-    msgHist.push({role:'notification',text:message,time:time});
-    saveHist();
+    histPush({role:'notification',text:message,time:time});
   }
 }
 function loadHist(){
@@ -4379,17 +4706,10 @@ function setManagedMode(on){
   // Sync Settings toggle
   const globalToggle=document.getElementById('globalManagedToggle');
   if(globalToggle)globalToggle.checked=on;
-  // Show/hide Expert settings section
+  // Sync the Expert settings section (footer mode button removed — replaced by output-style toggle;
+  // Expert is entered via the task-continuation prompt, not a persistent switch)
   const expertSection=document.getElementById('expertSettingsSection');
   if(expertSection)expertSection.style.display=on?'block':'none';
-  // Sync the footer mode button: state lives in the bolt's colour, the words
-  // only appear as the hover tooltip.
-  const modeBtn=document.getElementById('modeBtn');
-  if(modeBtn){
-    modeBtn.classList.toggle('expert',on);
-    modeBtn.setAttribute('aria-pressed',on?'true':'false');
-    modeBtn.title=on?'Expert — long-task loop · click to switch back to Instant':'Instant — single-turn direct answer · click to switch to Expert';
-  }
   const sendBtn=document.getElementById('sendBtn');
   if(sendBtn)sendBtn.classList.toggle('expert',on);
 }
@@ -4612,11 +4932,11 @@ function saveExtendedSettings(){
 }
 function sendPerms(){
   if(ws&&connected){
-    ws.send(JSON.stringify({type:'permissions',read:permissions.read,write:permissions.write,delete:permissions.delete,modify:permissions.modify,execute:permissions.execute}));
+    ws.send(JSON.stringify({type:'permissions',read:permissions.read,write:permissions.write,delete:permissions.delete,modify:permissions.modify,execute:permissions.execute,system:permissions.system}));
   }
 }
-function renderPermRequest(msg){
-  const conv=document.getElementById('convArea');
+function renderPermRequest(msg,parent){
+  const conv=parent||document.getElementById('convArea');
   // Add agent message restating the request
   const agentMsg=document.createElement('div');
   agentMsg.className='msg assistant';
@@ -5300,7 +5620,7 @@ function isWorkerFragment(msg){
   return false;
 }
 
-function handleSubAgentCard(msg){
+function handleSubAgentCard(msg,host){
   try{
     const run_id=msg.run_id||'', role=msg.role||'sub-agent';
     if(msg.type==='subagent_spawned'){
@@ -5315,7 +5635,7 @@ function handleSubAgentCard(msg){
           '<span class="sub-role">'+esc(role)+'</span>'+
           '<span class="sub-tok">0 tok</span></div>'+
           '<div class="sub-body"><div class="sub-sum">Worker dispatched…</div><div class="sub-ev"></div></div>';
-        appendToConv(card);
+        if(host)host.appendChild(card);else appendToConv(card);
         subAgentCards[run_id]=card;
       }
     }else if(msg.type==='budget_update'){
