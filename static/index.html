@@ -3054,15 +3054,12 @@ function hideTyping(){const el=document.getElementById('typingInd');if(el)el.rem
 // 閳光偓閳光偓 Thinking Block 閳光偓閳光偓
 function createThinkBlock(){
   const d=document.createElement('div');d.className='think-block active';
-  d.innerHTML='<div class="think-hdr" onclick="toggleBlock(this)">&#128161; Thinking... <span class="arrow open">&#9660;</span></div><div class="think-body open"><div class="think-text"></div></div>';
+  d.innerHTML='<div class="think-hdr" onclick="toggleBlock(this)">&#128161; Thinking... <span class="arrow">&#9660;</span></div><div class="think-body"><div class="think-text"></div></div>';
   return d;
 }
 function appendThinkText(el,chunk){
+  // 流式期间也保持默认折叠：只向收起的正文累加文字，不再强制展开（用户点标题才展开）
   const t=el.querySelector('.think-text');if(t)t.textContent+=chunk;
-  const body=el.querySelector('.think-body');
-  if(body)body.classList.add('open');
-  const arrow=el.querySelector('.arrow');
-  if(arrow)arrow.classList.add('open');
 }
 function finalizeThink(){
   if(curThinkEl){
