@@ -3077,12 +3077,12 @@ function finalizeThink(){
     // Arrow with 'open' class = expanded indicator
     const hdr=curThinkEl.querySelector('.think-hdr');
     if(hdr){
-      hdr.innerHTML='\uD83D\uDCA1 Thinking <span style="color:var(--t3);font-weight:400">\u2713</span> <span class="arrow open">&#9660;</span>';
+      hdr.innerHTML='\uD83D\uDCA1 Thinking <span style="color:var(--t3);font-weight:400">\u2713</span> <span class="arrow">&#9660;</span>';
       hdr.onclick=function(){toggleBlock(this)};
     }
-    // Keep body expanded by default - user clicks header to collapse
+    // 完成即默认折叠（与工具卡一致）：用户点标题才展开思考正文
     const body=curThinkEl.querySelector('.think-body');
-    if(body)body.classList.add('open');
+    if(body)body.classList.remove('open');
     curThinkEl=null;
   }
 }
