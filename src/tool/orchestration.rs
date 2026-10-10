@@ -43,6 +43,22 @@ pub fn register_orchestration_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(WaitAllSubagentsTool));
 }
 
+/// 子 Agent 派生进程级总开关（Settings “Sub-Agent Spawning”，持久化键 agent.subagent_enabled）。
+/// main.rs 启动时从 config 初始化，server.rs toggle 热写；投递层（llm_agent）与执行层共用。
+/// 语义边界（决策 B）：只管 Instant 编排链路——off ⇒ spawn_subagent 拒绝、Instant 根不投递编排工具集；
+/// 不门控 Expert 模式（独立 Manager-Executor 串行路径，由自己的开关管）；
+/// 已在飞的 worker 不强制杀止，wait/cancel 仍可用以便收尾。
+pub static SUBAGENT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_subagent_enabled(enabled: bool) {
+    SUBAGENT_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn subagent_enabled() -> bool {
+    SUBAGENT_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Execution-time double gate (SDD v1.5 §7.3): every orchestration tool must
 /// refuse non-spawning contexts and any depth >= 1 caller at its first line,
 /// independently of the orchestrator-registry fallback in `orch()`.
@@ -104,6 +120,12 @@ impl Tool for SpawnSubagentTool {
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<Value> {
         gate(ctx)?;
+        // 总开关兜底：投递层已拦一道，此处防会话历史里的陈旧工具定义仍被调用。
+        if !subagent_enabled() {
+            return Err(AgentError::agent(
+                "spawn_subagent: disabled in Settings (Sub-Agent Spawning = Off)",
+            ));
+        }
         let o = orch(ctx)?;
         let spec: SubAgentSpec = serde_json::from_value(args)
             .map_err(|e| AgentError::agent(format!("spawn_subagent: bad args: {e}")))?;
@@ -265,6 +287,20 @@ mod tests {
             assert!(reg.get(n).is_some(), "missing orchestration tool {}", n);
         }
         assert_eq!(reg.len(), ORCH_TOOL_NAMES.len());
+    }
+
+    /// 总开关 Off：即使上下文全部满足（can_spawn=true、depth=0），派生工具也必须拒绝执行。
+    #[tokio::test]
+    async fn spawn_refused_when_subagent_disabled() {
+        set_subagent_enabled(false);
+        let mut ctx = crate::context::ToolContext::simple(".".to_string(), ".".to_string());
+        ctx.can_spawn = true;
+        let err = SpawnSubagentTool
+            .execute(json!({ "role": "r", "prompt": "p" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Sub-Agent Spawning"), "got {err}");
+        set_subagent_enabled(true);
     }
 
     /// §7.3 double gate: even with `can_spawn = true`, a depth >= 1 caller must

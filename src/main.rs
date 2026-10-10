@@ -583,6 +583,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Windows 取证族冷工具全量载入开关（Settings，默认关 = 降为按需载入）。
     let win_ir_full_load = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.win_ir_full_load));
     let debrief_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.agent.debrief_enabled));
+    // 子 Agent 派生总开关：初始化进程级静态门（Settings 可热切换，见 server.rs 的 toggle 处理器）。
+    crate::tool::orchestration::set_subagent_enabled(config.agent.subagent_enabled);
 
     // SDD v1.5 H2: main agent is always Instant; Expert mode is handled by
     // ManagedRunner (separate code path). orchestration_enabled only controls

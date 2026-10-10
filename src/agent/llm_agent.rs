@@ -1756,9 +1756,14 @@ impl Agent for LlmAgent {
         // `user_message` 为借用 &str 处计算（它在下方被 shadow 成 String），供后续
         // Task 7 的扇出软提示使用。
         let prefilter = orchestration_prefilter(user_message); // 仅扇出提示/日志，不再门控
-        // 一级回滚点：在下一行调用末尾加 `&& prefilter` 即整体回退到 v1.1-hardened 行为
+        // 一级回滚点：在调用末尾加 `&& prefilter` 即整体回退到 v1.1-hardened 行为
         // （预筛硬门重新同时门控投递与构建）。
-        let orch_candidate = is_orch_candidate(ctx.can_spawn, ctx.mode, ctx.depth);
+        // Settings 总开关（Sub-Agent Spawning）：Off ⇒ 候选恒假，编排工具集整块不投递。
+        let orch_candidate = is_orch_candidate(
+            ctx.can_spawn && crate::tool::orchestration::subagent_enabled(),
+            ctx.mode,
+            ctx.depth,
+        );
         // F7: surface the orchestration fan-out hint for diagnosis — this is the
         // single line that records whether the run is a steady orchestration candidate.
         if ctx.can_spawn
@@ -1766,7 +1771,7 @@ impl Agent for LlmAgent {
             && ctx.depth == 0
         {
             tracing::info!(
-                "[session:{}] orchestration 扇出提示: prefilter={prefilter} -> orchard={orch_candidate} (Instant 根常态投递编排工具集)",
+                "[session:{}] orchestration fan-out hint: prefilter={prefilter} -> orchard={orch_candidate} (Instant root delivers orchestration toolset as steady state)",
                 session_id
             );
         }
