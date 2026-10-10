@@ -2536,17 +2536,17 @@ function paintSynthetic(msg){
   if(msg.type==='_user')showUserMsg(msg.content,(msg.imgs&&msg.imgs.length)?msg.imgs:(msg.time||''));
   else if(msg.type==='_assistant')showAssistantMsg(msg.content,msg.time)
 }
-// 全量重建：先复位装配状态袋（硬约束2），再逐条重放日志
+// 全量重建：先复位装配状态袋（硬约束2），再逐条重放日志；返回是否成功（供 setOutStyle 回退）
 function rebuild(){
-  var log=OUT.log.slice(),prev=OUT.replaying;
+  var log=OUT.log.slice(),prev=OUT.replaying,ok=true;
   OUT.replaying=true;
   try{
     clearCurrentSessionUI();gsReset();
     var c=document.getElementById('convArea');if(c)c.innerHTML='';
     for(var i=0;i<log.length;i++)paintOne(log[i])
-  }catch(err){console.error('rebuild',err);addLog('Rebuild failed midway: '+err,'error')}
+  }catch(err){console.error('rebuild',err);addLog('Rebuild failed midway: '+err,'error');ok=false}
   OUT.replaying=prev;
-  scrollBottom(false)
+  scrollBottom(false);return ok
 }
 function setOutStyle(s){
   if(s!=='turn'&&s!=='grouped')return;
@@ -2556,9 +2556,16 @@ function setOutStyle(s){
     addLog('Output style: nothing to regroup in this session (restored from history)','warn');
     renderStyleBtn(true);return
   }
-  OUT.style=s;
+  var old=OUT.style;OUT.style=s;
   try{localStorage.setItem('foxir.outstyle',s)}catch(e){}
-  rebuild();renderStyleBtn()
+  // spec §7：重建失败则回退到上一个成功风格，不留半棵树
+  if(!rebuild()){
+    OUT.style=old;
+    try{localStorage.setItem('foxir.outstyle',old)}catch(e){}
+    rebuild();
+    addLog('Style switch failed \u2014 reverted to previous view','error')
+  }
+  renderStyleBtn()
 }
 function renderStyleBtn(noEvents){
   var b=document.getElementById('styleBtn');if(!b)return;
