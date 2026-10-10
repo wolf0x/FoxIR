@@ -317,7 +317,7 @@ body{font-family:var(--font);background:linear-gradient(135deg,#667eea 0%,#764ba
 .notification-msg .md-content a{color:#d68910}
 
 /* 閳光偓閳光偓 Thinking Block 閳光偓閳光偓 */
-.think-block{border-radius:var(--rs);margin:6px 0;overflow:hidden;transition:all .3s}
+.think-block{border-radius:var(--rs);margin:6px 0;overflow:hidden;transition:all .3s;flex-shrink:0}
 .think-block.active{border:1px solid transparent;background:rgba(118,75,162,.04);animation:pulseP 2s infinite}
 .think-block.done{border:1px solid transparent;background:rgba(118,75,162,.02)}
 .think-hdr{display:flex;align-items:center;gap:6px;padding:8px 12px;cursor:pointer;font-size:12px;color:var(--purple);font-weight:500;user-select:none;transition:background .2s}
@@ -2106,6 +2106,7 @@ function restoreCurrentSession(){
         conv.innerHTML=s.html;
       } else if(msgHist.length){
         conv.innerHTML='';
+        seedHistToLog(msgHist);
         renderHistMessages(msgHist);
       } else {
         conv.innerHTML='';
@@ -2113,7 +2114,7 @@ function restoreCurrentSession(){
     }
   }
   else{msgHist=[];logHist=[];OUT.log=[];OUT.dropped=0;gsReset();if(conv)conv.innerHTML='';}
-  renderStyleBtn(!OUT.log.length)
+  renderStyleBtn()
 }
 function clearCurrentSessionUI(){
   curToolMap={};curThinkEl=null;curTextEl=null;textAccum='';lastInvId=null;
@@ -2241,7 +2242,7 @@ function loadHistForSession(id){
       const conv=document.getElementById('convArea');
       if(conv)conv.innerHTML='';
       msgHist=(d&&d.messages)||[];
-      if(msgHist.length){renderHistMessages(msgHist);saveHist();}
+      if(msgHist.length){seedHistToLog(msgHist);renderHistMessages(msgHist);saveHist();}
       else{sessionSnapshots[id]={msgHist:[],logHist:[],html:''};}
     })
     .catch(()=>{});
@@ -2533,8 +2534,21 @@ function paintOne(msg){
 // 非 WS 事件的本地渲染（用户/助手泡泡）也进日志，保证重建无损
 function paintSynthetic(msg){
   finalizeThink();finalizeTextBlock();
+  if(OUT.style==='grouped'&&msg.type==='_user')gsClose(); // 用户回合是分组边界：下一段真实事件开新组
   if(msg.type==='_user')showUserMsg(msg.content,(msg.imgs&&msg.imgs.length)?msg.imgs:(msg.time||''));
-  else if(msg.type==='_assistant')showAssistantMsg(msg.content,msg.time)
+  else if(msg.type==='_assistant')showAssistantMsg(msg.content,msg.time);
+  else if(msg.type==='_notif')showNotification(msg.content,msg.time,true)
+}
+// 历史消息（服务端/本地缓存渲染）必须播种进事件日志，否则 rebuild 只重放实时事件会丢失历史——日志是唯一真相（spec §5.1）。
+// 与 renderHistMessages 的渲染语义一一对应（_user→showUserMsg、_assistant→showAssistantMsg、_notif→showNotification），保证重建无损。
+function seedHistToLog(msgs){
+  OUT.log=[];OUT.dropped=0;
+  for(var i=0;i<msgs.length;i++){
+    var x=msgs[i];
+    if(x.role==='user')OUT.log.push({type:'_user',content:x.text||'',time:x.time||''});
+    else if(x.role==='assistant')OUT.log.push({type:'_assistant',content:x.text||'',time:x.time||''});
+    else if(x.role==='notification')OUT.log.push({type:'_notif',content:x.text||'',time:x.time||''});
+  }
 }
 // 全量重建：先复位装配状态袋（硬约束2），再逐条重放日志；返回是否成功（供 setOutStyle 回退）
 function rebuild(){
@@ -2551,11 +2565,7 @@ function rebuild(){
 function setOutStyle(s){
   if(s!=='turn'&&s!=='grouped')return;
   if(s===OUT.style)return;
-  if(!OUT.log.length){
-    // 历史恢复的会话没有可重放事件：不切换，按钮标注（spec §7）
-    addLog('Output style: nothing to regroup in this session (restored from history)','warn');
-    renderStyleBtn(true);return
-  }
+  var noAssemble=!hasGroupableEvents(); // 历史恢复的会话只有合成事件、无真实工具/思考可组（spec §7）
   var old=OUT.style;OUT.style=s;
   try{localStorage.setItem('foxir.outstyle',s)}catch(e){}
   // spec §7：重建失败则回退到上一个成功风格，不留半棵树
@@ -2565,14 +2575,18 @@ function setOutStyle(s){
     rebuild();
     addLog('Style switch failed \u2014 reverted to previous view','error')
   }
+  if(noAssemble&&s==='grouped')addLog('Output style: restored from history \u2014 no tool/thinking events to group, grouped view equals turn-by-turn here','warn');
   renderStyleBtn()
 }
+// log 里是否存在“可被组合式装配成卡片/思考条”的真实事件；只有历史文本(_user/_assistant)或纯状态事件(auth_ok/usage/done)时返回 false → grouped 等价 turn、需标注（spec §7）
+function hasGroupableEvents(){var g={thinking:1,tool_call:1,tool_result:1,progress:1,permission_request:1,subagent_spawned:1,subagent_completed:1,subagent_failed:1,budget_update:1,plan_updated:1};for(var i=0;i<OUT.log.length;i++){if(g[OUT.log[i]&&OUT.log[i].type])return true}return false}
 function renderStyleBtn(noEvents){
   var b=document.getElementById('styleBtn');if(!b)return;
+  if(noEvents===undefined)noEvents=!hasGroupableEvents();
   b.classList.toggle('grouped',OUT.style==='grouped');
   b.setAttribute('aria-pressed',OUT.style==='grouped'?'true':'false');
   b.title=OUT.style==='grouped'
-    ?(noEvents?'Grouped — this session was restored from history; no events to regroup':'Grouped view — click to switch to turn-by-turn')
+    ?(noEvents?'Grouped — restored from history; no tool/thinking events to group (looks like turn view)':'Grouped view — click to switch to turn-by-turn')
     :'Turn-by-turn view — click to switch to grouped'
 }
 
@@ -3413,7 +3427,7 @@ document.addEventListener('DOMContentLoaded',function(){
   // 输出样式切换：右下角分段钮 Turn|Grouped 点击互切（取代原 Instant|Expert 入口；Expert 由任务启动弹窗进入）
   const styleBtn=document.getElementById('styleBtn');
   if(styleBtn)styleBtn.addEventListener('click',function(){setOutStyle(OUT.style==='grouped'?'turn':'grouped')});
-  renderStyleBtn(!OUT.log.length);
+  renderStyleBtn();
   // 拖拽上传
   const bar=document.querySelector('.grok-bar');
   if(bar){
@@ -4646,13 +4660,14 @@ function loadHist(){
     if(SESSION_ID!==sid)return; // stale: user switched sessions mid-load
     let m=[];
     try{m=JSON.parse(localStorage.getItem('ra_msgs_'+sid)||'[]')}catch(e){m=[]}
-    if(m.length>0){renderHistMessages(m);msgHist=m}
+    if(m.length>0){seedHistToLog(m);renderHistMessages(m);msgHist=m}
   };
   fetch('/api/history?days=30&limit=200&tz_offset='+getTzOffset()+'&session='+encodeURIComponent(sid))
     .then(r=>r.json())
     .then(d=>{
       if(SESSION_ID!==sid)return; // stale: another session is active now
       if(d.messages&&d.messages.length>0){
+        seedHistToLog(d.messages);
         renderHistMessages(d.messages);
         msgHist=d.messages;
         saveHist();  // Update localStorage cache with fresh data
