@@ -3422,6 +3422,8 @@ async fn execute_tool_call(
 ) -> ChatMessage {
     let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
     let args_str = tc.function.arguments.as_deref().unwrap_or("{}");
+    // Wall-clock anchor for the tool-card duration field (spec P4).
+    let call_start = std::time::Instant::now();
 
     // Per-result protection cap: how much of one tool result is injected into
     // history/context. Scaled consistently with per-tool inline limits and
@@ -3740,8 +3742,9 @@ async fn execute_tool_call(
         });
     }
 
-    // Emit tool_result event (full result to UI)
-    let result_event = AgentEvent::tool_result(tool_name, &tc.id, result.clone(), invocation_id, author);
+    // Emit tool_result event (full result to UI) with duration + explicit ok/exit_code.
+    let duration_ms = call_start.elapsed().as_millis() as u64;
+    let result_event = AgentEvent::tool_result(tool_name, &tc.id, result.clone(), invocation_id, author, duration_ms);
     let _ = tx.send(Ok(result_event)).await;
 
     // Build the history entry with size cap (max ~30000 chars per result to prevent context overflow)

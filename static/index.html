@@ -2609,6 +2609,8 @@ function pillEl(st){
   sp.textContent=st==='fail'?'✗ failed':st==='running'?'▶':'✓';
   return sp
 }
+// 时长格式化（spec P4：后端 duration_ms 落地；缺字段返回 —）
+function fmtDur(ms){if(ms==null||isNaN(ms))return '\u2014';if(ms<1000)return Math.round(ms)+'ms';var s=ms/1000;if(s<60)return s.toFixed(1)+'s';var m=Math.floor(s/60);return m+'m'+Math.round(s%60)+'s'}
 function gsClose(){
   if(!gs.grp)return;
   if(!gs.grp.dataset.bad)gs.grp.classList.remove('open'); // 无失败即折叠：“失败就是新闻”（spec §8）
@@ -2622,8 +2624,8 @@ function gsOpen(inv){
   var drop=++gs.seq===1&&OUT.dropped?'<span class="tg-drop">… '+OUT.dropped+' earlier events omitted</span>':'';
   g.innerHTML='<div class="tg-hdr" onclick="this.parentElement.classList.toggle(\'open\')">'+
     '<span class="tg-title">🗂 '+gs.seq+'</span>'+
-    '<span class="tg-stat">0 tool calls</span><span class="tg-hist"></span>'+drop+
-    '<span class="tg-dur">Total —</span><span class="tg-arrow">▾</span></div><div class="tg-body"></div>';
+    '<span class="tg-stat">0 tool calls</span><span class="tg-hist"></span><span class="tg-shell" style="display:none"></span>'+drop+
+    '<span class="tg-dur">Total \u2014</span><span class="tg-arrow">\u25be</span></div><div class="tg-body"></div>';
   c.appendChild(g);gs.grp=g;gs.cards={};gs.strip=null;gs.striping=false;
   scrollBottom();return g
 }
@@ -2638,11 +2640,19 @@ function tgUpd(){
   var body=g.querySelector('.tg-body');
   var cards=body.querySelectorAll('.tcard');
   g.querySelector('.tg-stat').textContent=cards.length+' tool call'+(cards.length===1?'':'s');
-  var cnt={};
-  Array.prototype.forEach.call(cards,function(cd){var r=cd.dataset.region||'TOOL';cnt[r]=(cnt[r]||0)+1});
+  var cnt={},shell=0,total=0,hasDur=false;
+  Array.prototype.forEach.call(cards,function(cd){
+    var r=cd.dataset.region||'TOOL';cnt[r]=(cnt[r]||0)+1;
+    if(r==='SH'||r==='PS')shell++;
+    if(cd.dataset.dur!=null&&cd.dataset.dur!==''){total+=parseInt(cd.dataset.dur,10)||0;hasDur=true}
+  });
   var hs=g.querySelector('.tg-hist');
   hs.innerHTML=Object.keys(cnt).map(function(r){return '<span class="hchip '+r+'">'+r+'·'+cnt[r]+'</span>'}).join('');
-  // 总时长与 bypass 计数：后端字段第二笔（P4）落地前显示 — / 隐藏，不显示假数（spec §4/§6）
+  // bypass 计数：以后端 region 为真相，统计走通用 shell/PS 的调用数（不编数，只标注“可能被领域工具覆盖”）
+  var sh=g.querySelector('.tg-shell');
+  if(sh){if(shell){sh.style.display='';sh.textContent='\u26a0 '+shell+' via shell';sh.title='Generic shell/PowerShell calls — a domain-specific tool may cover these.'}else{sh.style.display='none';sh.textContent=''}}
+  var td=g.querySelector('.tg-dur');
+  if(td)td.textContent='Total '+(hasDur?fmtDur(total):'\u2014');
 }
 function gsNewStrip(inv){
   gsNeed(inv);
@@ -2655,13 +2665,13 @@ function gsNewStrip(inv){
   return s
 }
 function gsStopStrip(){if(gs.strip)gs.striping=false}
-function gsMakeCard(name,callId,args){
+function gsMakeCard(name,callId,args,region){
   var d=document.createElement('div');d.className='tcard';
-  var region=regionOf(name);d.dataset.region=region;d.dataset.callId=callId||'';
+  var reg=region||regionOf(name);d.dataset.region=reg;d.dataset.callId=callId||'';
   var sum=toolSummary(args);
   var argsStr=typeof args==='string'?args:JSON.stringify(args||{},null,2);
-  d.innerHTML='<span class="region hchip '+region+'">'+region+'</span><span class="nm">'+esc(name||'tool')+'</span>'+
-    '<span class="clause">'+esc(sum||'—')+'</span>';
+  d.innerHTML='<span class="region hchip '+reg+'">'+reg+'</span><span class="nm">'+esc(name||'tool')+'</span>'+
+    '<span class="clause">'+esc(sum||'\u2014')+'</span>';
   d.appendChild(pillEl('running'));
   var td=document.createElement('span');td.className='tdur';td.textContent='—';d.appendChild(td);
   var out=document.createElement('div');out.className='out';out.textContent=argsStr;d.appendChild(out);
@@ -2682,8 +2692,8 @@ function paintGrouped(msg){
       if(!peek.textContent)peek.textContent=msg.content.trim().substring(0,42)+'…';
       break;
     case 'tool_call':
-      gsStopStrip();
-      gsMakeCard(msg.name,msg.call_id,msg.args);tgUpd();
+      gsStopStrip();gsNeed(inv); // 无前置 thinking 时也必须先开组，否则 gsBody() 为空
+      gsMakeCard(msg.name,msg.call_id,msg.args,msg.region);tgUpd();
       break;
     case 'tool_result':{
       var card=gs.cards[msg.call_id];
@@ -2691,12 +2701,17 @@ function paintGrouped(msg){
         // 找不到 call_id：记 warn 并新建，绝不静默丢（spec §6/§7）
         console.warn('grouped: orphan tool_result',msg.call_id);
         gsNeed(inv);
-        card=gsMakeCard(msg.name,msg.call_id||('orphan-'+msg.call_id),{note:'re-attached result (card was not in this view)'});
+        card=gsMakeCard(msg.name,msg.call_id||('orphan-'+msg.call_id),{note:'re-attached result (card was not in this view)'},msg.region);
+        gs.cards[msg.call_id]=card;
       }
-      var st=toolStatus(msg.result);
+      // P4：后端显式 ok 优先；无字段时退回启发式
+      var st=(typeof msg.ok==='boolean')?(msg.ok?'ok':'fail'):toolStatus(msg.result);
       var pl=card.querySelector('.tpill');if(pl)pl.remove();
-      var newPill=pillEl(st);var dur=card.querySelector('.tdur');
-      card.insertBefore(newPill,dur);
+      var dur=card.querySelector('.tdur');if(!dur){dur=document.createElement('span');dur.className='tdur';card.appendChild(dur)}
+      dur.textContent=fmtDur(msg.duration_ms);
+      card.dataset.dur=(msg.duration_ms!=null&&!isNaN(msg.duration_ms))?String(msg.duration_ms):'';
+      var newPill=pillEl(st);card.insertBefore(newPill,dur);
+      if(msg.exit_code!=null&&msg.exit_code!==0){var exSpan=card.querySelector('.texit');if(!exSpan){exSpan=document.createElement('span');exSpan.className='tdur texit';card.insertBefore(exSpan,dur)}exSpan.textContent='exit '+msg.exit_code}
       var resTxt=typeof msg.result==='string'?msg.result:JSON.stringify(msg.result,null,2);
       var out=card.querySelector('.out');
       if(out)out.textContent+='\n→ '+resTxt;
@@ -2836,7 +2851,7 @@ function handleMsg(msg){
         blk=createToolBlock(msg.name||'tool',msg.call_id,{});
         appendToConv(blk);curToolMap[msg.call_id]=blk
       }
-      updateToolResult(blk,msg.result);
+      updateToolResult(blk,msg.result,msg);
       addLog('Tool: '+msg.name,'tool');
       scrollBottom();break;
     case 'progress':
@@ -3067,15 +3082,19 @@ function createToolBlock(name,callId,args){
   d.dataset.callId=callId;
   return d;
 }
-function updateToolResult(blk,result){
+function updateToolResult(blk,result,meta){
   blk.classList.remove('active');
   blk.classList.add('done');
-  // E7 修复：成功/失败在卡片上可区分（fail 基于显式错误信号；超时/被杀等后端字段 P4）
+  // E7/P4：优先用后端显式 ok；时长/退出码取自事件字段（缺字段显 —）
   var _hdr=blk.querySelector('.tool-hdr');
   if(_hdr&&!_hdr.querySelector('.tpill')){
-    var _st=toolStatus(result);
-    var _tp=pillEl(_st);
-    _hdr.insertBefore(_tp,_hdr.querySelector('.arrow'));
+    var _arrow=_hdr.querySelector('.arrow');
+    var _st=(meta&&typeof meta.ok==='boolean')?(meta.ok?'ok':'fail'):toolStatus(result);
+    _hdr.insertBefore(pillEl(_st),_arrow);
+    var _dur=document.createElement('span');_dur.className='tdur';_dur.textContent=fmtDur(meta?meta.duration_ms:null);
+    _hdr.insertBefore(_dur,_arrow);
+    var _ex=(meta&&meta.exit_code!=null)?meta.exit_code:null;
+    if(_ex!=null&&_ex!==0){var _ec=document.createElement('span');_ec.className='tdur';_ec.textContent='exit '+_ex;_hdr.insertBefore(_ec,_arrow)}
     if(_st==='fail')blk.style.borderColor='rgba(231,76,60,.45)'
   }
   const rs=blk.querySelector('.tool-result');
@@ -3112,7 +3131,7 @@ function replaySessionEvents(events){
       appendToConv(tb);curToolMap[ev.call_id]=tb;
     }else if(ev.type==='tool_result'){
       const blk=curToolMap[ev.call_id];
-      if(blk)updateToolResult(blk,ev.result);
+      if(blk)updateToolResult(blk,ev.result,ev);
     }
     // thinking / progress are ephemeral; skip for background replay.
   }

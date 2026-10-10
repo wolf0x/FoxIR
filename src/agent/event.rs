@@ -34,6 +34,8 @@ pub enum AgentEvent {
         name: String,
         #[serde(rename = "call_id")]
         call_id: String,
+        /// Backend-authoritative region code (IR/SYS/FS/NET/SH/PS/TOOL).
+        region: String,
         args: Value,
     },
 
@@ -44,6 +46,16 @@ pub enum AgentEvent {
         name: String,
         #[serde(rename = "call_id")]
         call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        /// Explicit success signal (result has no `error` field).
+        ok: bool,
+        /// Wall-clock duration of the call in milliseconds.
+        #[serde(rename = "duration_ms")]
+        duration_ms: u64,
+        /// Exit code parsed from the result payload, when present.
+        #[serde(rename = "exit_code", skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i64>,
         result: Value,
     },
 
@@ -233,17 +245,54 @@ impl AgentEvent {
             meta: EventMeta::new(invocation_id, author),
             name: name.to_string(),
             call_id: call_id.to_string(),
+            region: Self::tool_region(name).to_string(),
             args,
         }
     }
 
-    pub fn tool_result(name: &str, call_id: &str, result: Value, invocation_id: &str, author: &str) -> Self {
+    pub fn tool_result(name: &str, call_id: &str, result: Value, invocation_id: &str, author: &str, duration_ms: u64) -> Self {
+        let ok = result.get("error").is_none();
+        let exit_code = Self::exit_code_from(&result);
         AgentEvent::ToolResult {
             meta: EventMeta::new(invocation_id, author),
             name: name.to_string(),
             call_id: call_id.to_string(),
+            region: Some(Self::tool_region(name).to_string()),
+            ok,
+            duration_ms,
+            exit_code,
             result,
         }
+    }
+
+    /// Backend-authoritative region code for a tool name (mirrors the frontend map).
+    fn tool_region(name: &str) -> &'static str {
+        const P: &[(&str, &str)] = &[
+            ("ir_", "IR"), ("malware_", "IR"), ("yara", "IR"),
+            ("sys_", "SYS"), ("svc_", "SYS"), ("cron_", "SYS"), ("app_", "SYS"),
+            ("file_", "FS"), ("dir_", "FS"),
+            ("net_", "NET"), ("pcap_", "NET"),
+            ("winrm", "SH"), ("shell_exec", "SH"), ("cmd_exec", "SH"),
+            ("powershell", "PS"),
+        ];
+        for (p, r) in P {
+            if name.starts_with(p) {
+                return r;
+            }
+        }
+        "TOOL"
+    }
+
+    /// Pull an exit code out of a tool result payload when it carries one.
+    fn exit_code_from(result: &Value) -> Option<i64> {
+        for k in ["exit_code", "exitCode", "return_code", "code"] {
+            if let Some(v) = result.get(k) {
+                if let Some(n) = v.as_i64() {
+                    return Some(n);
+                }
+            }
+        }
+        None
     }
 
     pub fn progress(tool_name: &str, message: &str, elapsed_secs: u64, invocation_id: &str, author: &str) -> Self {
@@ -415,5 +464,34 @@ mod tests {
         let v: Value = serde_json::from_str(&plan.to_ws_message()).unwrap();
         assert_eq!(v["type"], "plan_updated");
         assert_eq!(v["plan"]["subtask"], "recon");
+    }
+
+    #[test]
+    fn tool_events_carry_region_and_p4_fields() {
+        // tool_call carries backend-authoritative region.
+        let call = AgentEvent::tool_call("ir_sysinfo", "c1", serde_json::json!({"path": "C:\\x"}), "inv-1", "agent");
+        let v: Value = serde_json::from_str(&call.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "tool_call");
+        assert_eq!(v["region"], "IR");
+
+        // successful result with an exit code: ok=true, duration lands, exit_code parsed.
+        let okres = AgentEvent::tool_result(
+            "shell_exec", "c2", serde_json::json!({"stdout": "hi", "exit_code": 0}), "inv-1", "agent", 1234,
+        );
+        let v: Value = serde_json::from_str(&okres.to_ws_message()).unwrap();
+        assert_eq!(v["type"], "tool_result");
+        assert_eq!(v["region"], "SH");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["duration_ms"], 1234);
+        assert_eq!(v["exit_code"], 0);
+
+        // error result: ok=false, no exit_code key emitted (skip_serializing_if none).
+        let bad = AgentEvent::tool_result(
+            "powershell", "c3", serde_json::json!({"error": "boom"}), "inv-1", "agent", 7,
+        );
+        let v: Value = serde_json::from_str(&bad.to_ws_message()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["region"], "PS");
+        assert!(v.get("exit_code").is_none(), "absent exit_code must not be serialized");
     }
 }

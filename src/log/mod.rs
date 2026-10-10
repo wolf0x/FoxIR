@@ -110,21 +110,26 @@ impl ConversationLogger {
         self.flush_pending();
 
         let entry = match event {
-            AgentEvent::ToolCall { name, call_id, args, .. } => json!({
+            AgentEvent::ToolCall { name, call_id, args, region, .. } => json!({
                 "ts": Utc::now().to_rfc3339(),
                 "session": session_id,
                 "role": "assistant",
                 "type": "tool_call",
                 "tool": name,
                 "call_id": call_id,
+                "region": region,
                 "args": args,
             }),
-            AgentEvent::ToolResult { name, call_id, result, .. } => json!({
+            AgentEvent::ToolResult { name, call_id, result, region, ok, duration_ms, exit_code, .. } => json!({
                 "ts": Utc::now().to_rfc3339(),
                 "session": session_id,
                 "role": "tool",
                 "tool": name,
                 "call_id": call_id,
+                "region": region,
+                "ok": ok,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
                 "result": result,
             }),
             AgentEvent::Error { message, .. } => json!({
