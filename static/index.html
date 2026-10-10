@@ -542,7 +542,9 @@ input:checked+.slider:before{transform:translateX(20px)}
 ::-webkit-scrollbar-thumb{background:#bdc3c7;border-radius:4px}
 ::-webkit-scrollbar-thumb:hover{background:#95a5a6}
 
-/* ── 输出样式子系统：状态 pill / 事件行 / 组合式（spec 2026-10-10；类名隔离 .turngroup/.tcard/.tstrip/.tgevt，不复用 .tool-block）── */
+/* ── 输出样式子系统：状态 pill / 事件行 / 组合式两框（spec 2026-10-10；grouped = .inv 内 .gbox.thinking + .gbox.tools，答复走 Turn 气泡）── */
+:root{--amber:#b9770e;--violet:#764ba2}
+:root[data-theme="dark"]{--amber:#f5a623;--violet:#c4b5fd}
 .tpill{font-size:10px;font-weight:600;padding:2px 8px;border-radius:9px;margin-left:6px;white-space:nowrap;flex:none}
 .tpill.ok{background:rgba(46,204,113,.14);color:#27ae60}
 .tpill.fail{background:rgba(231,76,60,.14);color:var(--red)}
@@ -551,22 +553,32 @@ input:checked+.slider:before{transform:translateX(20px)}
 .tdur{font-size:10px;color:var(--t3);margin-left:2px;font-family:var(--mono);flex:none}
 .evt-line{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--t2);padding:3px 12px;margin:4px 0;border-left:2px solid var(--border)}
 .evt-line.warn{color:var(--red);border-left-color:var(--red)}
-.turngroup{border:1px solid var(--border);border-radius:10px;margin:8px 0;background:var(--bg2);overflow:hidden}
-.turngroup.has-bad{border-color:rgba(231,76,60,.4)}
-:root[data-theme="dark"] .turngroup{border-color:#1f2733;background:#10161e}
-:root[data-theme="dark"] .turngroup.has-bad{border-color:rgba(248,113,113,.35)}
-.tg-hdr{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;user-select:none;flex-wrap:wrap}
-.tg-hdr:hover{background:rgba(52,152,219,.05)}
-:root[data-theme="dark"] .tg-hdr:hover{background:#141922}
-.tg-title{font-size:12px;font-weight:700;color:var(--t1)}
-.tg-stat{font-size:11px;color:var(--t2)}
-.tg-hist{display:flex;gap:4px;margin-left:2px}
-.tg-dur{font-size:11px;color:var(--t3);margin-left:auto;font-family:var(--mono)}
-.tg-drop{font-size:10px;color:var(--orange)}
-.tg-arrow{font-size:10px;color:var(--t3);transition:transform .25s}
-.turngroup.open>.tg-hdr .tg-arrow{transform:rotate(180deg)}
-.turngroup.open>.tg-body{display:block}
-.tg-body{display:none;padding:4px 12px 12px}
+/* invocation = two stacked boxes (thinking + tools) */
+.inv{display:flex;flex-direction:column;gap:10px;margin:8px 0;flex-shrink:0}
+.gbox{border:1px solid var(--border);border-radius:10px;background:var(--bg2);overflow:hidden;flex-shrink:0}
+:root[data-theme="dark"] .gbox{border-color:#1f2733;background:#10161e}
+.gbox-hdr{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;user-select:none;flex-wrap:wrap}
+.gbox-hdr:hover{background:rgba(52,152,219,.05)}
+:root[data-theme="dark"] .gbox-hdr:hover{background:#141922}
+.gbox-title{font-size:12px;font-weight:700;color:var(--t1)}
+.gbox-title .dot{color:var(--t3);font-weight:400;margin:0 3px}
+.gbox-meta{font-size:11px;color:var(--t3);font-family:var(--mono)}
+.gbox-right{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:11px;color:var(--t2)}
+.gbox .arrow{font-size:10px;color:var(--t3);transition:transform .25s}
+.gbox.open>.gbox-hdr .arrow{transform:rotate(180deg)}
+.gbox-body{display:none;padding:4px 12px 12px}
+.gbox.open>.gbox-body{display:block}
+/* thinking box: aggregated icon list + ×N dedup */
+.gbox.thinking{border-left:4px solid var(--violet)}
+:root[data-theme="dark"] .gbox.thinking{border-left-color:var(--violet)}
+.tline{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--t2);padding:5px 6px;line-height:1.5}
+.tline .ic{width:16px;text-align:center;flex:none}
+.tline .tx{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tline .x{font-size:10px;font-weight:700;color:var(--orange);background:rgba(230,126,34,.14);padding:1px 6px;border-radius:8px;font-family:var(--mono);flex:none}
+/* tools box: fixed amber left border; only failed cards turn red */
+.gbox.tools{border-left:4px solid var(--amber)}
+:root[data-theme="dark"] .gbox.tools{border-left-color:var(--amber)}
+.hchips{display:flex;gap:4px}
 .hchip{font-size:10px;font-weight:700;padding:1px 7px;border-radius:8px;font-family:var(--mono);background:rgba(127,140,141,.14);color:var(--t2)}
 .hchip.PS{background:rgba(52,152,219,.13);color:var(--accent)}
 .hchip.SH{background:rgba(26,188,156,.14);color:#148f77}
@@ -578,16 +590,9 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] .hchip.SYS{color:var(--orange)}
 :root[data-theme="dark"] .hchip.FS{color:var(--green)}
 :root[data-theme="dark"] .hchip.NET{color:var(--cyan)}
-.tstrip{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--purple);padding:5px 10px;margin:4px 0;border-radius:var(--rs);background:rgba(118,75,162,.05);cursor:pointer;user-select:none}
-:root[data-theme="dark"] .tstrip{color:var(--purple);background:rgba(196,181,253,.05)}
-.tstrip:hover{background:rgba(118,75,162,.1)}
-.tstrip .peek{color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
-.tstrip .full{display:none;white-space:pre-wrap;color:var(--t2);line-height:1.7;font-style:italic}
-.tstrip.open{align-items:flex-start;flex-wrap:wrap}
-.tstrip.open .peek{display:none}
-.tstrip.open .full{display:block;flex:1 1 100%}
 .tcard{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:4px 0;border:1px solid var(--border);border-radius:var(--rs);background:var(--bg);cursor:pointer;flex-wrap:wrap}
 .tcard:hover{border-color:var(--accent)}
+.tcard.has-bad{border-left:3px solid var(--red)}
 :root[data-theme="dark"] .tcard{background:#0d1117;border-color:#1f2733}
 .tcard .region{flex:none}
 .tcard .nm{font-size:12px;font-family:var(--mono);color:var(--t1);font-weight:600}
@@ -2591,9 +2596,9 @@ function renderStyleBtn(noEvents){
     :'Turn-by-turn view — click to switch to grouped'
 }
 
-// ── 组合式装配器：一个 invocation 一个组；invocation 缺失/恒定时（Instant）一个用户回合一个组 ──
-var gs={grp:null,cards:{},strip:null,striping:false,seq:0};
-function gsReset(){gs={grp:null,cards:{},strip:null,striping:false,seq:0}}
+// ── 组合式装配器：一个 invocation 一个 .inv，内含 Thinking 框 + tools 框；答复走 Turn 气泡留在 .inv 之外 ──
+var gs={inv:null,root:null,think:null,tools:null,cards:{},seq:0,thinkT0:0,thinkTn:0,curThink:null,btnSynced:false};
+function gsReset(){gs={inv:null,root:null,think:null,tools:null,cards:{},seq:0,thinkT0:0,thinkTn:0,curThink:null,btnSynced:false}}
 var REGION_PREFIX=[['ir_','IR'],['malware_','IR'],['yara','IR'],['sys_','SYS'],['svc_','SYS'],['cron_','SYS'],['app_','SYS'],['file_','FS'],['dir_','FS'],['net_','NET'],['pcap_','NET'],['winrm','SH'],['shell_exec','SH'],['cmd_exec','SH'],['powershell','PS']];
 function regionOf(n){n=n||'tool';for(var i=0;i<REGION_PREFIX.length;i++){if(n.indexOf(REGION_PREFIX[i][0])===0)return REGION_PREFIX[i][1]}return 'TOOL'}
 // 参数摘要（回合式/组合式共用）
@@ -2626,61 +2631,96 @@ function pillEl(st){
 }
 // 时长格式化（spec P4：后端 duration_ms 落地；缺字段返回 —）
 function fmtDur(ms){if(ms==null||isNaN(ms))return '\u2014';if(ms<1000)return Math.round(ms)+'ms';var s=ms/1000;if(s<60)return s.toFixed(1)+'s';var m=Math.floor(s/60);return m+'m'+Math.round(s%60)+'s'}
-function gsClose(){
-  if(!gs.grp)return;
-  if(!gs.grp.dataset.bad)gs.grp.classList.remove('open'); // 无失败即折叠：“失败就是新闻”（spec §8）
-  gs.grp=null;gs.cards={};gs.strip=null;gs.striping=false
-}
+// 事件时间戳（EventMeta.timestamp，ISO）→ ms；缺失返回 0
+function gsStamp(msg){var t=msg&&msg.timestamp?Date.parse(msg.timestamp):0;return isNaN(t)?0:t}
 function gsOpen(inv){
   gsClose();
   var c=document.getElementById('convArea');if(!c)return null;
-  var g=document.createElement('div');g.className='turngroup open';
-  if(inv)g.dataset.inv=inv;
-  var drop=++gs.seq===1&&OUT.dropped?'<span class="tg-drop">… '+OUT.dropped+' earlier events omitted</span>':'';
-  g.innerHTML='<div class="tg-hdr" onclick="this.parentElement.classList.toggle(\'open\')">'+
-    '<span class="tg-title">🗂 '+gs.seq+'</span>'+
-    '<span class="tg-stat">0 tool calls</span><span class="tg-hist"></span><span class="tg-shell" style="display:none"></span>'+drop+
-    '<span class="tg-dur">Total \u2014</span><span class="tg-arrow">\u25be</span></div><div class="tg-body"></div>';
-  c.appendChild(g);gs.grp=g;gs.cards={};gs.strip=null;gs.striping=false;
-  scrollBottom();return g
+  gs.seq++;
+  var root=document.createElement('div');root.className='inv';if(inv)root.dataset.inv=inv;
+  c.appendChild(root); // 两框懒建：只有真实出现的类型才建对应框，避免出现空框
+  gs.inv=inv||null;gs.root=root;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null;
+  scrollBottom();return root;
 }
-function gsBody(){var g=gs.grp;return g?g.querySelector('.tg-body'):null}
+function ensureThink(){
+  if(gs.think||!gs.root)return gs.think;
+  var th=document.createElement('div');th.className='gbox thinking open';
+  th.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">Thinking</span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
+  gs.root.insertBefore(th,gs.root.firstChild); // thinking 框恒在 tools 框之上
+  gs.think=th;return th;
+}
+function ensureTools(){
+  if(gs.tools||!gs.root)return gs.tools;
+  var tl=document.createElement('div');tl.className='gbox tools open';
+  tl.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">0 tool calls</span><span class="hchips"></span><span class="gbox-right"><span class="gbox-meta">Total \u2014</span></span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
+  gs.root.appendChild(tl);
+  gs.tools=tl;return tl;
+}
 function gsNeed(inv){
-  if(!gs.grp){gsOpen(inv);return}
-  if(inv&&gs.grp.dataset.inv&&gs.grp.dataset.inv!==inv)gsOpen(inv); // Expert 多 invocation 按调用切组
-  if(inv&&!gs.grp.dataset.inv)gs.grp.dataset.inv=inv
+  if(!gs.root){gsOpen(inv);return}
+  if(inv&&gs.inv&&gs.inv!==inv)gsOpen(inv); // Expert 多 invocation 按调用切组
+  if(inv&&!gs.inv)gs.inv=inv
 }
-function tgUpd(){
-  var g=gs.grp;if(!g)return;
-  var body=g.querySelector('.tg-body');
+function gsClose(){endThink();gs.inv=null;gs.root=null;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null}
+function thinkBody(){return gs.think?gs.think.querySelector('.gbox-body'):null}
+function toolsBody(){return gs.tools?gs.tools.querySelector('.gbox-body'):null}
+function endThink(){gs.curThink=null} // 结束当前流式思考段
+function updThinkHdr(){
+  if(!gs.think)return;
+  var n=gs.think.querySelectorAll('.tline').length;
+  var t=(gs.thinkT0&&gs.thinkTn>gs.thinkT0)?('<span class="dot">\u00b7</span>'+fmtDur(gs.thinkTn-gs.thinkT0)):'';
+  gs.think.querySelector('.gbox-title').innerHTML='Thinking<span class="dot">\u00b7</span>'+n+t;
+}
+// thinking：连续增量拼成一行（🧠），不做去重（各段文本通常不同）
+function onThinking(msg){
+  if(!msg.content||!msg.content.trim())return;
+  gsNeed(msg.invocation_id||'');ensureThink();
+  var body=thinkBody();if(!body)return;
+  var s=gsStamp(msg);if(s){if(!gs.thinkT0)gs.thinkT0=s;if(s>gs.thinkTn)gs.thinkTn=s}
+  if(!gs.curThink){
+    var d=document.createElement('div');d.className='tline';
+    d.innerHTML='<span class="ic">\ud83e\udde0</span><span class="tx"></span>';
+    body.appendChild(d);gs.curThink={el:d,text:''};
+  }
+  gs.curThink.text+=msg.content;
+  var show=gs.curThink.text.replace(/\s+/g,' ').trim();
+  gs.curThink.el.querySelector('.tx').textContent=show.length>72?show.slice(0,72)+'\u2026':show;
+  updThinkHdr();
+}
+// progress：离散状态行（⏳）并入 Thinking 框，相同文本合并 ×N
+function onProgress(msg){
+  var text=(msg.message||'').trim();if(!text)return;
+  gsNeed(msg.invocation_id||'');endThink();ensureThink();
+  var body=thinkBody();if(!body)return;
+  var s=gsStamp(msg);if(s){if(!gs.thinkT0)gs.thinkT0=s;if(s>gs.thinkTn)gs.thinkTn=s}
+  var lines=body.querySelectorAll('.tline[data-tx]');
+  for(var i=0;i<lines.length;i++){
+    if(lines[i].getAttribute('data-tx')===text){
+      var n=(parseInt(lines[i].dataset.n,10)||1)+1;lines[i].dataset.n=n;
+      var x=lines[i].querySelector('.x');if(!x){x=document.createElement('span');x.className='x';lines[i].appendChild(x)}
+      x.textContent='\u00d7'+n;updThinkHdr();return;
+    }
+  }
+  var d=document.createElement('div');d.className='tline';d.setAttribute('data-tx',text);d.dataset.n='1';
+  d.innerHTML='<span class="ic">\u23f3</span><span class="tx">'+esc(text.length>72?text.slice(0,72)+'\u2026':text)+'</span>';
+  body.appendChild(d);updThinkHdr();
+}
+function updToolsHdr(){
+  var tl=gs.tools;if(!tl)return;
+  var body=tl.querySelector('.gbox-body');
   var cards=body.querySelectorAll('.tcard');
-  g.querySelector('.tg-stat').textContent=cards.length+' tool call'+(cards.length===1?'':'s');
-  var cnt={},shell=0,total=0,hasDur=false;
+  tl.querySelector('.gbox-title').textContent=cards.length+' tool call'+(cards.length===1?'':'s');
+  var cnt={},total=0,hasDur=false;
   Array.prototype.forEach.call(cards,function(cd){
     var r=cd.dataset.region||'TOOL';cnt[r]=(cnt[r]||0)+1;
-    if(r==='SH'||r==='PS')shell++;
-    if(cd.dataset.dur!=null&&cd.dataset.dur!==''){total+=parseInt(cd.dataset.dur,10)||0;hasDur=true}
+    if(cd.dataset.dur){total+=parseInt(cd.dataset.dur,10)||0;hasDur=true}
   });
-  var hs=g.querySelector('.tg-hist');
-  hs.innerHTML=Object.keys(cnt).map(function(r){return '<span class="hchip '+r+'">'+r+'·'+cnt[r]+'</span>'}).join('');
-  // bypass 计数：以后端 region 为真相，统计走通用 shell/PS 的调用数（不编数，只标注“可能被领域工具覆盖”）
-  var sh=g.querySelector('.tg-shell');
-  if(sh){if(shell){sh.style.display='';sh.textContent='\u26a0 '+shell+' via shell';sh.title='Generic shell/PowerShell calls — a domain-specific tool may cover these.'}else{sh.style.display='none';sh.textContent=''}}
-  var td=g.querySelector('.tg-dur');
-  if(td)td.textContent='Total '+(hasDur?fmtDur(total):'\u2014');
+  tl.querySelector('.hchips').innerHTML=Object.keys(cnt).map(function(r){return '<span class="hchip '+r+'">'+r+'\u00b7'+cnt[r]+'</span>'}).join('');
+  tl.querySelector('.gbox-meta').textContent='Total '+(hasDur?fmtDur(total):'\u2014');
 }
-function gsNewStrip(inv){
-  gsNeed(inv);
-  var body=gsBody();if(!body)return null;
-  if(gs.strip&&gs.striping)return gs.strip;
-  var s=document.createElement('div');s.className='tstrip';
-  s.innerHTML='💭 <span class="peek"></span><span class="full"></span>';
-  s.addEventListener('click',function(ev){ev.stopPropagation();s.classList.toggle('open')});
-  body.appendChild(s);gs.strip=s;gs.striping=true;
-  return s
-}
-function gsStopStrip(){if(gs.strip)gs.striping=false}
 function gsMakeCard(name,callId,args,region){
+  ensureTools();
+  var body=toolsBody();if(!body)return null;
   var d=document.createElement('div');d.className='tcard';
   var reg=region||regionOf(name);d.dataset.region=reg;d.dataset.callId=callId||'';
   var sum=toolSummary(args);
@@ -2688,29 +2728,28 @@ function gsMakeCard(name,callId,args,region){
   d.innerHTML='<span class="region hchip '+reg+'">'+reg+'</span><span class="nm">'+esc(name||'tool')+'</span>'+
     '<span class="clause">'+esc(sum||'\u2014')+'</span>';
   d.appendChild(pillEl('running'));
-  var td=document.createElement('span');td.className='tdur';td.textContent='—';d.appendChild(td);
+  var td=document.createElement('span');td.className='tdur';td.textContent='\u2014';d.appendChild(td);
   var out=document.createElement('div');out.className='out';out.textContent=argsStr;d.appendChild(out);
-  d.addEventListener('click',function(){d.classList.toggle('open')});
-  gsBody().appendChild(d);
+  d.addEventListener('click',function(){d.classList.toggle('open')}); // 默认折叠，点击展开
+  body.appendChild(d);
   if(callId)gs.cards[callId]=d;
   return d
 }
 function paintGrouped(msg){
   if(isWorkerFragment(msg))return; // 抑制在装配层；事件已入日志，切回合式时重现（硬约束1）
+  // 与回合式一致：thinking/progress/tool 事件先结束当前流式文本块，使被工具隔开的多段答复各自成气泡（不并入同块）
+  if(msg.type==='thinking'||msg.type==='progress'||msg.type==='tool_call'||msg.type==='tool_result')finalizeTextBlock();
+  if(!gs.btnSynced&&(msg.type==='thinking'||msg.type==='progress'||msg.type==='tool_call')){gs.btnSynced=true;renderStyleBtn(false);} // 首个可分组事件出现后纠正样式按钮的陈旧“无事件可组”提示
   var inv=msg.invocation_id||'';
   switch(msg.type){
-    case 'thinking':
-      if(!msg.content||!msg.content.trim())break;
-      var s=gsNewStrip(inv);if(!s)break;
-      var full=s.querySelector('.full'),peek=s.querySelector('.peek');
-      full.textContent+=msg.content;
-      if(!peek.textContent)peek.textContent=msg.content.trim().substring(0,42)+'…';
-      break;
+    case 'thinking':onThinking(msg);break;
+    case 'progress':onProgress(msg);break;
     case 'tool_call':
-      gsStopStrip();gsNeed(inv); // 无前置 thinking 时也必须先开组，否则 gsBody() 为空
-      gsMakeCard(msg.name,msg.call_id,msg.args,msg.region);tgUpd();
+      endThink();gsNeed(inv);
+      gsMakeCard(msg.name,msg.call_id,msg.args,msg.region);updToolsHdr();
       break;
     case 'tool_result':{
+      endThink();
       var card=gs.cards[msg.call_id];
       if(!card){
         // 找不到 call_id：记 warn 并新建，绝不静默丢（spec §6/§7）
@@ -2729,31 +2768,22 @@ function paintGrouped(msg){
       if(msg.exit_code!=null&&msg.exit_code!==0){var exSpan=card.querySelector('.texit');if(!exSpan){exSpan=document.createElement('span');exSpan.className='tdur texit';card.insertBefore(exSpan,dur)}exSpan.textContent='exit '+msg.exit_code}
       var resTxt=typeof msg.result==='string'?msg.result:JSON.stringify(msg.result,null,2);
       var out=card.querySelector('.out');
-      if(out)out.textContent+='\n→ '+resTxt;
-      if(st==='fail'){
-        if(gs.grp){gs.grp.dataset.bad='1';gs.grp.classList.add('has-bad')}
-        card.classList.add('open')
-      }
-      tgUpd();break}
-    case 'progress':
-      if(msg.message){
-        gsNeed(inv);
-        var ln=document.createElement('div');ln.className='tgevt';
-        ln.innerHTML='ℹ️ '+esc(msg.message)+' <span class="t">'+nowTimeStr()+'</span>';
-        gsBody().appendChild(ln)
-      }
-      break;
+      if(out)out.textContent+='\n\u2192 '+resTxt;
+      // 失败：只让卡片自身红边，不传染容器、不自动展开（对齐定稿 demo）
+      if(st==='fail'){card.classList.add('has-bad');card.dataset.bad='1'}
+      updToolsHdr();break}
     case 'permission_request':
-      gsStopStrip();gsNeed(inv);
-      renderPermRequest(msg,gsBody());
-      break;
+      endThink();gsNeed(inv);ensureTools();renderPermRequest(msg,toolsBody());break;
     case 'subagent_spawned':case 'subagent_completed':case 'subagent_failed':case 'budget_update':case 'plan_updated':
-      gsStopStrip();gsNeed(inv);
-      expertHandleMsg(msg);handleSubAgentCard(msg,gsBody());
-      break;
-    case 'text':case 'done':case 'error':case 'notification':case 'expert_prompt':case 'usage':
-      gsClose();handleMsg(msg); // 正文气泡与状态类不进组，复用现有画家
-      break;
+      endThink();gsNeed(inv);ensureTools();expertHandleMsg(msg);handleSubAgentCard(msg,toolsBody());break;
+    case 'text':
+      endThink();handleMsg(msg);break; // 答复走 Turn 气泡留在 .inv 之外；不关组，后续 thinking/tool 继续并入同组
+    case 'done':
+      endThink();gsClose();handleMsg(msg);break;
+    case 'usage':
+      handleMsg(msg);break; // 计费/统计事件：不切组（否则同一 invocation 会被 usage 拆成两组），也不打断当前思考段
+    case 'error':case 'notification':case 'expert_prompt':
+      gsClose();handleMsg(msg);break; // 系统级状态气泡进组外
     default:
       handleMsg(msg)
   }
