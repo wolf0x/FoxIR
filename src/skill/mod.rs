@@ -7,6 +7,7 @@ pub mod schema;
 pub mod grants;
 pub mod install;
 pub mod unpack;
+pub mod align;
 pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};
@@ -1210,11 +1211,17 @@ fn substitute_skill_dir(body: &str, skill_dir: &str) -> String {
 
 /// Read the instruction body of a SKILL.md lazily (skip frontmatter) and
 /// resolve any `{skill_dir}` / `{skill_dir_url}` placeholders against the
-/// skill's canonical on-disk directory.
+/// skill's canonical on-disk directory. Third-party compatibility alignment
+/// (cold-tool pointers, dangling bundled refs, PowerShell notes, brand) is
+/// applied here so EVERY load path — install_skill, zip unpack, manual copy —
+/// delivers an aligned body without mutating the file on disk.
 fn read_skill_body(path: &Path, skill_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     split_frontmatter(&content)
-        .map(|(_fm, body)| substitute_skill_dir(&body, skill_dir))
+        .map(|(_fm, body)| {
+            let subs = substitute_skill_dir(&body, skill_dir);
+            align::align_skill_body(&subs, Some(Path::new(skill_dir)))
+        })
 }
 
 impl Skill {
@@ -1504,7 +1511,10 @@ read the same way on demand. Do NOT use generic `file_read`/`shell` to locate sk
             Ok(raw) => {
                 let content = if is_instruction {
                     metrics::record_skill_load();
-                    let mut b = strip_frontmatter(&raw).to_string();
+                    let mut b = align::align_skill_body(
+                        &substitute_skill_dir(strip_frontmatter(&raw), &skill_dir.to_string_lossy()),
+                        Some(&skill_dir),
+                    );
                     if let Some(block) = steps::contract_block(&skill.step_contract()) { b.push_str(&block); }
                     b
                 } else { raw };
