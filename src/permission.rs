@@ -39,6 +39,35 @@ pub fn tool_category(name: &str) -> &'static str {
     }
 }
 
+/// Grouped native tools whose destructive sub-actions must not inherit the
+/// permissive "modify" category. Their `action` argument carries the real verb,
+/// so the category is decided per call, not per tool name.
+const GROUPED_MANAGE_TOOLS: &[&str] = &["sys_process", "sys_service", "ir_process", "cron_manage"];
+
+/// Action verbs that take something away or stop it running (mirrors the
+/// delete/containment red line). First-verb matching keeps state words out.
+const DELETE_ACTIONS: &[&str] = &[
+    "kill", "stop", "restart", "delete", "remove", "disable", "uninstall", "purge", "clear", "reset",
+];
+
+/// Effective permission category of a specific call — tool name plus, for the
+/// grouped management tools, the destructive `action` argument. This plugs the
+/// hole where sys_process(action=kill) or sys_service(action=stop) rode the
+/// default-allowed "modify" category while the AGENTS red line requires
+/// confirmation for containment actions.
+pub fn effective_category(name: &str, args: &Value) -> &'static str {
+    let base = tool_category(name);
+    if base == "modify" && GROUPED_MANAGE_TOOLS.contains(&name) {
+        if let Some(action) = args.get("action").and_then(|a| a.as_str()) {
+            let verb = action.split(['_', '-']).next().unwrap_or("").to_ascii_lowercase();
+            if DELETE_ACTIONS.contains(&verb.as_str()) {
+                return "delete";
+            }
+        }
+    }
+    base
+}
+
 /// Locked categories, read straight from `config.toml` so a Settings change is
 /// honoured by the next iteration without threading another shared map through
 /// every caller. Missing/unreadable config means "nothing locked" -- said once
@@ -62,7 +91,10 @@ pub fn permission_locks_for(workspace_dir: &str) -> Vec<String> {
     }
 }
 
-/// Default permissions: read/write/modify allowed, delete/execute require endorsement.
+/// Default permissions: read/write/modify allowed; delete/execute/system require endorsement.
+/// "system" is the sixth category for system-config changes reached through command
+/// intent (registry writes, service/task configuration, firewall & AV changes,
+/// install/uninstall) — see detect_intent_category.
 pub fn default_permissions() -> HashMap<String, bool> {
     let mut m = HashMap::new();
     m.insert("read".to_string(), true);
@@ -70,6 +102,7 @@ pub fn default_permissions() -> HashMap<String, bool> {
     m.insert("delete".to_string(), false);
     m.insert("modify".to_string(), true);
     m.insert("execute".to_string(), false);
+    m.insert("system".to_string(), false);
     m
 }
 
@@ -186,7 +219,7 @@ impl PermissionChecker {
             }
         }
 
-        let category = tool_category(tool_name);
+        let category = effective_category(tool_name, args);
 
         // Check if category is auto-allowed
         {
@@ -303,13 +336,63 @@ fn detect_intent_category(tool_name: &str, args: &Value) -> Option<&'static str>
     let intent = crate::policy::parse::parse_intent(command, shell);
 
     use crate::policy::parse::Verb;
+    // Deletion / formatting keep the pre-existing (stricter) mappings first.
     match intent.verb {
         // Deletion via shell_exec bypasses file_delete permission
-        Verb::Delete => Some("delete"),
+        Verb::Delete => return Some("delete"),
         // Format/disk operations bypass modify permission
-        Verb::Format => Some("modify"),
-        _ => None,
+        Verb::Format => return Some("modify"),
+        _ => {}
     }
+    // System-config changes reached inside an otherwise-allowed execute call:
+    // registry, service configuration, scheduled tasks, firewall/AV, installers.
+    if reaches_system_config(&intent.raw_lower) {
+        return Some("system");
+    }
+    None
+}
+
+/// Whether the (lowercased) command line changes system configuration rather
+/// than merely running something. Deliberately conservative: only high-signal
+/// patterns, so ordinary admin reads (reg query, Get-Service) and plain file
+/// writes are NOT flagged. Bypasses that beat string matching (encoded
+/// commands, third-party tools) are a known limit of this gate, not a surprise.
+fn reaches_system_config(lower: &str) -> bool {
+    const DIRECT: &[&str] = &[
+        "reg add",
+        "reg import",
+        "reg delete",
+        "sc config",
+        "sc create",
+        "sc delete",
+        "new-service",
+        "schtasks /create",
+        "schtasks /change",
+        "schtasks /delete",
+        "unregister-scheduledtask",
+        "unregister-scheduledjob",
+        "netsh advfirewall",
+        "netsh firewall",
+        "winget install",
+        "winget uninstall",
+        "choco install",
+        "choco uninstall",
+        "msiexec /i",
+        "msiexec /x",
+        "set-mppreference",
+        "add-mppreference",
+        "set-mpcomputeroperation",
+        "disable-netadapter",
+    ];
+    if DIRECT.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // Registry writes through the PowerShell provider (Set-ItemProperty 'HKLM\...\Run'):
+    // needs BOTH a writing cmdlet and a registry hive token, so "Set-Content notes.txt"
+    // stays unflagged.
+    const WRITERS: &[&str] = &["set-itemproperty", "new-itemproperty", "remove-itemproperty", "new-item"];
+    const HIVES: &[&str] = &["hklm", "hkcu", "hkcc", "hkey_local_machine", "hkey_current_user"];
+    WRITERS.iter().any(|p| lower.contains(p)) && HIVES.iter().any(|p| lower.contains(p))
 }
 
 /// Whether a skill-derived bypass must be refused. Two ways, both narrowing:
@@ -324,7 +407,7 @@ pub(crate) fn grant_blocked_by_category(
     perms: &HashMap<String, bool>,
     locked: &[String],
 ) -> Option<&'static str> {
-    let own = tool_category(tool_name);
+    let own = effective_category(tool_name, args);
     if locked.iter().any(|cat| cat == own) {
         return Some(own);
     }
@@ -380,11 +463,12 @@ pub fn explain_tool_call(tool_name: &str, args: &Value) -> String {
     }
 
     // ---------- Generic fallback ----------
-    let action = match tool_category(tool_name) {
+    let action = match effective_category(tool_name, args) {
         "read" => "读取/查询",
         "write" => "写入",
-        "delete" => "删除",
+        "delete" => "删除/停用",
         "modify" => "修改",
+        "system" => "系统变更",
         _ => "执行",
     };
     let tool = tool_name.replace('_', " ");
@@ -901,5 +985,169 @@ mod tests {
     fn explain_unknown_falls_back() {
         let p = explain_shell_command("some-obscure-tool --flag");
         assert!(p.starts_with("执行命令"), "got: {p}");
+    }
+
+    /// 分组管理工具的删除类子动作不得跟着 modify 默认直通：停服务、杀进程
+    /// 是 containment 动作，AGENTS 红线要求逐次确认；只读/启动子动作不受影响。
+    #[test]
+    fn grouped_destructive_actions_take_the_delete_category() {
+        let kill = serde_json::json!({ "action": "kill", "pid": 1234 });
+        assert_eq!(effective_category("sys_process", &kill), "delete");
+        let stop = serde_json::json!({ "action": "stop", "name": "W3SVC" });
+        assert_eq!(effective_category("sys_service", &stop), "delete");
+        let restart = serde_json::json!({ "action": "restart", "name": "W3SVC" });
+        assert_eq!(effective_category("sys_service", &restart), "delete");
+        let ir_kill = serde_json::json!({ "action": "kill", "pid": 1 });
+        assert_eq!(effective_category("ir_process", &ir_kill), "delete");
+        let cron_rm = serde_json::json!({ "action": "remove", "id": "t1" });
+        assert_eq!(effective_category("cron_manage", &cron_rm), "delete");
+
+        // 正对照：非破坏性子动作维持原类别，读取不被误伤。
+        let list = serde_json::json!({ "action": "list" });
+        assert_eq!(effective_category("sys_process", &list), "modify");
+        let start = serde_json::json!({ "action": "start", "name": "Spooler" });
+        assert_eq!(effective_category("sys_service", &start), "modify");
+        let add = serde_json::json!({ "action": "add" });
+        assert_eq!(effective_category("cron_manage", &add), "modify");
+        assert_eq!(effective_category("sys_info", &serde_json::json!({})), "read");
+        // 无 action 字段的调用不因新分类改变行为。
+        assert_eq!(effective_category("sys_process", &serde_json::json!({})), "modify");
+    }
+
+    /// 系统变更命令借道被允许的 execute 类时必须被意图识别抓出来；
+    /// 只读查询与普通文件写入是正对照，不得误伤。
+    #[test]
+    fn system_config_intents_are_detected_in_shell_commands() {
+        let cases = [
+            r#"reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v Upd /t REG_SZ /d C:\x.exe /f"#,
+            r#"Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Upd -Value 'C:\x.exe'"#,
+            r#"New-Item -Path 'HKCU:\Software\Evil' -Force"#,
+            "sc config W3SVC start= disabled",
+            "sc create BackSvc binPath= C:\\temp\\s.exe",
+            "schtasks /create /tn update /tr C:\\x.exe /sc daily",
+            "Unregister-ScheduledTask -TaskName 'Cleanup'",
+            "netsh advfirewall set allprofiles state off",
+            "winget install -e --id Some.Tool",
+            "msiexec /x {11111111-2222-3333-4444-555555555555}",
+            "Disable-NetAdapter -Name Ethernet -Confirm:$false",
+            "Set-MpPreference -DisableRealtimeMonitoring $true",
+        ];
+        for cmd in cases {
+            let args = serde_json::json!({ "command": cmd });
+            assert_eq!(
+                detect_intent_category("shell_exec", &args),
+                Some("system"),
+                "system-change intent must be caught: {cmd}"
+            );
+        }
+
+        // 正对照：读取与本地文件写入不属于系统变更。
+        for cmd in [
+            r#"reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run"#,
+            "ipconfig /all",
+            "Get-Service | Where-Object Status -eq Running",
+            r#"Set-Content -Path C:\Users\a\notes.txt -Value 'meeting at 3'"#,
+            "winget list",
+            "sc query W3SVC",
+        ] {
+            let args = serde_json::json!({ "command": cmd });
+            assert_eq!(
+                detect_intent_category("shell_exec", &args),
+                None,
+                "read-only or plain-file command must not be flagged: {cmd}"
+            );
+        }
+    }
+
+    /// 闸门端到端：execute 已被用户允许时，注册表写入仍要弹审批（system 默认
+    /// 背书），而只读命令直通不问。
+    #[tokio::test]
+    async fn an_allowed_execute_session_still_asks_before_system_changes() {
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut perms = default_permissions();
+        perms.insert("execute".to_string(), true); // 用户已允许命令执行
+        let checker = PermissionChecker::new(
+            pending.clone(),
+            tx,
+            Arc::new(Mutex::new(perms)),
+            "inv-sys".to_string(),
+            "FoxIR".to_string(),
+            None,
+            None,
+            vec![],
+        );
+
+        let watcher = tokio::spawn(watch_one_request(pending));
+        let allowed = checker
+            .check(
+                "shell_exec",
+                &serde_json::json!({
+                    "command": r#"reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v Upd /d C:\x.exe /f"#
+                }),
+            )
+            .await;
+        let asked = watcher.await.unwrap();
+        assert_eq!(asked.len(), 1, "the system gate must have asked the user");
+        assert!(!allowed, "an unanswered system change must not run");
+
+        // 正对照：同一条权限状态下只读命令不再逐次问。
+        let allowed = checker
+            .check(
+                "shell_exec",
+                &serde_json::json!({ "command": r#"reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run"# }),
+            )
+            .await;
+        assert!(allowed, "a read-only query must pass under an allowed execute category");
+    }
+
+    /// 原生工具的 containment 洞封堵：modify 默认直通时，sys_process kill
+    /// 必须回到逐次审批。
+    #[tokio::test]
+    async fn killing_a_process_via_the_grouped_tool_asks_for_endorsement() {
+        let (_resolver, pending) = PermissionResolver::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let checker = PermissionChecker::new(
+            pending.clone(),
+            tx,
+            Arc::new(Mutex::new(default_permissions())),
+            "inv-contain".to_string(),
+            "FoxIR".to_string(),
+            None,
+            None,
+            vec![],
+        );
+
+        let watcher = tokio::spawn(watch_one_request(pending));
+        let allowed = checker
+            .check("sys_process", &serde_json::json!({ "action": "kill", "pid": 4444 }))
+            .await;
+        let asked = watcher.await.unwrap();
+        assert_eq!(asked.len(), 1, "containment must go through the gate now");
+        assert!(!allowed, "an unanswered kill must not run");
+
+        // 正对照：同工具的 list 子动作维持直通。
+        let allowed = checker
+            .check("sys_process", &serde_json::json!({ "action": "list" }))
+            .await;
+        assert!(allowed, "enumerating processes is not a containment action");
+    }
+
+    /// 新类别自动接受既有旁路收窄机制：锁住 delete 后，分组工具的 kill 授权
+    /// 不得使用（类别驱动，零特例代码）。
+    #[test]
+    fn the_lock_and_grant_logic_covers_grouped_actions_by_category() {
+        let perms = default_permissions();
+        let kill = serde_json::json!({ "action": "kill", "pid": 1 });
+        assert_eq!(
+            grant_blocked_by_category("sys_process", &kill, &perms, &["delete".to_string()]),
+            Some("delete"),
+            "a locked delete must refuse the destructive arm of a grouped tool"
+        );
+        assert_eq!(
+            grant_blocked_by_category("sys_process", &kill, &perms, &[]),
+            None,
+            "without the lock the grant still speaks for it (consented-skill path)"
+        );
     }
 }

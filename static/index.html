@@ -1261,6 +1261,15 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] .token-table tr:hover td{background:#141922}
 :root[data-theme="dark"] .expert-stats b{color:#7dd3fc}
 :root[data-theme="dark"] .expert-empty{color:#5d6878}
+/* 暗色补丁②：权限卡已决议条 + Expert Multi-Agent 子块（plan/queue/agent 三张白底卡与内部深灰字） */
+:root[data-theme="dark"] .perm-request .perm-resolved-msg.allowed{color:#4ade80;background:rgba(74,222,128,.08);border-top-color:rgba(74,222,128,.22)}
+:root[data-theme="dark"] .perm-request .perm-resolved-msg.denied{color:#f87171;background:rgba(248,113,113,.08);border-top-color:rgba(248,113,113,.22)}
+:root[data-theme="dark"] .expert-sec h4{color:#8b97a8}
+:root[data-theme="dark"] .expert-plan,:root[data-theme="dark"] .expert-queue,:root[data-theme="dark"] .expert-agent{background:#141922;border-color:#1f2733}
+:root[data-theme="dark"] .expert-plan .p-sub,:root[data-theme="dark"] .expert-agent .ag-role{color:#e4e9f1}
+:root[data-theme="dark"] .expert-plan ul{color:#8b97a8}
+:root[data-theme="dark"] .expert-agent .ag-body{color:#b6c0cd;border-top-color:#1f2733}
+:root[data-theme="dark"] .expert-agent .ag-ev a{color:#7dd3fc}
 :root[data-theme="dark"] .mcp-card{background:linear-gradient(135deg,#141922,#1a212c);border-color:#1f2733}
 :root[data-theme="dark"] .mcp-card-name{color:#e4e9f1}
 :root[data-theme="dark"] .mcp-tools{color:#8b97a8}
@@ -1469,6 +1478,16 @@ input:checked+.slider:before{transform:translateX(20px)}
             </div>
             <label class="perm-toggle">
               <input type="checkbox" id="heartbeatToggle" onchange="toggleHeartbeat(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <label style="margin-bottom:0">&#129302; Sub-Agent Spawning</label>
+              <small style="color:var(--t3)">Off disables Instant-mode orchestration tools and spawn_subagent; Expert mode is controlled by its own switch</small>
+            </div>
+            <label class="perm-toggle">
+              <input type="checkbox" id="subagentToggle" onchange="toggleSubagent(this.checked)">
               <span class="slider"></span>
             </label>
           </div>
@@ -2292,7 +2311,8 @@ const PERM_CATEGORIES=[
   {id:'write',name:'Write',tools:'file_write',def:true},
   {id:'delete',name:'Delete',tools:'file_delete',def:false},
   {id:'modify',name:'Modify',tools:'file_modify, sys_process, sys_service',def:true},
-  {id:'execute',name:'Execute',tools:'shell_exec, app_launch',def:false}
+  {id:'execute',name:'Execute',tools:'shell_exec, app_launch',def:false},
+  {id:'system',name:'System',tools:'via shell intent: registry writes, service/scheduled-task config, firewall/AV changes, install/uninstall',def:false}
 ];
 let permissions={};
 // Categories where the user forbids skill grants from answering for them
@@ -2317,7 +2337,7 @@ function switchPage(name,btn){
   if(name==='skills')loadSkills();
   if(name==='mcp')loadMcp();
   if(name==='cron')loadCron();
-  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();initHeartbeatToggle();loadHindsightSettings();}
+  if(name==='settings'){loadProviders();loadConfigFiles();initHumanInterventionToggle();initSubagentToggle();initHeartbeatToggle();loadHindsightSettings();}
   if(name==='tools')loadTools();
   if(name==='knowledge')loadKnowledge();
   if(name==='dashboard')loadDashboard();
@@ -4523,6 +4543,35 @@ function toggleHumanIntervention(enabled){
       }
     })
     .catch(e=>addLog('Human intervention toggle error: '+e,'error'));
+}
+
+// Initialize sub-agent spawning master switch from backend
+async function initSubagentToggle(){
+  try{
+    const r=await fetch('/api/settings/subagent');
+    const d=await r.json();
+    const toggle=document.getElementById('subagentToggle');
+    if(toggle&&d.enabled!==undefined){
+      toggle.checked=d.enabled;
+    }
+  }catch(e){console.error('initSubagentToggle',e)}
+}
+
+// Toggle sub-agent spawning master switch
+function toggleSubagent(enabled){
+  fetch('/api/settings/subagent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})})
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.success){
+        addLog('Sub-agent spawning '+(enabled?'enabled':'disabled')+(d.persisted===false?' (not persisted: '+(d.persist_error||'unknown')+')':''),d.persisted===false?'warn':'info');
+        if(!enabled){addLog('Orchestration tools (spawn_subagent etc.) will not be delivered to Instant runs','warn');}
+      }else{
+        addLog('Sub-agent spawning toggle failed: '+(d.error||'unknown'),'error');
+        const toggle=document.getElementById('subagentToggle');
+        if(toggle)toggle.checked=!enabled; // revert UI to server state
+      }
+    })
+    .catch(e=>addLog('Sub-agent spawning toggle error: '+e,'error'));
 }
 
 // Toggle background heartbeat

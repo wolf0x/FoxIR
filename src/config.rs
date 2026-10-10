@@ -147,6 +147,10 @@ pub struct AgentConfig {
     /// Whether the background heartbeat (proactive HEARTBEAT.md checks) runs. Default: off.
     #[serde(default = "default_heartbeat_enabled")]
     pub heartbeat_enabled: bool,
+    /// 子 Agent 派生总开关（Settings “Sub-Agent Spawning”）。off 时：Instant 根不投递编排工具集、
+    /// spawn_subagent 执行层拒绝。不门控 Expert 模式（边界决策 B，由自己的 Expert Mode 开关管）。默认开。
+    #[serde(default = "default_subagent_enabled")]
+    pub subagent_enabled: bool,
     /// Primary model name (selected in Settings UI)
     #[serde(default)]
     pub primary_model: Option<String>,
@@ -595,6 +599,7 @@ impl Default for Config {
                 computer_use: false,
                 human_intervention: false,
                 heartbeat_enabled: default_heartbeat_enabled(),
+                subagent_enabled: default_subagent_enabled(),
                 primary_model: None,
                 fallback_model: None,
                 timezone_offset: default_timezone_offset(),
@@ -616,6 +621,7 @@ impl Default for Config {
 fn default_host() -> String { "127.0.0.1".to_string() }
 fn default_port() -> u16 { 7788 }
 fn default_working_dir() -> String { ".".to_string() }
+fn default_subagent_enabled() -> bool { true }
 fn default_workspace_dir() -> String {
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
         format!("{}\\.RustAgent\\Workspace", userprofile)
@@ -947,6 +953,7 @@ working_dir = "."
 max_iterations = 100
 rabbit_hole_threshold = 5
 trim_redundant_tool_calls = false  # Off by default (see fn default_trim_redundant_tool_calls)
+subagent_enabled = true            # Instant orchestration master switch (does not gate Expert mode)
 knowledge_pre_retrieval = true   # per-turn knowledge pointer pre-injection (default on)
 sop_replay = true                # independent SOP replay (default on)
 budget_dashboard = true          # unified context budget dashboard (default on)
@@ -995,6 +1002,7 @@ timezone_offset = 8
 # write = true
 # delete = false
 # execute = true
+# system = false   # registry/service/task/firewall/install changes reached via shell intent
 # Locked categories: skill allowed-tools grants do NOT apply here (still asked
 # every time, even after the user approved the skill).
 # permission_locks = ["delete", "execute"]
@@ -1048,6 +1056,7 @@ orchestration = "off"
             "browser_cdp" => config.agent.browser_enabled = enabled,
             "computer_use" => config.agent.computer_use = enabled,
             "human_intervention" => config.agent.human_intervention = enabled,
+            "subagent_enabled" => config.agent.subagent_enabled = enabled,
             "linux_ir_tools" => config.agent.linux_ir_tools = enabled,
             "win_ir_tools" => config.agent.win_ir_full_load = enabled,
             other => return Err(format!("unknown tool switch: {}", other).into()),

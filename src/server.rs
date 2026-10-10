@@ -476,6 +476,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/checkpoints/{id}", delete(checkpoints_delete_handler))
         .route("/api/settings/computer_use", post(computer_use_toggle_handler))
         .route("/api/settings/human_intervention", get(human_intervention_get_handler).post(human_intervention_toggle_handler))
+        .route("/api/settings/subagent", get(subagent_get_handler).post(subagent_toggle_handler))
         .route("/api/settings/heartbeat", get(heartbeat_get_handler).post(heartbeat_toggle_handler))
         .route("/api/settings/agent", post(agent_settings_save_handler))
         .route("/api/settings/agent/extended", post(agent_settings_extended_save_handler))
@@ -2423,6 +2424,8 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             let session_cancel: Option<Arc<AtomicBool>> =
                                 state.session_slot_acquire(&session_id);
 
+                            // Sub-Agent Spawning 开关不门控 Expert 模式（边界决策 B）：
+                            // Expert 是独立的 Manager-Executor 串行代码路径，由自己的 Expert Mode 开关管。
                             let run_result = if managed {
                                 info!("Expert mode requested for session {}", session_id);
                                 // -- Instant -> Expert: inherit same-session Instant progress --
@@ -2928,7 +2931,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                         "permissions" => {
                             // Update permission settings (when not in agent execution)
                             let mut perms = state.permissions.lock().await;
-                            for cat in &["read", "write", "delete", "modify", "execute"] {
+                            for cat in &["read", "write", "delete", "modify", "execute", "system"] {
                                 if let Some(v) = parsed[cat].as_bool() {
                                     perms.insert(cat.to_string(), v);
                                 }
@@ -3979,6 +3982,35 @@ async fn human_intervention_toggle_handler(
     let mut response = json!({ "success": true, "enabled": enabled });
     if let Err(e) = crate::config::Config::set_builtin_tool_switch(&state.workspace_dir, "human_intervention", enabled) {
         error!("Failed to persist human_intervention={}: {}", enabled, e);
+        response["persisted"] = json!(false);
+        response["persist_error"] = json!(format!("changed for this run, but not saved: {}", e));
+    } else {
+        response["persisted"] = json!(true);
+    }
+    Json(response)
+}
+
+// Sub-Agent Spawning 总开关（只管 Instant 编排链路：工具投递 + spawn 执行；不门控 Expert，边界决策 B）
+// ============================================================
+
+async fn subagent_get_handler() -> Json<Value> {
+    Json(json!({ "success": true, "enabled": crate::tool::orchestration::subagent_enabled() }))
+}
+
+async fn subagent_toggle_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) else {
+        return Json(json!({ "success": false, "error": "missing boolean field: enabled" }));
+    };
+    crate::tool::orchestration::set_subagent_enabled(enabled);
+    info!("Sub-Agent Spawning {}", if enabled { "ENABLED" } else { "DISABLED" });
+
+    // 不落盘的话这一勾只活到下一次重启（与 human_intervention 同模式）。
+    let mut response = json!({ "success": true, "enabled": enabled });
+    if let Err(e) = crate::config::Config::set_builtin_tool_switch(&state.workspace_dir, "subagent_enabled", enabled) {
+        error!("Failed to persist subagent_enabled={}: {}", enabled, e);
         response["persisted"] = json!(false);
         response["persist_error"] = json!(format!("changed for this run, but not saved: {}", e));
     } else {
