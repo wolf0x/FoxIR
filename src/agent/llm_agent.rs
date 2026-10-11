@@ -1281,6 +1281,13 @@ to create a TODO list BEFORE starting work. THEN process the items STRICTLY ONE 
 5. When the LAST item is completed (all terminal: completed/cancelled/skipped), call `todo_update` action='clear'.\n\
 NEVER work on several items or all items in a single turn and summarize at the end — the user expects \
 progress to be visible item-by-item, with state synced after EACH step.\n\n\
+### HARD RULE — no silent rounds:\n\
+Once a TODO list is active, EVERY work round that ends with a tool call MUST also carry a `todo_update` \
+reflecting the current item's real status: mark it 'in_progress' the moment you begin it and 'completed' \
+the moment it is done. Creating the list with 'set' and then running many rounds WITHOUT any 'update' is a \
+contract violation — it freezes the TASKS panel at 'pending' while you work, the exact failure this prevents. \
+Even for large tasks (10+ items, e.g. a long checklist) you MUST update per item as you go and never batch \
+the status changes to the very end.\n\n\
 ### Intent-first (IMPORTANT):\n\
 - Take every new user message at face value and just do it. A new message IS the new task — never \
   comment on how it relates to previous tasks or the TODO list (no \"this is a different/new task\", \

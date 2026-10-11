@@ -2508,6 +2508,18 @@ try{var _ost=localStorage.getItem('foxir.outstyle');if(_ost==='grouped'||_ost===
 function histPush(m){if(OUT.replaying)return;msgHist.push(m);saveHist()}
 // 有界日志：单条正文 >64KB 只存引用与摘要；丢弃必须可见
  function outLogPush(m){
+  // v1.0.24 修复：把连续同流的增量合并为一条逻辑记录，使 OUT.log 的长度只随“块数”
+  // （而非 token 数）增长。旧版每个 text/thinking/progress 增量都单独入日
+  // 志，长会话撑爆 OUT_LOG_CAP 后会被 splice 掉最旧事件，导致切换 Turn/Grouped 时
+  // rebuild 只重放被截断的日志、丢见早期整段会话。text/thinking 拼接 content，progress 保留最后一条。
+  if(m&&(m.type==='text'||m.type==='thinking'||m.type==='progress')&&OUT.log.length){
+    var _last=OUT.log[OUT.log.length-1];
+    if(_last&&_last.type===m.type&&((_last.invocation_id||'')=== (m.invocation_id||''))){
+      if(m.type==='progress'){ _last.message=m.message; _last.elapsed_secs=m.elapsed_secs; if(m.tool_name)_last.tool_name=m.tool_name; }
+      else { _last.content=(_last.content||'')+(m.content||''); if(m.time)_last.time=m.time; }
+      return;
+    }
+  }
   var e=m;
   try{
     var big=(typeof m.result==='string'&&m.result.length>OUT_BODY_REF)||(typeof m.content==='string'&&m.content.length>OUT_BODY_REF)||(m.imgs&&m.imgs.some(function(s){return typeof s==='string'&&s.length>OUT_BODY_REF}));
@@ -2527,10 +2539,10 @@ function emit(msg){
   var _stream=['thinking','text','tool_call','tool_result','progress'];
   var _sid=msg.session||taskSessionId||SESSION_ID;
   if(_stream.indexOf(msg.type)>=0&&_sid!==SESSION_ID){handleMsg(msg);return}
-  // 实时 TASKS/TODO：todo_update 工具在 execute() 中已写盘，其 tool_result 到达时
-  // 当前会话的 todos.json 必已最新——立即刷新面板，而不干等 5s 轮询。后台会话已在
-  // 上方提前分流，故此钩子只对可见会话自身的 todo 变更触发（会话隔离）。
-  if(msg.type==='tool_result'&&msg.name==='todo_update')scheduleTodosRefresh();
+  // 实时 TASKS/TODO（v1.0.24，对齐 GDAgent 的事件携带载荷直渲）：todo_update 的 tool_result
+  // 已带全量 todos，直接渲染面板，去掉 fetch 往返。后台会话已在上方提前分流，故此钩子只对
+  // 可见会话自身的 todo 变更触发（会话隔离）。
+  if(msg.type==='tool_result'&&msg.name==='todo_update')applyTodosFromEvent(msg);
   outLogPush(msg);paintOne(msg);
 }
 function paintOne(msg){
@@ -5135,29 +5147,41 @@ async function openOutputFolder(){
   }catch(e){addLog('Open folder failed','error')}
 }
 
+// 渲染任务面板（供 fetch 兜底路径与事件载荷直渲路径共用）
+function renderTodoItems(items){
+  const el=document.getElementById('todoList');if(!el)return;
+  items=items||[];
+  if(!items.length){el.innerHTML='<div class="todo-empty">No active tasks</div>';return}
+  el.innerHTML=items.map(item=>{
+    const s=item.status||'pending';
+    const desc=esc(item.description||'');
+    return '<div class="todo-item" title="'+desc+' ('+s+')">'+
+      '<span class="todo-status '+s+'"></span>'+
+      '<span class="todo-desc '+s+'">'+desc+'</span>'+
+      '</div>';
+  }).join('');
+}
 async function loadTodos(sid){
   const s=sid||SESSION_ID||'';
   try{
     const r=await fetch('/api/todos?session='+encodeURIComponent(s));const d=await r.json();
-    const el=document.getElementById('todoList');if(!el)return;
-    const items=d.items||[];
-    if(!items.length){el.innerHTML='<div class="todo-empty">No active tasks</div>';return}
-    el.innerHTML=items.map(item=>{
-      const s=item.status||'pending';
-      const desc=esc(item.description||'');
-      return '<div class="todo-item" title="'+desc+' ('+s+')">'+
-        '<span class="todo-status '+s+'"></span>'+
-        '<span class="todo-desc '+s+'">'+desc+'</span>'+
-        '</div>';
-    }).join('');
+    renderTodoItems(d.items||[]);
   }catch(e){}
 }
-// 事件驱动的即时刷新：收到 todo_update 的 tool_result 后短防抖重拉一次，
-// 避免连续更新时风暴式 fetch；5s 轮询保留为兜底（如服务端 watchdog 自动 skip 不发事件）。
+// 事件驱动的即时刷新（v1.0.24，对齐 GDAgent）：todo_update 的 tool_result 已携带全量
+// todos 载荷，直接渲染、不再 fetch 往返；clear / 全部完成自动清空渲染为空；仅在遇到未知
+// 载荷时退回一次带防抖的 fetch。5s 轮询保留为兜底（服务端 watchdog 自动 skip 不发事件、
+// 以及断线重连/切会话后的补齐）。
 var _todosRefreshTimer=null;
 function scheduleTodosRefresh(){
   if(_todosRefreshTimer)clearTimeout(_todosRefreshTimer);
   _todosRefreshTimer=setTimeout(function(){_todosRefreshTimer=null;loadTodos();},120);
+}
+function applyTodosFromEvent(msg){
+  const res=(msg&&msg.result)||{};
+  if(res.todos&&Array.isArray(res.todos.items)){renderTodoItems(res.todos.items);return}
+  if(res.action==='clear'||res.auto_cleared===true){renderTodoItems([]);return}
+  scheduleTodosRefresh();
 }
 setInterval(()=>loadTodos(),5000);
 
