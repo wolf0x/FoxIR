@@ -562,6 +562,8 @@ input:checked+.slider:before{transform:translateX(20px)}
 :root[data-theme="dark"] .gbox-hdr:hover{background:#141922}
 .gbox-title{font-size:12px;font-weight:700;color:var(--t1)}
 .gbox-title .dot{color:var(--t3);font-weight:400;margin:0 3px}
+.gbox-count{font-size:12px;font-weight:700;color:var(--t1)}
+.gbox-time{font-size:11px;color:var(--t3);font-family:var(--mono)}
 .gbox-meta{font-size:11px;color:var(--t3);font-family:var(--mono)}
 .gbox-right{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:11px;color:var(--t2)}
 .gbox .arrow{font-size:10px;color:var(--t3);transition:transform .25s}
@@ -2525,6 +2527,10 @@ function emit(msg){
   var _stream=['thinking','text','tool_call','tool_result','progress'];
   var _sid=msg.session||taskSessionId||SESSION_ID;
   if(_stream.indexOf(msg.type)>=0&&_sid!==SESSION_ID){handleMsg(msg);return}
+  // 实时 TASKS/TODO：todo_update 工具在 execute() 中已写盘，其 tool_result 到达时
+  // 当前会话的 todos.json 必已最新——立即刷新面板，而不干等 5s 轮询。后台会话已在
+  // 上方提前分流，故此钩子只对可见会话自身的 todo 变更触发（会话隔离）。
+  if(msg.type==='tool_result'&&msg.name==='todo_update')scheduleTodosRefresh();
   outLogPush(msg);paintOne(msg);
 }
 function paintOne(msg){
@@ -2559,6 +2565,10 @@ function seedHistToLog(msgs){
 // 全量重建：先复位装配状态袋（硬约束2），再逐条重放日志；返回是否成功（供 setOutStyle 回退）
 function rebuild(){
   var log=OUT.log.slice(),prev=OUT.replaying,ok=true;
+  // 不变量守卫：日志是唯一真相源。若日志为空但当前会话仍持有持久化消息 msgHist
+  // （典型来自快照/历史经 innerHTML 快路径回填却未播种 OUT.log 的路径），先播种再重放，
+  // 避免切换 Turn/Grouped 时用空日志重绘把已渲染的历史抹掉（bugfix：切换视图历史会话丢失）。
+  if(log.length===0&&!prev&&msgHist&&msgHist.length){seedHistToLog(msgHist);log=OUT.log.slice();}
   OUT.replaying=true;
   try{
     clearCurrentSessionUI();gsReset();
@@ -2639,20 +2649,20 @@ function gsOpen(inv){
   gs.seq++;
   var root=document.createElement('div');root.className='inv';if(inv)root.dataset.inv=inv;
   c.appendChild(root); // 两框懒建：只有真实出现的类型才建对应框，避免出现空框
-  gs.inv=inv||null;gs.root=root;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null;
+  gs.inv=inv||null;gs.root=root;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null;gs.folded=false;
   scrollBottom();return root;
 }
 function ensureThink(){
   if(gs.think||!gs.root)return gs.think;
-  var th=document.createElement('div');th.className='gbox thinking open';
-  th.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">Thinking</span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
+  var th=document.createElement('div');th.className='gbox thinking';
+  th.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">Analyzing</span><span class="gbox-count"></span><span class="gbox-right"><span class="gbox-time"></span></span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
   gs.root.insertBefore(th,gs.root.firstChild); // thinking 框恒在 tools 框之上
   gs.think=th;return th;
 }
 function ensureTools(){
   if(gs.tools||!gs.root)return gs.tools;
   var tl=document.createElement('div');tl.className='gbox tools open';
-  tl.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">0 tool calls</span><span class="hchips"></span><span class="gbox-right"><span class="gbox-meta">Total \u2014</span></span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
+  tl.innerHTML='<div class="gbox-hdr" onclick="this.parentElement.classList.toggle(\'open\')"><span class="gbox-title">EXEC</span><span class="gbox-count">Tool call: 0</span><span class="hchips"></span><span class="gbox-right"><span class="gbox-meta">Total \u2014</span></span><span class="arrow">\u25be</span></div><div class="gbox-body"></div>';
   gs.root.appendChild(tl);
   gs.tools=tl;return tl;
 }
@@ -2661,15 +2671,16 @@ function gsNeed(inv){
   if(inv&&gs.inv&&gs.inv!==inv)gsOpen(inv); // Expert 多 invocation 按调用切组
   if(inv&&!gs.inv)gs.inv=inv
 }
-function gsClose(){endThink();gs.inv=null;gs.root=null;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null}
+function gsClose(){gsCollapseBoxes();endThink();gs.inv=null;gs.root=null;gs.think=null;gs.tools=null;gs.cards={};gs.thinkT0=0;gs.thinkTn=0;gs.curThink=null}
 function thinkBody(){return gs.think?gs.think.querySelector('.gbox-body'):null}
 function toolsBody(){return gs.tools?gs.tools.querySelector('.gbox-body'):null}
 function endThink(){gs.curThink=null} // 结束当前流式思考段
 function updThinkHdr(){
   if(!gs.think)return;
   var n=gs.think.querySelectorAll('.tline').length;
-  var t=(gs.thinkT0&&gs.thinkTn>gs.thinkT0)?('<span class="dot">\u00b7</span>'+fmtDur(gs.thinkTn-gs.thinkT0)):'';
-  gs.think.querySelector('.gbox-title').innerHTML='Thinking<span class="dot">\u00b7</span>'+n+t;
+  gs.think.querySelector('.gbox-count').innerHTML='<span class="dot">\u00b7</span>'+n;
+  var tm=gs.think.querySelector('.gbox-time');
+  if(tm)tm.textContent=(gs.thinkT0&&gs.thinkTn>gs.thinkT0)?fmtDur(gs.thinkTn-gs.thinkT0):'';
 }
 // thinking：连续增量拼成一行（🧠），不做去重（各段文本通常不同）
 function onThinking(msg){
@@ -2709,7 +2720,7 @@ function updToolsHdr(){
   var tl=gs.tools;if(!tl)return;
   var body=tl.querySelector('.gbox-body');
   var cards=body.querySelectorAll('.tcard');
-  tl.querySelector('.gbox-title').textContent=cards.length+' tool call'+(cards.length===1?'':'s');
+  tl.querySelector('.gbox-count').textContent='Tool call: '+cards.length;
   var cnt={},total=0,hasDur=false;
   Array.prototype.forEach.call(cards,function(cd){
     var r=cd.dataset.region||'TOOL';cnt[r]=(cnt[r]||0)+1;
@@ -2730,16 +2741,20 @@ function gsMakeCard(name,callId,args,region){
   d.appendChild(pillEl('running'));
   var td=document.createElement('span');td.className='tdur';td.textContent='\u2014';d.appendChild(td);
   var out=document.createElement('div');out.className='out';out.textContent=argsStr;d.appendChild(out);
-  d.addEventListener('click',function(){d.classList.toggle('open')}); // 默认折叠，点击展开
+  // tool 卡默认折叠详情（参数/结果全文），点击卡片展开
+  d.addEventListener('click',function(){d.classList.toggle('open')});
   body.appendChild(d);
   if(callId)gs.cards[callId]=d;
   return d
 }
+function gsCollapseBoxes(){gs.folded=true;if(gs.root){gs.root.querySelectorAll('.gbox').forEach(function(b){b.classList.remove('open')})}}
 function paintGrouped(msg){
   if(isWorkerFragment(msg))return; // 抑制在装配层；事件已入日志，切回合式时重现（硬约束1）
   // 与回合式一致：thinking/progress/tool 事件先结束当前流式文本块，使被工具隔开的多段答复各自成气泡（不并入同块）
   if(msg.type==='thinking'||msg.type==='progress'||msg.type==='tool_call'||msg.type==='tool_result')finalizeTextBlock();
   if(!gs.btnSynced&&(msg.type==='thinking'||msg.type==='progress'||msg.type==='tool_call')){gs.btnSynced=true;renderStyleBtn(false);} // 首个可分组事件出现后纠正样式按钮的陈旧“无事件可组”提示
+  // 新一轮守卫：本轮已收束折叠（gs.folded 标记）时，遇新 thinking/tool 事件先关旧组，使下一轮独立成组并重新展开
+  if(gs.root&&(msg.type==='thinking'||msg.type==='progress'||msg.type==='tool_call'||msg.type==='tool_result')&&gs.folded){gsClose();}
   var inv=msg.invocation_id||'';
   switch(msg.type){
     case 'thinking':onThinking(msg);break;
@@ -2777,7 +2792,7 @@ function paintGrouped(msg){
     case 'subagent_spawned':case 'subagent_completed':case 'subagent_failed':case 'budget_update':case 'plan_updated':
       endThink();gsNeed(inv);ensureTools();expertHandleMsg(msg);handleSubAgentCard(msg,toolsBody());break;
     case 'text':
-      endThink();handleMsg(msg);break; // 答复走 Turn 气泡留在 .inv 之外；不关组，后续 thinking/tool 继续并入同组
+      endThink();handleMsg(msg);break; // 答复走 Turn 气泡留在 .inv 之外；不折叠不关组，使中间叙述不拆组，本轮保持一组，至 done 才折叠
     case 'done':
       endThink();gsClose();handleMsg(msg);break;
     case 'usage':
@@ -5136,6 +5151,13 @@ async function loadTodos(sid){
         '</div>';
     }).join('');
   }catch(e){}
+}
+// 事件驱动的即时刷新：收到 todo_update 的 tool_result 后短防抖重拉一次，
+// 避免连续更新时风暴式 fetch；5s 轮询保留为兜底（如服务端 watchdog 自动 skip 不发事件）。
+var _todosRefreshTimer=null;
+function scheduleTodosRefresh(){
+  if(_todosRefreshTimer)clearTimeout(_todosRefreshTimer);
+  _todosRefreshTimer=setTimeout(function(){_todosRefreshTimer=null;loadTodos();},120);
 }
 setInterval(()=>loadTodos(),5000);
 
