@@ -13,33 +13,41 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
-type Queue = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
+type PendingQueue = Arc<Mutex<HashMap<String, VecDeque<(String, bool)>>>>;
+type InsertQueue = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 
-fn pending() -> &'static Queue {
-    static Q: OnceLock<Queue> = OnceLock::new();
+fn pending() -> &'static PendingQueue {
+    static Q: OnceLock<PendingQueue> = OnceLock::new();
     Q.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
-fn insert_channel() -> &'static Queue {
-    static Q: OnceLock<Queue> = OnceLock::new();
+fn insert_channel() -> &'static InsertQueue {
+    static Q: OnceLock<InsertQueue> = OnceLock::new();
     Q.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
 /// Queue a follow-up task to run after the current task finishes (default
 /// path when the user does not press "insert"). Synchronous and non-blocking.
-pub fn push_pending(session_id: &str, content: String) {
+///
+/// `echo` controls whether the dispatcher should send a `queued_run` event to
+/// the client when this item actually starts running:
+/// - `true` for interject-origin items (the client never rendered a bubble for
+///   them, so `queued_run` is what surfaces the user message once).
+/// - `false` for chat-while-running items (the client already rendered its own
+///   send bubble, so echoing again would duplicate the user message).
+pub fn push_pending(session_id: &str, content: String, echo: bool) {
     pending()
         .lock()
         .unwrap()
         .entry(session_id.to_string())
         .or_default()
-        .push_back(content);
+        .push_back((content, echo));
 }
 
-/// Pop the next queued follow-up for a session (FIFO). Returns `None` when the
-/// queue is empty. The server dispatches these as sequential tasks after the
-/// current run completes.
-pub fn pop_pending(session_id: &str) -> Option<String> {
+/// Pop the next queued follow-up for a session (FIFO), returning its content and
+/// the `echo` flag. Returns `None` when the queue is empty. The server
+/// dispatches these as sequential tasks after the current run completes.
+pub fn pop_pending(session_id: &str) -> Option<(String, bool)> {
     let mut q = pending().lock().unwrap();
     let entry = q.get_mut(session_id)?;
     let item = entry.pop_front();
@@ -93,11 +101,11 @@ mod tests {
     fn pending_queue_is_fifo_and_empties() {
         let sid = "test-pending-1";
         for m in ["task-a", "task-b", "task-c"] {
-            push_pending(sid, m.to_string());
+            push_pending(sid, m.to_string(), true);
         }
-        assert_eq!(pop_pending(sid).as_deref(), Some("task-a"));
-        assert_eq!(pop_pending(sid).as_deref(), Some("task-b"));
-        assert_eq!(pop_pending(sid).as_deref(), Some("task-c"));
+        assert_eq!(pop_pending(sid).map(|(c, _)| c).as_deref(), Some("task-a"));
+        assert_eq!(pop_pending(sid).map(|(c, _)| c).as_deref(), Some("task-b"));
+        assert_eq!(pop_pending(sid).map(|(c, _)| c).as_deref(), Some("task-c"));
         assert_eq!(pop_pending(sid), None);
         assert_eq!(pop_pending(sid), None, "empty queue keeps returning None");
     }
@@ -118,13 +126,13 @@ mod tests {
     #[test]
     fn channels_are_isolated() {
         let sid = "test-iso-1";
-        push_pending(sid, "follow-up".to_string());
+        push_pending(sid, "follow-up".to_string(), true);
         push_insert(sid, "insert-now".to_string());
         let drained = drain_insert(sid);
         assert_eq!(drained, vec!["insert-now".to_string()]);
         assert!(drain_insert(sid).is_empty());
         // The pending follow-up is untouched by draining inserts.
-        assert_eq!(pop_pending(sid).as_deref(), Some("follow-up"));
+        assert_eq!(pop_pending(sid).map(|(c, _)| c).as_deref(), Some("follow-up"));
         assert_eq!(pop_pending(sid), None);
     }
 }

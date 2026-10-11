@@ -2131,14 +2131,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             }
         } else {
             match crate::interject::pop_pending(&session_id) {
-                Some(next_content) => {
+                Some((next_content, echo)) => {
                     info!("[session:{}] Dispatching queued follow-up task", session_id);
                     // Tell the client this queued interjection is now entering the
                     // execution queue so it can render a user-side bubble. It must
-                    // NOT be shown earlier (only once it actually starts running).
-                    let run_content = next_content.clone();
-                    let _ = ws_send_bounded(&ws_sink, json!(
-                        {"type":"queued_run","content":run_content,"session":session_id}).to_string()).await;
+                    // NOT be shown earlier (only once it actually starts running),
+                    // and only for interject-origin items: chat-while-running items
+                    // were already rendered by the client's own send bubble, so
+                    // echoing again would duplicate the user message (echo=false).
+                    if echo {
+                        let run_content = next_content.clone();
+                        let _ = ws_send_bounded(&ws_sink, json!(
+                            {"type":"queued_run","content":run_content,"session":session_id}).to_string()).await;
+                    }
                     let msg_json = json!({ "type": "chat", "content": next_content });
                     Some(Message::Text(msg_json.to_string().into()))
                 }
@@ -2411,8 +2416,11 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                             // NOT a global setting. When true, the task runs through the
                             // Manager-Executor-Auditor loop for long-horizon IR tasks.
                         if state.session_is_running(&session_id) {
-                            crate::interject::push_pending(&session_id, content.clone());
-                            let _ = ws_send_bounded(&ws_sink, json!({"type":"queued_run","content":content.clone(),"session":session_id}).to_string()).await;
+                            // The client already rendered its own bubble for this `chat`,
+                            // so queue it with echo=false: dispatch will run it WITHOUT
+                            // re-sending queued_run (no duplicate user message). The
+                            // previous premature queued_run here was the second render source.
+                            crate::interject::push_pending(&session_id, content.clone(), false);
                         } else {
                             let managed = parsed["managed"].as_bool().unwrap_or(false);
                             let managed_scope = parsed["managed_scope"].as_str().unwrap_or("").to_string();
@@ -3003,7 +3011,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                 if ij_insert {
                                     crate::interject::push_insert(&ij_sid, ij_content);
                                 } else {
-                                    crate::interject::push_pending(&ij_sid, ij_content);
+                                    crate::interject::push_pending(&ij_sid, ij_content, true);
                                 }
                             }
                         }
