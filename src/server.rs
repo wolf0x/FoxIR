@@ -295,8 +295,6 @@ pub struct AppState {
     /// Expert-mode per-role model overrides (Manager/Auditor/Executor) and their
     /// optional fallbacks. Hot-reloadable from Settings UI.
     pub expert_role_models: Arc<std::sync::RwLock<crate::config::RoleModelsConfig>>,
-    /// Timezone offset in hours (from config.toml) — RwLock for hot-reload from UI
-    pub timezone_offset: Arc<std::sync::RwLock<i8>>,
     /// Hindsight 远端记忆体同步器（Task #20）：写同步 retain / 读融合 recall。
     /// 与 `mcp_manager` 共享同一份 MCP 连接，配置可经 Settings 热更新。
     pub hindsight_sync: Arc<crate::hindsight_sync::HindsightSync>,
@@ -599,7 +597,7 @@ async fn knowledge_refresh_handler(State(state): State<Arc<AppState>>) -> Json<V
             json!({ "rel": rel, "title": title, "preferred": pinned })
         })
         .collect();
-    Json(json!({ "files": items, "preferred": preferred, "count": items.len() }))
+    Json(json!({ "success": true, "files": items, "preferred": preferred, "count": items.len() }))
 }
 
 async fn index_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -979,7 +977,6 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
         "primary_model": state.primary_model.read().unwrap().clone(),
         "fallback_model": state.fallback_model.read().unwrap().clone(),
         "expert_role_models": serde_json::to_value(state.expert_role_models.read().unwrap().clone()).unwrap_or(json!({})),
-        "timezone_offset": *state.timezone_offset.read().unwrap(),
         "tool_permissions": tool_permissions,
         "permission_locks": permission_locks,
     }))
@@ -1002,6 +999,7 @@ async fn providers_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
             "context_window": m.context_window,
             "max_tokens": m.max_tokens,
             "temperature": m.temperature,
+            "supports_vision": m.supports_vision,
         })
     }).collect();
     Json(json!({ "providers": list, "count": list.len() }))
@@ -1031,7 +1029,7 @@ async fn providers_create_handler(
         context_window: body["context_window"].as_u64().map(|v| v as usize).unwrap_or(128000),
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32).unwrap_or(16384),
         temperature: body["temperature"].as_f64().unwrap_or(0.7),
-        supports_vision: body["supports_vision"].as_bool().unwrap_or(false),
+        supports_vision: body["supports_vision"].as_bool().unwrap_or(true),
     };
     models.push(new_config);
     crate::model_store::save_configs(&models, std::path::Path::new(&state.model_store_path));
@@ -1271,30 +1269,6 @@ fn mask_api_key(key: &str) -> String {
     format!("{}****{}", head, tail)
 }
 
-/// 根据 Hindsight 配置构造名为 "hindsight" 的 SSE MCP server 配置。
-fn hindsight_mcp_config(cfg: &crate::config::HindsightConfig) -> McpServerConfig {
-    let url = format!(
-        "{}/mcp/{}/",
-        cfg.base_url.trim_end_matches('/'),
-        cfg.bank_id
-    );
-    McpServerConfig {
-        name: "hindsight".to_string(),
-        transport: "sse".to_string(),
-        command: None,
-        args: vec![],
-        url: Some(url),
-        auth_token: if cfg.api_key.is_empty() {
-            None
-        } else {
-            Some(cfg.api_key.clone())
-        },
-        enabled: true,
-        // 只暴露同步层实际调用的 4 个工具，管理类工具不进 LLM 工具表。
-        tool_whitelist: Some(crate::config::HindsightConfig::tool_whitelist()),
-    }
-}
-
 async fn hindsight_settings_get_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let cfg = state.hindsight_sync.get_config().await;
     let connected = {
@@ -1315,93 +1289,24 @@ async fn hindsight_settings_get_handler(State(state): State<Arc<AppState>>) -> J
     }))
 }
 
-async fn hindsight_settings_save_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
-    // 以当前配置为基线（保留未在 body 中出现的超时/熔断参数）。
-    let current = state.hindsight_sync.get_config().await;
-
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(current.enabled);
-    let base_url = body.get("base_url").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string()).unwrap_or_else(|| current.base_url.clone());
-    let bank_id = body.get("bank_id").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-        .unwrap_or_else(|| current.bank_id.clone());
-    // api_key：若前端回传遮蔽值（含 '*'）或空，则沿用已有 key，避免误抹。
-    let api_key = match body.get("api_key").and_then(|v| v.as_str()) {
-        Some(k) if !k.is_empty() && !k.contains('*') => k.trim().to_string(),
-        _ => current.api_key.clone(),
-    };
-
-    let new_cfg = crate::config::HindsightConfig {
-        enabled,
-        base_url: base_url.clone(),
-        api_key: api_key.clone(),
-        bank_id: bank_id.clone(),
-        write_timeout_ms: current.write_timeout_ms,
-        read_timeout_ms: current.read_timeout_ms,
-        circuit_breaker_threshold: current.circuit_breaker_threshold,
-        circuit_breaker_cooldown_s: current.circuit_breaker_cooldown_s,
-    };
-
-    // 热更新同步器配置。
-    state.hindsight_sync.update_config(new_cfg.clone()).await;
-
-    // 注册/更新或移除 MCP server，并同步工具注册表。
-    let mut mgr = state.mcp_manager.lock().await;
-    let old_names = mgr.tool_names();
-    if enabled && !api_key.is_empty() && !base_url.is_empty() {
-        // 已存在同名 → 先 remove 再 connect（避免重复 handle）。
-        mgr.remove_server("hindsight").await;
-        let hs_cfg = hindsight_mcp_config(&new_cfg);
-        mgr.connect_server(&hs_cfg).await;
-        mgr.save_configs();
-    } else {
-        // 未启用：断开并移除 "hindsight" MCP server。
-        if mgr.remove_server("hindsight").await {
-            mgr.save_configs();
-        }
-    }
-    let mcp_tools = mgr.get_tools();
-    let connected = mgr.is_server_connected("hindsight");
-    drop(mgr);
-    {
-        let mut registry = state.tools.write().await;
-        registry.unregister_many(&old_names);
-        for tool in &mcp_tools {
-            registry.register(tool.clone());
-        }
-    }
-
-    // 持久化到 config.toml。
-    let persist_ok = match crate::config::Config::save_hindsight_settings(&state.workspace_dir, &new_cfg) {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("Failed to persist hindsight settings: {}", e);
-            false
-        }
-    };
-
-    Json(json!({ "success": true, "persisted": persist_ok, "connected": connected }))
+/// 端点与凭据由部署方写在 `config.toml`，此 API 不开放修改（始终拒绝写入）。
+/// 读侧仍可在 Settings 里看到当前生效值（key 掩码）。
+async fn hindsight_settings_save_handler() -> Json<Value> {
+    Json(json!({
+        "success": false,
+        "locked": true,
+        "error": "Hindsight settings are locked by deployment configuration",
+    }))
 }
 
 async fn hindsight_settings_test_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
 ) -> Json<Value> {
-    // 若前端传回遮蔽 key（含 '*'）或空，则使用已存储的真实 key。
+    // 只测试 config.toml 里当前生效的端点，忽略请求体（避免用表单里的掩码值去连）。
     let stored = state.hindsight_sync.get_config().await;
-    let base_url = body.get("base_url").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-        .unwrap_or_else(|| stored.base_url.clone());
-    let api_key = match body.get("api_key").and_then(|v| v.as_str()) {
-        Some(k) if !k.is_empty() && !k.contains('*') => k.trim().to_string(),
-        _ => stored.api_key.clone(),
-    };
-    let bank_id = body.get("bank_id").and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-        .unwrap_or_else(|| stored.bank_id.clone());
+    let base_url = stored.base_url.clone();
+    let api_key = stored.api_key.clone();
+    let bank_id = stored.bank_id.clone();
     if base_url.is_empty() {
         return Json(json!({ "success": false, "error": "Missing base_url", "tools": [] }));
     }
@@ -1564,7 +1469,7 @@ async fn logs_handler(
 ) -> Json<Value> {
     let date = query
         .date
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
     match state.logger.read_logs(&date) {
         Ok(entries) => Json(json!({ "date": date, "entries": entries, "count": entries.len() })),
         Err(e) => Json(json!({ "error": e })),
@@ -2002,7 +1907,7 @@ async fn drain_session_stream(
             hist.drain(..drop_n);
         }
         let _ = state.memory_store.store_entry(&session_id, "assistant", &assistant_text, None);
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let _ = state.memory_store.auto_summarize_date(&today);
     }
 
@@ -2925,7 +2830,7 @@ if state.two_tier_memory.load(Ordering::SeqCst) {
                                     if !assistant_text.is_empty() {
                                         let _ = state.memory_store.store_entry(&session_id, "user", &cp.user_message, None);
                                         let _ = state.memory_store.store_entry(&session_id, "assistant", &assistant_text, None);
-                                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                                         let _ = state.memory_store.auto_summarize_date(&today);
                                     }
                                 }
@@ -3064,7 +2969,7 @@ async fn memory_entries_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MemoryQuery>,
 ) -> Json<Value> {
-    let date = query.date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let date = query.date.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
     match state.memory_store.get_entries_by_date(&date) {
         Ok(entries) => Json(json!({ "date": date, "entries": entries, "count": entries.len() })),
         Err(e) => Json(json!({ "error": e })),
@@ -3080,7 +2985,7 @@ async fn memory_summarize_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SummarizeRequest>,
 ) -> Json<Value> {
-    let date = body.date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let date = body.date.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
     match state.memory_store.build_raw_context_for_date(&date) {
         Ok(raw) => {
             // Store a simple extractive summary (LLM-based summary would need provider access).
@@ -3364,8 +3269,6 @@ struct HistoryQuery {
     days: usize,
     #[serde(default = "default_history_limit")]
     limit: usize,
-    #[serde(default = "default_tz_offset")]
-    tz_offset: i32,
     /// Optional session_id filter. When present, only entries for that session
     /// are returned; when absent, behaviour is unchanged (all recent entries).
     session: Option<String>,
@@ -3619,7 +3522,6 @@ Never record whether this assistant's OWN tools or capabilities work, are broken
 
 fn default_history_days() -> usize { 3 }
 fn default_history_limit() -> usize { 50 }
-fn default_tz_offset() -> i32 { 8 }
 
 async fn history_handler(
     State(state): State<Arc<AppState>>,
@@ -3627,8 +3529,6 @@ async fn history_handler(
 ) -> Json<Value> {
     let days = query.days.max(1).min(30);
     let limit = query.limit.max(1).min(200);
-    let tz_secs = query.tz_offset.clamp(-12, 14) * 3600;
-    let tz = chrono::FixedOffset::east_opt(tz_secs).unwrap_or_else(|| chrono::FixedOffset::east_opt(8 * 3600).unwrap());
     match state.memory_store.get_recent_entries(days) {
         Ok(entries) => {
             // Filter to user/assistant roles and take the last N entries
@@ -3646,8 +3546,9 @@ async fn history_handler(
                 .map(|e| json!({
                     "role": e.role,
                     "text": e.content,
+                    // Timestamps are stored as UTC; render in the OS-local timezone.
                     "time": chrono::DateTime::parse_from_rfc3339(&e.timestamp)
-                        .map(|dt| dt.with_timezone(&tz).format("%H:%M:%S").to_string())
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
                         .unwrap_or_default(),
                     "session_id": e.session_id,
                 }))
@@ -4233,7 +4134,7 @@ async fn agent_settings_save_handler(
     }
 }
 
-/// Save extended agent settings (model selection, timezone, permissions) to config.toml.
+/// Save extended agent settings (model selection, permissions) to config.toml.
 async fn agent_settings_extended_save_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -4246,10 +4147,6 @@ async fn agent_settings_extended_save_handler(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let timezone_offset = body.get("timezone_offset")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i8)
-        .unwrap_or(8);
 
     // Parse tool_permissions from the request
     let tool_permissions: std::collections::HashMap<String, bool> = body.get("tool_permissions")
@@ -4269,7 +4166,6 @@ async fn agent_settings_extended_save_handler(
         workspace_dir,
         primary_model.clone(),
         fallback_model.clone(),
-        timezone_offset,
         tool_permissions.clone(),
         permission_locks,
     ) {
@@ -4281,15 +4177,13 @@ async fn agent_settings_extended_save_handler(
             if let Some(ref m) = fallback_model {
                 *state.fallback_model.write().unwrap() = Some(m.clone());
             }
-            *state.timezone_offset.write().unwrap() = timezone_offset;
 
-            info!("Extended settings saved and hot-reloaded: primary_model={:?}, fallback_model={:?}, timezone={}, permissions={:?}",
-                primary_model, fallback_model, timezone_offset, tool_permissions);
+            info!("Extended settings saved and hot-reloaded: primary_model={:?}, fallback_model={:?}, permissions={:?}",
+                primary_model, fallback_model, tool_permissions);
             Json(json!({
                 "success": true,
                 "primary_model": primary_model,
                 "fallback_model": fallback_model,
-                "timezone_offset": timezone_offset,
                 "tool_permissions": tool_permissions,
                 "permission_locks": locks_echo,
             }))
@@ -4557,8 +4451,6 @@ fn is_recall_query(text: &str) -> bool {
 struct UsageQuery {
     #[serde(default = "default_usage_days")]
     days: usize,
-    #[serde(default)]
-    tz: f64,
 }
 
 fn default_usage_days() -> usize { 7 }
@@ -4569,9 +4461,7 @@ async fn usage_handler(
 ) -> Json<Value> {
     // days == 0 -> all-time cumulative; otherwise clamp to [1, 90]
     let days = if query.days == 0 { 0 } else { query.days.max(1).min(90) };
-    // Clamp timezone offset to a sane range (UTC-12 .. UTC+14)
-    let tz = query.tz.max(-12.0).min(14.0);
-    match state.memory_store.get_usage_stats(days, tz) {
+    match state.memory_store.get_usage_stats(days) {
         Ok(data) => {
             // Compute summary totals from the data array
             let mut total_calls: i64 = 0;

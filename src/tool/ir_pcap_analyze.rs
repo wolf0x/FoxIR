@@ -685,13 +685,13 @@ impl PcapAnalysis {
     }
 }
 
-/// Format Unix timestamp to human-readable string (UTC+8).
+/// Format Unix timestamp to a human-readable OS-local string with its UTC offset.
 fn format_timestamp(secs: i64) -> String {
     match chrono::DateTime::from_timestamp(secs, 0) {
-        Some(dt) => {
-            let naive = dt.naive_utc() + chrono::Duration::hours(8);
-            naive.format("%Y-%m-%d %H:%M:%S (UTC+8)").to_string()
-        }
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+            .to_string(),
         None => "N/A".to_string(),
     }
 }

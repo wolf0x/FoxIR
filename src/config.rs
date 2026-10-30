@@ -157,9 +157,6 @@ pub struct AgentConfig {
     /// Fallback model name (used if primary fails)
     #[serde(default)]
     pub fallback_model: Option<String>,
-    /// Timezone offset in hours (e.g., 8 = UTC+8)
-    #[serde(default = "default_timezone_offset")]
-    pub timezone_offset: i8,
     /// Tool permissions: category -> allowed (true) or denied (false)
     #[serde(default)]
     pub tool_permissions: HashMap<String, bool>,
@@ -202,19 +199,22 @@ pub struct AgentConfig {
 
 /// Hindsight 远端记忆体集成配置。
 ///
-/// Hindsight 通过 MCP 端点（`http://{host}:{port}/mcp/{bank_id}/`）暴露
-/// retain / recall 能力。FoxIR 复用既有 MCP 客户端编程式调用，本结构承载
-/// 开关、超时与熔断参数，支持 Settings 页热更新。
+/// Hindsight 通过 MCP 端点（`{base_url}/mcp/{bank_id}/`）暴露 retain / recall
+/// 能力。FoxIR 复用既有 MCP 客户端编程式调用，本结构承载开关、超时与熔断参数。
+///
+/// **端点与凭据只来自 `config.toml`**：源码不内置任何 base_url、api_key 或
+/// bank_id。`api_key` 允许以 `ENC:` 密文落盘（`Config::save` 自动加密，
+/// `Config::load` 自动解密）。两者缺任何一项即停用远端同步并告警。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HindsightConfig {
-    /// 总开关，默认开。
+    /// 总开关，默认关（部署方在 config.toml 里填好端点与凭据后再开）。
     pub enabled: bool,
-    /// Hindsight 服务基址，默认 `http://localhost:8888`。
+    /// Hindsight 服务基址，例如 `http://10.0.0.5:8889`。默认为空 = 未配置。
     pub base_url: String,
-    /// Bearer token（加密存储）。
+    /// Bearer token（`ENC:` 密文落盘，明文驻内存）。默认为空 = 未配置。
     pub api_key: String,
-    /// 记忆体 bank 标识，默认 `smoke-test`。
+    /// 记忆体 bank 标识。默认为空 = 未配置。
     pub bank_id: String,
     /// 写入超时（毫秒），默认 10000。
     pub write_timeout_ms: u64,
@@ -229,10 +229,10 @@ pub struct HindsightConfig {
 impl Default for HindsightConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            base_url: "http://localhost:8888".to_string(),
+            enabled: false,
+            base_url: String::new(),
             api_key: String::new(),
-            bank_id: "smoke-test".to_string(),
+            bank_id: String::new(),
             write_timeout_ms: 10000,
             read_timeout_ms: 8000,
             circuit_breaker_threshold: 5,
@@ -242,6 +242,29 @@ impl Default for HindsightConfig {
 }
 
 impl HindsightConfig {
+    /// 解密落盘的 `ENC:` 凭据，并在缺端点或缺凭据时停用同步。
+    ///
+    /// 不做无凭据的尝试，也不留一个"看起来启用、实则必 401"的开关。
+    pub fn normalize_deployment(&mut self) {
+        self.api_key = crate::crypto::decrypt(&self.api_key);
+        if !self.enabled {
+            return;
+        }
+        let missing = match (self.base_url.trim().is_empty(), self.api_key.trim().is_empty()) {
+            (true, true) => Some("endpoint and api_key"),
+            (true, false) => Some("endpoint"),
+            (false, true) => Some("api_key"),
+            (false, false) => None,
+        };
+        if let Some(what) = missing {
+            tracing::warn!(
+                "Hindsight remote sync disabled: config.toml is missing {}; skipping remote memory",
+                what
+            );
+            self.enabled = false;
+        }
+    }
+
     /// FoxIR 同步层实际只调用这 4 个工具（写入 / 召回 / 作废 + 作废回退，
     /// 见 [`crate::hindsight_sync::HindsightSync`]）；mental model、directive、
     /// bank、knowledge base、operations 等管理类工具不进入 LLM 工具表，
@@ -515,8 +538,10 @@ pub struct ModelConfig {
     /// Sampling temperature (default: 0.7)
     #[serde(default = "default_temperature")]
     pub temperature: f64,
-    /// Whether this model supports image/vision input (default: false)
-    #[serde(default)]
+    /// Whether this model accepts image/vision input. Defaults to **enabled**;
+    /// a model the user explicitly turned off stays off (`models.json` always
+    /// carries the key, so existing entries are never re-enabled by this default).
+    #[serde(default = "default_true")]
     pub supports_vision: bool,
 }
 
@@ -602,7 +627,6 @@ impl Default for Config {
                 subagent_enabled: default_subagent_enabled(),
                 primary_model: None,
                 fallback_model: None,
-                timezone_offset: default_timezone_offset(),
                 tool_permissions: HashMap::new(),
                 permission_locks: Vec::new(),
                 external_tools: HashMap::new(),
@@ -668,7 +692,6 @@ fn default_parallel_ir_tools() -> bool { true }
 fn default_heartbeat_enabled() -> bool { false }
 fn default_max_tokens() -> u32 { 16384 }
 fn default_temperature() -> f64 { 0.7 }
-fn default_timezone_offset() -> i8 { 8 }
 fn default_expert_max_iterations() -> usize { 200 }
 fn default_expert_tool_timeout_secs() -> usize { 600 }
 fn default_expert_max_tool_retries() -> usize { 3 }
@@ -782,84 +805,22 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
-/// Current address name read from USER.md, if any explicit non-placeholder
-/// declaration exists. Looks for English "Call me X" or Chinese "称呼我为 X".
-pub fn user_md_address_name(workspace_dir: &str) -> Option<String> {
-    let path = std::path::Path::new(workspace_dir).join("USER.md");
-    let content = std::fs::read_to_string(&path).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        // English: "Call me <name>"
-        let lower = trimmed.to_lowercase();
-        if let Some(idx) = lower.find("call me") {
-            let rest = &trimmed[idx + "call me".len()..];
-            let name: String = rest
-                .chars()
-                .skip_while(|c| c.is_whitespace() || *c == ':' || *c == '：' || *c == '-')
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
-                .collect();
-            let name = name.trim().to_string();
-            if !name.is_empty() && !name.eq_ignore_ascii_case("master") {
-                return Some(name);
-            }
-        }
-        // Chinese: "称呼我为 <name>"
-        if let Some(idx) = trimmed.find("称呼我为") {
-            let rest = &trimmed[idx + "称呼我为".len()..];
-            let name: String = rest
-                .chars()
-                .skip_while(|c| c.is_whitespace() || *c == '：' || *c == ':')
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
-                .collect();
-            let name = name.trim().to_string();
-            if !name.is_empty() && !name.eq_ignore_ascii_case("master") {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Sync the user address name into the runtime USER.md on startup.
-/// If the system detects a real given name and USER.md has no explicit non-placeholder
-/// address (only "Master" or none), written the detected name so the agent addresses
-/// the user correctly without manual edits. Returns true if USER.md was updated.
+/// Fill the `{{USER_NAME}}` placeholder in the runtime USER.md on startup.
+/// Simple contract:
+/// - Placeholder present -> replace it with the filtered detected given name
+///   (system/reserved account names filter out and fall back to "Master").
+/// - No placeholder (already filled, or the user edited/removed the line) ->
+///   leave the file untouched. Returns true only when USER.md was written.
 pub fn sync_user_name_to_user_md(workspace_dir: &str, detected_name: &str) -> Result<bool, String> {
-    let detected = detected_name.trim();
-    if detected.is_empty() || !is_real_given_name(detected) {
-        return Ok(false);
-    }
-    // Respect an explicit user-declared address (any real name). Only fill the gap
-    // when USER.md uses the placeholder "Master" or has no address line at all.
-    if let Some(_existing) = user_md_address_name(workspace_dir) {
-        return Ok(false);
-    }
     let path = std::path::Path::new(workspace_dir).join("USER.md");
-    let mut content = std::fs::read_to_string(&path).map_err(|e| format!("read USER.md: {e}"))?;
-    let line_en = content
-        .lines()
-        .find(|l| l.to_lowercase().contains("address the user as") || l.to_lowercase().contains("call me"))
-        .map(|l| l.to_string());
-    let line_cn = content.lines().find(|l| l.contains("称呼我为")).map(|l| l.to_string());
-    if let Some(old) = line_en {
-        let new_line = format!("- Address the user as **{}**.", detected);
-        if content.contains(&old) {
-            content = content.replace(&old, &new_line);
-        } else {
-            content.push_str(&format!("
-- Address the user as **{}**.
-", detected));
-        }
-    } else if let Some(old) = line_cn {
-        let new_line = format!("- 称呼我为 {}.", detected);
-        content = content.replace(&old, &new_line);
-    } else {
-        content.push_str(&format!("
-## Identity
-- Address the user as **{}**.
-", detected));
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read USER.md: {e}"))?;
+    if !content.contains("{{USER_NAME}}") {
+        return Ok(false);
     }
-    std::fs::write(&path, &content).map_err(|e| format!("write USER.md: {e}"))?;
+    let detected = detected_name.trim();
+    let fill = if is_real_given_name(detected) { detected } else { "Master" };
+    let updated = content.replace("{{USER_NAME}}", fill);
+    std::fs::write(&path, &updated).map_err(|e| format!("write USER.md: {e}"))?;
     Ok(true)
 }
 
@@ -912,9 +873,8 @@ impl Config {
                 );
             }
             config.agent.modes.validate_orchestration();
-            // Hindsight api_key 以密文落盘：内存中统一还原为明文（明文配置原样透传）。
-            config.agent.hindsight.api_key =
-                crate::crypto::decrypt(&config.agent.hindsight.api_key);
+            // Hindsight 端点/凭据来自 config.toml：解密 ENC: 的 api_key，缺值即停用。
+            config.agent.hindsight.normalize_deployment();
             Ok(config)
         } else {
             // Backward compatibility: try exe_dir config.toml
@@ -926,8 +886,8 @@ impl Config {
                     let content = std::fs::read_to_string(&config_path)?;
                     // Parse with relaxed deserialization — ignore unknown fields from old format
                     let mut config: Config = toml::from_str(&content).unwrap_or_default();
-                    config.agent.hindsight.api_key =
-                        crate::crypto::decrypt(&config.agent.hindsight.api_key);
+                    // Hindsight：迁移路径同样按 config.toml 取值并做停用归一。
+                    config.agent.hindsight.normalize_deployment();
                     return Ok(config);
                 }
             }
@@ -994,8 +954,6 @@ heartbeat_enabled = false
 # Primary and fallback model names (set via Settings UI)
 # primary_model = "gpt-4o"
 # fallback_model = ""
-# Timezone offset in hours (e.g., 8 = UTC+8)
-timezone_offset = 8
 # Tool permissions (category -> allowed/denied)
 # [agent.tool_permissions]
 # read = true
@@ -1162,7 +1120,7 @@ orchestration = "off"
         config.save(workspace_dir)
     }
 
-    /// Save extended agent settings (model selection, timezone, permissions) to config.toml.
+    /// Save extended agent settings (model selection, permissions) to config.toml.
     /// `permission_locks` is `Option`: `None` means "this payload says nothing about
     /// locks", so a client that predates the third state must not clear what the user
     /// already locked.
@@ -1170,7 +1128,6 @@ orchestration = "off"
         workspace_dir: &str,
         primary_model: Option<String>,
         fallback_model: Option<String>,
-        timezone_offset: i8,
         tool_permissions: HashMap<String, bool>,
         permission_locks: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1178,7 +1135,6 @@ orchestration = "off"
 
         config.agent.primary_model = primary_model;
         config.agent.fallback_model = fallback_model;
-        config.agent.timezone_offset = timezone_offset;
         config.agent.tool_permissions = tool_permissions;
         if let Some(locks) = permission_locks {
             config.agent.permission_locks = locks;
@@ -1212,20 +1168,6 @@ orchestration = "off"
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = Self::load(workspace_dir).unwrap_or_default();
         config.agent.expert_role_models = role_models.clone();
-        config.save(workspace_dir)
-    }
-
-    /// 持久化 Hindsight 远端记忆体集成配置到 config.toml。
-    ///
-    /// 与 `set_builtin_tool_switch` 一致：load 失败直接向上报错，不用
-    /// `unwrap_or_default()` 接走 —— 否则会把用户配好的 provider / 权限段整体抹平。
-    /// `api_key` 由 [`Config::save`] 统一加密（`ENC:` 前缀）后落盘。
-    pub fn save_hindsight_settings(
-        workspace_dir: &str,
-        cfg: &HindsightConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = Self::load(workspace_dir)?;
-        config.agent.hindsight = cfg.clone();
         config.save(workspace_dir)
     }
 }
@@ -1297,7 +1239,7 @@ mod tests {
         );
 
         // GUI 的扩展设置保存走 load-then-mutate：它不碰这一行，也就不许把它抹掉
-        Config::save_extended_settings(&ws, Some("m".to_string()), None, 8, HashMap::new(), None).unwrap();
+        Config::save_extended_settings(&ws, Some("m".to_string()), None, HashMap::new(), None).unwrap();
         let after = Config::load(&ws).unwrap();
         assert_eq!(
             after.agent.permission_locks, cfg.agent.permission_locks,
@@ -1323,7 +1265,6 @@ mod tests {
             &ws,
             None,
             None,
-            8,
             HashMap::new(),
             Some(vec!["execute".to_string()]),
         )
@@ -1335,7 +1276,7 @@ mod tests {
             "the lock must land on disk"
         );
 
-        Config::save_extended_settings(&ws, None, None, 8, HashMap::new(), None).unwrap();
+        Config::save_extended_settings(&ws, None, None, HashMap::new(), None).unwrap();
         let after = Config::load(&ws).unwrap();
         assert_eq!(
             after.agent.permission_locks, cfg.agent.permission_locks,
@@ -1438,28 +1379,29 @@ mod tests {
     }
 
     #[test]
-    fn sync_writes_detected_name_when_no_address() {
+    fn sync_leaves_file_untouched_without_placeholder() {
         let ws = tmp_ws("noaddr");
         std::fs::write(Path::new(&ws).join("USER.md"), "# USER.md\n\nSome body.\n").unwrap();
         let updated = sync_user_name_to_user_md(&ws, "Alice").unwrap();
-        assert!(updated);
+        assert!(!updated, "without a placeholder the file is user-owned and must not be rewritten");
         let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
-        assert!(content.contains("Alice"));
+        assert_eq!(content, "# USER.md\n\nSome body.\n");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
-    fn sync_writes_detected_name_over_master_placeholder() {
-        let ws = tmp_ws("master");
+    fn sync_fills_master_when_detection_is_system_account() {
+        let ws = tmp_ws("sysname");
         std::fs::write(
             Path::new(&ws).join("USER.md"),
-            "# USER.md\n\n- Address the user as **Master** by default.\n",
+            "# USER.md\n\n- Call me {{USER_NAME}} (if empty/unrendered, use \"Master\").\n",
         ).unwrap();
-        let updated = sync_user_name_to_user_md(&ws, "Bob").unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Administrator").unwrap();
         assert!(updated);
         let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
-        assert!(content.contains("Bob"));
-        assert!(!content.contains("Address the user as **Master**"));
+        assert!(content.contains("Call me Master"), "system account must fall back to Master:\n{content}");
+        assert!(!content.contains("{{USER_NAME}}"));
+        assert!(!content.contains("Administrator"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1478,13 +1420,20 @@ mod tests {
     }
 
     #[test]
-    fn sync_skips_system_account_names() {
-        let ws = tmp_ws("admin");
-        std::fs::write(Path::new(&ws).join("USER.md"), "# USER.md\n\nSome body.\n").unwrap();
-        let updated = sync_user_name_to_user_md(&ws, "Administrator").unwrap();
-        assert!(!updated);
+    fn sync_renders_user_name_placeholder() {
+        let ws = tmp_ws("phname");
+        std::fs::write(
+            Path::new(&ws).join("USER.md"),
+            "# USER.md\n\n- Call me {{USER_NAME}} (if empty/unrendered, use \"Master\").\n",
+        )
+        .unwrap();
+        let updated = sync_user_name_to_user_md(&ws, "Caroline").unwrap();
+        assert!(updated);
         let content = std::fs::read_to_string(Path::new(&ws).join("USER.md")).unwrap();
-        assert!(!content.contains("Administrator"));
+        assert!(content.contains("Call me Caroline"), "placeholder must be filled in place:\n{content}");
+        assert!(!content.contains("{{USER_NAME}}"), "placeholder must be gone:\n{content}");
+        let again = sync_user_name_to_user_md(&ws, "Caroline").unwrap();
+        assert!(!again, "no placeholder left -> second run must not rewrite the file");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1561,5 +1510,99 @@ mod tests {
         assert!(back.agent.browser_headless, "missing key must default to headless");
         assert!(back.agent.browser_executable.is_empty(), "missing key must mean auto-detect");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 部署端点与凭据只来自 config.toml，源码不内置任何值。
+    #[test]
+    fn hindsight_values_are_read_from_config_file() {
+        let ws = tmp_ws("hindsight_cfg");
+        std::fs::write(
+            Path::new(&ws).join("config.toml"),
+            "[server]\n[agent.hindsight]\nenabled = true\nbase_url = \"http://cfg.invalid:8889\"\napi_key = \"cfg-key-123\"\nbank_id = \"CFGBANK\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load(&ws).expect("config.toml-provided hindsight must load");
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(cfg.agent.hindsight.base_url, "http://cfg.invalid:8889");
+        assert_eq!(cfg.agent.hindsight.api_key, "cfg-key-123");
+        assert_eq!(cfg.agent.hindsight.bank_id, "CFGBANK");
+        assert!(cfg.agent.hindsight.enabled);
+    }
+
+    /// api_key 密文落盘（ENC:），读回来必须是明文。
+    #[test]
+    fn hindsight_api_key_encrypted_on_disk_and_decrypted_on_load() {
+        let ws = tmp_ws("hindsight_enc");
+        let mut c = Config::default();
+        c.agent.hindsight.enabled = true;
+        c.agent.hindsight.base_url = "http://127.0.0.1:1/v1".to_string();
+        c.agent.hindsight.api_key = "plain-secret".to_string();
+        c.agent.hindsight.bank_id = "B".to_string();
+        c.save(&ws).unwrap();
+
+        let raw = std::fs::read_to_string(Path::new(&ws).join("config.toml")).unwrap();
+        assert!(raw.contains("ENC:"), "api_key must not reach disk in plaintext");
+        assert!(!raw.contains("plain-secret"), "plaintext key must not appear on disk");
+
+        let back = Config::load(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+        assert_eq!(back.agent.hindsight.api_key, "plain-secret", "must decrypt on load");
+    }
+
+    /// 缺端点或缺 key 时停用远端同步，不得假装在工作。
+    #[test]
+    fn hindsight_is_disabled_without_endpoint_or_key() {
+        let ws = tmp_ws("hindsight_missing");
+        std::fs::write(
+            Path::new(&ws).join("config.toml"),
+            "[server]\n[agent.hindsight]\nenabled = true\nbank_id = \"ONLYBANK\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+        assert!(!cfg.agent.hindsight.enabled, "no endpoint + no key must disable sync");
+
+        let ws2 = tmp_ws("hindsight_nopw");
+        std::fs::write(
+            Path::new(&ws2).join("config.toml"),
+            "[server]\n[agent.hindsight]\nenabled = true\nbase_url = \"http://cfg.invalid:8889\"\n",
+        )
+        .unwrap();
+        let cfg2 = Config::load(&ws2).unwrap();
+        let _ = std::fs::remove_dir_all(&ws2);
+        assert!(!cfg2.agent.hindsight.enabled, "endpoint without key must disable sync");
+    }
+
+    /// 默认构造必须干净：不带端点、不带凭据、不带 bank。
+    #[test]
+    fn hindsight_defaults_carry_no_endpoint_or_credential() {
+        let d = HindsightConfig::default();
+        assert!(!d.enabled, "remote sync is off until the deployment fills in config.toml");
+        assert!(d.base_url.is_empty(), "no built-in endpoint in source");
+        assert!(d.api_key.is_empty(), "no built-in credential in source");
+        assert!(d.bank_id.is_empty(), "no built-in bank id in source");
+    }
+
+    /// 视觉输入默认开：没有显式写 `supports_vision` 的模型配置必须解析为 true。
+    #[test]
+    fn model_config_defaults_supports_vision_to_true() {
+        let cfg: ModelConfig = serde_json::from_str(
+            r#"{"title":"gpt-4o","name":"gpt-4o","api_base":"https://api.example.com/v1"}"#,
+        )
+        .expect("minimal model config must deserialize");
+        assert!(cfg.supports_vision, "vision must default to enabled");
+    }
+
+    /// 存量不 backfill：显式写了 false 的条目不得被新默认值翻转。
+    #[test]
+    fn model_config_keeps_explicit_false_supports_vision() {
+        let cfg: ModelConfig = serde_json::from_str(
+            r#"{"title":"txt","name":"txt","api_base":"https://api.example.com/v1","supports_vision":false}"#,
+        )
+        .expect("model config with vision off must deserialize");
+        assert!(!cfg.supports_vision, "an explicit false must stay false");
     }
 }

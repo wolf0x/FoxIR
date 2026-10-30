@@ -670,7 +670,7 @@ impl MemoryStore {
         content: &str,
         tool_name: Option<&str>,
     ) -> Result<i64, String> {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let timestamp = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -717,7 +717,7 @@ impl MemoryStore {
 
     /// Get recent entries from the last N days.
     pub fn get_recent_entries(&self, days: usize) -> Result<Vec<ConversationEntry>, String> {
-        let since = (Utc::now() - chrono::Duration::days(days as i64))
+        let since = (chrono::Local::now() - chrono::Duration::days(days as i64))
             .format("%Y-%m-%d")
             .to_string();
         let conn = self.conn.lock().unwrap();
@@ -839,7 +839,7 @@ impl MemoryStore {
         }
 
         let fts_query = tokens.join(" OR ");
-        let since = (Utc::now() - chrono::Duration::days(days as i64))
+        let since = (chrono::Local::now() - chrono::Duration::days(days as i64))
             .format("%Y-%m-%d")
             .to_string();
 
@@ -1072,7 +1072,7 @@ impl MemoryStore {
 
     /// Get recent summaries (last N days).
     pub fn get_recent_summaries(&self, days: usize) -> Result<Vec<SummaryEntry>, String> {
-        let since = (Utc::now() - chrono::Duration::days(days as i64))
+        let since = (chrono::Local::now() - chrono::Duration::days(days as i64))
             .format("%Y-%m-%d")
             .to_string();
         let conn = self.conn.lock().unwrap();
@@ -1161,7 +1161,7 @@ impl MemoryStore {
     /// Today's summary is always refreshed (to capture the latest entries);
     /// past days are generated once.
     pub fn ensure_recent_summaries(&self, days: usize) {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let dates = match self.available_dates() {
             Ok(d) => d,
             Err(_) => return,
@@ -1519,12 +1519,12 @@ impl MemoryStore {
     /// Returns JSON array of {date, model, calls, prompt_tokens, completion_tokens,
     /// total_tokens, cached_tokens, cache_input_tokens, cache_reported_calls}.
     /// `cached_tokens` is null when no call in that bucket reported cache info.
-    pub fn get_usage_stats(&self, days: usize, tz_hours: f64) -> Result<serde_json::Value, String> {
+    pub fn get_usage_stats(&self, days: usize) -> Result<serde_json::Value, String> {
         let conn = self.conn.lock().unwrap();
 
-        // Timestamps are stored in UTC. Apply the caller's timezone offset so that
-        // dates are grouped/filtered by LOCAL calendar day (e.g. "+8 hours").
-        let tz_mod = format!("{:+} hours", tz_hours);
+        // Timestamps are stored in UTC. Buckets follow the machine's LOCAL calendar
+        // day: apply the current system UTC offset (seconds) as the SQL modifier.
+        let tz_mod = format!("{:+} seconds", chrono::Local::now().offset().local_minus_utc());
 
         fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
             Ok(serde_json::json!({
@@ -1606,7 +1606,7 @@ impl MemoryStore {
     /// Get today's total token usage summary.
     pub fn get_today_usage(&self) -> Result<serde_json::Value, String> {
         let conn = self.conn.lock().unwrap();
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
         let mut stmt = conn.prepare(
             "SELECT model_name,
@@ -2493,7 +2493,7 @@ mod usage_cache_stats {
         s.record_usage("m1", 500, 20, 520, Some(0), "sess-a").unwrap(); // reported miss
         s.record_usage("m2", 9999, 10, 10009, None, "sess-b").unwrap(); // silent endpoint
 
-        let rows = s.get_usage_stats(0, 0.0).unwrap();
+        let rows = s.get_usage_stats(0).unwrap();
         let rows = rows.as_array().unwrap();
         let m1 = rows.iter().find(|r| r["model"] == "m1").expect("m1 row");
         assert_eq!(m1["cached_tokens"].as_i64(), Some(800));
@@ -2519,7 +2519,7 @@ mod usage_cache_stats {
             s.record_usage("m3", 2000, 10, 2010, Some(1500), "sess-c").unwrap();
         }
         let s = MemoryStore::new(&p).unwrap();
-        let rows = s.get_usage_stats(0, 0.0).unwrap();
+        let rows = s.get_usage_stats(0).unwrap();
         let m3 = rows.as_array().unwrap().iter().find(|r| r["model"] == "m3").expect("m3 row");
         assert_eq!(m3["cached_tokens"].as_i64(), Some(1500));
         assert_eq!(m3["cache_input_tokens"].as_i64(), Some(2000));

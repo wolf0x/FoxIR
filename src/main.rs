@@ -281,13 +281,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_given_name = crate::config::detect_user_given_name();
     info!("Detected user_given_name: {}", user_given_name);
 
-    // ── Sync detected address name into runtime USER.md (startup) ──
-    // If the OS reports a real given name and USER.md has no explicit non-placeholder
-    // address (only "Master" or none), write the detected name so the agent greets
-    // the user with the right name. Existing explicit USER.md addresses are respected.
-    if let Err(e) = crate::config::sync_user_name_to_user_md(&workspace_dir, &user_given_name) {
-        tracing::warn!("Failed to sync user name to USER.md: {}", e);
-    }
+    // Record the system timezone once per startup. All timestamps (file logs, chat
+    // display, model date context) follow the OS clock — this line is the audit
+    // anchor that pins the machine's UTC offset for the whole run.
+    info!("System timezone: UTC{}", chrono::Local::now().format("%:z"));
 
     // Build tool registry (built-in tools)
     // The notification broadcast channel is created early so tools that need to
@@ -322,6 +319,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Extracted {} to workspace", name);
             }
         }
+    }
+
+    // ── Sync runtime state into USER.md (after first-run extraction) ──
+    // First-run extraction above may just have created USER.md, so the sync must run
+    // after it: fill the {{USER_NAME}} placeholder with the detected given name.
+    // Without a placeholder the file is user-owned and is left untouched.
+    if let Err(e) = crate::config::sync_user_name_to_user_md(&workspace_dir, &user_given_name) {
+        tracing::warn!("Failed to sync user name to USER.md: {}", e);
     }
 
     // Migrate existing config files from exe_dir → workspace (first-run upgrade)
@@ -463,6 +468,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load skills (resolve skills dir from workspace)
     let skills_dir = std::path::Path::new(&workspace_dir).join("skills");
+    // ── Install embedded builtin skills (first run / new additions) ──
+    // Fresh machines get the default skill set enabled; existing skills and
+    // ones in the _deleted recycle bin are never touched.
+    match crate::skill::builtin::ensure_builtin_skills(&skills_dir) {
+        Ok(0) => {}
+        Ok(n) => info!("Installed {} builtin skill(s)", n),
+        Err(e) => tracing::warn!("Failed to install builtin skills: {}", e),
+    }
     crate::skill::metrics::init(skills_dir.join(".metrics.json"));
     let skill_manager = Arc::new(SkillManager::new_with_notify(
         skills_dir.to_str().unwrap_or("skills"),
@@ -839,7 +852,6 @@ expert_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         primary_model: Arc::new(std::sync::RwLock::new(config.agent.primary_model.clone())),
         fallback_model: Arc::new(std::sync::RwLock::new(config.agent.fallback_model.clone())),
         expert_role_models: Arc::new(std::sync::RwLock::new(config.agent.expert_role_models.clone())),
-        timezone_offset: Arc::new(std::sync::RwLock::new(config.agent.timezone_offset)),
         hindsight_sync: hindsight_sync.clone(),
     });
 

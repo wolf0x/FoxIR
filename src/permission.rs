@@ -91,7 +91,8 @@ pub fn permission_locks_for(workspace_dir: &str) -> Vec<String> {
     }
 }
 
-/// Default permissions: read/write/modify allowed; delete/execute/system require endorsement.
+/// Default permissions: read/write/modify/execute allowed; delete/system require
+/// endorsement.
 /// "system" is the sixth category for system-config changes reached through command
 /// intent (registry writes, service/task configuration, firewall & AV changes,
 /// install/uninstall) — see detect_intent_category.
@@ -101,7 +102,7 @@ pub fn default_permissions() -> HashMap<String, bool> {
     m.insert("write".to_string(), true);
     m.insert("delete".to_string(), false);
     m.insert("modify".to_string(), true);
-    m.insert("execute".to_string(), false);
+    m.insert("execute".to_string(), true);
     m.insert("system".to_string(), false);
     m
 }
@@ -176,7 +177,8 @@ impl PermissionChecker {
 
     /// Check if a tool call is allowed.
     /// - If the action is pre-authorized by the managed-task profile: returns `true` immediately.
-    /// - If the category is allowed: returns `true` immediately.
+    /// - If the category is allowed and not locked: returns `true` immediately.
+    /// - A locked category always asks, even when its allowed flag is set.
     /// - If the category requires endorsement: emits permission_request, waits for user response.
     /// - Cross-category bypass detection: if shell_exec is auto-allowed but the command
     ///   intent maps to a DENIED category (e.g., delete), still requires confirmation.
@@ -224,7 +226,11 @@ impl PermissionChecker {
         // Check if category is auto-allowed
         {
             let perms = self.permissions.lock().await;
-            if perms.get(category).copied().unwrap_or(false) {
+            // A locked category asks every time even when its allowed flag is set:
+            // a hand-edited config can hold both, and "Locked = ask every time" is
+            // the documented contract (approved skills do not apply either).
+            let locked = self.grant_locked.iter().any(|c| c == category);
+            if !locked && perms.get(category).copied().unwrap_or(false) {
                 // Cross-category bypass detection for execute-category tools:
                 // If shell_exec/app_launch is pre-authorized, but the command's intent
                 // matches a DENIED permission category, escalate to confirmation.
@@ -722,8 +728,8 @@ mod tests {
         crate::skill::SkillManager::new(dir.to_str().unwrap())
     }
 
-    /// 免审批按名字生效：`ext_ir_scan` 落进 `_ => execute`（默认要背书），
-    /// 技能同意后这个外置工具就不再逐次问。
+    /// 免审批按名字生效：`ext_ir_scan` 落进 `_ => execute`；本用例把 execute
+    /// 钉成要背书（模拟类别图会拦它的场景），技能同意后就不再逐次问。
     #[tokio::test]
     async fn a_name_level_grant_bypasses_a_tool_the_category_map_would_stop() {
         let tmp = std::env::temp_dir().join(format!("rs_gate_name_{}", std::process::id()));
@@ -737,10 +743,12 @@ mod tests {
 
         let (_resolver, pending) = PermissionResolver::new();
         let (tx, _rx) = mpsc::channel(8);
+        let mut perms = default_permissions();
+        perms.insert("execute".to_string(), false); // 钉成"要背书"，模拟类别图会拦住 ext_ir_scan 的场景
         let checker = PermissionChecker::new(
             pending,
             tx,
-            Arc::new(Mutex::new(default_permissions())),
+            Arc::new(Mutex::new(perms)),
             "inv-name".to_string(),
             "FoxIR".to_string(),
             None,
@@ -855,7 +863,7 @@ mod tests {
     /// 第三状态：类别被"锁"住时，技能授权（名单级和窄臂都算）一律不使用。
     #[test]
     fn a_locked_category_refuses_names_and_arms_alike() {
-        let perms = default_permissions(); // delete/execute 都是 false（要背书）
+        let perms = default_permissions(); // 锁的判定看 locked 名单，与类别放行值无关
         let locked = vec!["delete".to_string(), "execute".to_string()];
         let none_locked: [String; 0] = [];
 
@@ -907,6 +915,7 @@ mod tests {
     }
 
     /// 锁住 execute 之后，已同意的 `ext_ir_scan` 也必须回到逐次审批，且不写台账。
+    /// 锁压过类别的放行值：execute 默认可放行，锁住的类别照样逐次问。
     #[tokio::test]
     async fn a_locked_category_sends_a_granted_tool_back_to_confirmation() {
         let tmp = std::env::temp_dir().join(format!("rs_gate_locked_{}", std::process::id()));

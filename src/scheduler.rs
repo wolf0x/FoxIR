@@ -384,8 +384,8 @@ impl Scheduler {
     /// Whether `now` falls within the task's optional [start_date, end_date] window.
     /// Dates are compared as YYYY-MM-DD strings (lexicographic == chronological).
     fn within_active_window(task: &CronTask, now: &chrono::DateTime<chrono::Utc>) -> bool {
-        // Interpret the date/time window in the LOCAL calendar so a UTC+8 user setting
-        // "Sep 1 - Sep 10" or "09:00-17:00" gets the intended local days/hours.
+        // Interpret the date/time window in the machine's LOCAL calendar so a task
+        // like "Sep 1 - Sep 10" or "09:00-17:00" gets the intended local days/hours.
         let local = now.with_timezone(&chrono::Local);
         let today = local.format("%Y-%m-%d").to_string();
         // Only enforce bounds that are well-formed; a bad string does not disable the task.

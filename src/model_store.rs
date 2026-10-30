@@ -68,3 +68,31 @@ pub fn load_configs(path: &Path) -> Vec<ModelConfig> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(vision: bool) -> ModelConfig {
+        ModelConfig {
+            title: "m".into(), name: "m".into(), api_base: "http://x".into(),
+            api_key: None, api_key_env: None,
+            context_window: 128000, max_tokens: 16384, temperature: 0.7,
+            supports_vision: vision,
+        }
+    }
+
+    /// 视觉开关必须原样往返持久化：关掉的存量模型不能因为默认值改动而被打开。
+    #[test]
+    fn vision_flag_survives_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+
+        save_configs(&[sample(false), sample(true)], &path);
+        let loaded = load_configs(&path);
+
+        assert_eq!(loaded.len(), 2, "both models must persist");
+        assert!(!loaded[0].supports_vision, "an off model stays off across reload");
+        assert!(loaded[1].supports_vision, "an on model stays on across reload");
+    }
+}

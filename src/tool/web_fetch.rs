@@ -175,7 +175,7 @@ impl Tool for WebFetchTool {
             let name = format!(
                 "fetch_{}_{}.json",
                 ctx.base.base.session_id.get(..8).unwrap_or("sess"),
-                chrono::Utc::now().format("%Y%m%d_%H%M%S%3f")
+                chrono::Local::now().format("%Y%m%d_%H%M%S%3f")
             );
             let dir = std::path::Path::new(&ctx.output_dir()).join("fetch");
             let _ = std::fs::create_dir_all(&dir);

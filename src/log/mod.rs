@@ -52,7 +52,7 @@ impl ConversationLogger {
     }
 
     fn get_date_str() -> String {
-        Utc::now().format("%Y-%m-%d").to_string()
+        chrono::Local::now().format("%Y-%m-%d").to_string()
     }
 
     fn ensure_file(&self) -> Result<(), String> {

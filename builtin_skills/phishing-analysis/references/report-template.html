@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phishing Email Analysis Report — {{EMAIL_SUBJECT}}</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#161d2e; --panel2:#1b2437; --border:#263149;
+    --text:#e6ebf4; --muted:#8fa0bd; --accent:#e5484d; --warn:#f5a524;
+    --ok:#46a758; --cyan:#4cc2ff; --gold:#f7c948;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.65;padding:40px 20px}
+  .wrap{max-width:1100px;margin:0 auto}
+  /* Header */
+  .header{background:linear-gradient(135deg,#1c2438 0%,#0f1420 100%);border:1px solid var(--border);border-radius:14px;padding:32px 36px;margin-bottom:24px}
+  .header .tag{display:inline-block;background:rgba(229,72,77,.15);color:var(--accent);border:1px solid rgba(229,72,77,.4);padding:2px 12px;border-radius:20px;font-size:12px;letter-spacing:1px;margin-bottom:12px}
+  .header h1{font-size:26px;font-weight:700;margin-bottom:6px}
+  .header .sub{color:var(--muted);font-size:14px}
+  .meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:20px}
+  .meta-grid .m{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 14px}
+  .meta-grid .m .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .meta-grid .m .v{font-size:14px;margin-top:2px;word-break:break-all}
+  /* Verdict */
+  .verdict{display:flex;align-items:center;gap:28px;background:linear-gradient(135deg,rgba(229,72,77,.18),rgba(229,72,77,.05));border:1px solid rgba(229,72,77,.5);border-radius:14px;padding:28px 36px;margin-bottom:24px;flex-wrap:wrap}
+  .verdict .big{font-size:38px;font-weight:800;color:var(--accent);letter-spacing:1px}
+  .verdict .conf{font-size:15px;color:var(--text);margin-top:2px}
+  .verdict .score{font-size:30px;font-weight:700;color:var(--warn)}
+  .verdict .meta{font-size:13px;color:var(--muted)}
+  .vsep{width:1px;height:56px;background:rgba(229,72,77,.3)}
+  /* Sections */
+  section{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:26px 30px;margin-bottom:20px}
+  h2{font-size:19px;font-weight:700;margin-bottom:18px;display:flex;align-items:center;gap:10px}
+  h2 .num{background:var(--accent);color:#fff;width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+  h3{font-size:15px;color:var(--cyan);margin:18px 0 10px}
+  p{color:var(--text);margin-bottom:10px;font-size:14px}
+  .muted{color:var(--muted);font-size:13px}
+  /* Tables */
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  th{background:var(--panel2);color:var(--muted);text-align:left;padding:10px 14px;font-weight:600;border-bottom:1px solid var(--border);font-size:12px;letter-spacing:.3px;white-space:nowrap}
+  td{padding:10px 14px;border-bottom:1px solid rgba(38,49,71,.5);vertical-align:top}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .tag-b{display:inline-block;padding:1px 9px;border-radius:12px;font-size:12px;font-weight:600;margin-right:4px}
+  .t-red{background:rgba(229,72,77,.15);color:var(--accent);border:1px solid rgba(229,72,77,.4)}
+  .t-yellow{background:rgba(245,165,36,.12);color:var(--warn);border:1px solid rgba(245,165,36,.4)}
+  .t-green{background:rgba(70,167,88,.12);color:var(--ok);border:1px solid rgba(70,167,88,.4)}
+  .t-cyan{background:rgba(76,194,255,.1);color:var(--cyan);border:1px solid rgba(76,194,255,.35)}
+  /* Cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:14px}
+  .card{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:16px 18px}
+  .card .k{font-size:12px;color:var(--muted);margin-bottom:6px}
+  .card .v{font-size:15px;font-weight:600;word-break:break-all}
+  .card .s{font-size:12px;color:var(--muted);margin-top:5px}
+  /* Evidence cards */
+  .ev{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:14px}
+  .ev-card{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:18px 20px;border-left:3px solid var(--accent)}
+  .ev-card.ok{border-left-color:var(--ok)} .ev-card.warn{border-left-color:var(--warn)}
+  .ev-card .t{font-size:15px;font-weight:700;margin-bottom:8px}
+  .ev-card .t small{font-weight:400;color:var(--muted);font-size:11px;margin-left:6px}
+  .ev-card ul{padding-left:18px} .ev-card li{font-size:13px;margin-bottom:6px}
+  .ev-card code{background:rgba(0,0,0,.35);padding:1px 6px;border-radius:4px;font-size:12px;color:var(--cyan)}
+  /* Chain */
+  .chain{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:16px 0}
+  .node{background:var(--panel2);border:1.5px solid var(--border);border-radius:10px;padding:12px 16px;min-width:150px;flex:1}
+  .node .n-title{font-size:13px;font-weight:700;margin-bottom:4px}
+  .node .n-detail{font-size:11.5px;color:var(--muted);word-break:break-all}
+  .node.hot{border-color:var(--accent);background:rgba(229,72,77,.08)}
+  .node.hot .n-title{color:var(--accent)}
+  .node.mid{border-color:var(--warn);background:rgba(245,165,36,.06)}
+  .arrow{color:var(--muted);font-size:20px;flex-shrink:0}
+  /* Screenshot */
+  .shot{border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:14px 0;background:var(--panel2)}
+  .shot img{width:100%;display:block}
+  .shot .cap{padding:8px 14px;font-size:12px;color:var(--muted);background:var(--panel2);border-top:1px solid var(--border)}
+  /* Doc evidence quote */
+  .docquote{background:rgba(0,0,0,.35);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:8px;padding:16px 20px;margin:12px 0;font-size:13px}
+  .docquote .h{color:var(--warn);font-weight:700;margin-bottom:8px}
+  .docquote pre{white-space:pre-wrap;font-family:inherit;color:var(--text);font-size:13px;line-height:1.7}
+  .docquote .link{color:var(--accent);font-weight:700;text-decoration:underline}
+  /* IOC */
+  .ioc{display:flex;justify-content:space-between;align-items:center;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 16px;margin-bottom:8px;flex-wrap:wrap;gap:8px}
+  .ioc .val{font-family:Consolas,monospace;font-size:13px;color:var(--cyan);word-break:break-all}
+  .ioc .type{font-size:12px}
+  .ioc .badge{font-size:11px;padding:2px 10px;border-radius:12px}
+  .b-red{background:rgba(229,72,77,.2);color:var(--accent)} .b-yellow{background:rgba(245,165,36,.15);color:var(--warn)} .b-cyan{background:rgba(76,194,255,.12);color:var(--cyan)}
+  /* Actions */
+  ol.actions{counter-reset:act;padding-left:0;list-style:none}
+  ol.actions li{counter-increment:act;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px;font-size:13.5px;padding-left:52px;position:relative}
+  ol.actions li::before{content:counter(act);position:absolute;left:14px;top:50%;transform:translateY(-50%);width:26px;height:26px;background:var(--accent);border-radius:7px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#fff}
+  .unverified td:first-child{color:var(--warn);font-weight:600}
+  .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:30px;padding-bottom:20px}
+  .highlight{background:rgba(245,165,36,.12);border:1px solid rgba(245,165,36,.35);border-radius:6px;padding:2px 8px;font-weight:600;color:var(--warn)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ HEADER ============ -->
+  <div class="header">
+    <span class="tag">PHISHING REPORT · Phishing Email Analysis Report</span>
+    <h1>{{REPORT_TITLE}}</h1>
+    <div class="sub">Target: <code>{{EMAIL_FILE_PATH}}</code> · Generated: {{REPORT_DATE}}</div>
+    <div class="meta-grid">
+      <div class="m"><div class="k">Subject</div><div class="v">{{EMAIL_SUBJECT}}</div></div>
+      <div class="m"><div class="k">Sent At</div><div class="v">{{EMAIL_SENT_AT}}</div></div>
+      <div class="m"><div class="k">From</div><div class="v">{{EMAIL_FROM}}</div></div>
+      <div class="m"><div class="k">To</div><div class="v">{{EMAIL_TO}}</div></div>
+      <div class="m"><div class="k">Original From</div><div class="v">{{EMAIL_ORIGINAL_FROM}}</div></div>
+      <div class="m"><div class="k">Sending Server</div><div class="v">{{EMAIL_SERVER}}</div></div>
+    </div>
+  </div>
+
+  <!-- ============ VERDICT ============ -->
+  <div class="verdict">
+    <div>
+      <div class="big">{{VERDICT}}</div>
+      <div class="conf">Verdict: {{VERDICT_DESC}}</div>
+    </div>
+    <div class="vsep"></div>
+    <div>
+      <div class="score">{{SCORE}}</div>
+      <div class="meta">Cumulative weighted score</div>
+    </div>
+    <div class="vsep"></div>
+    <div>
+      <div class="conf" style="font-size:16px">Confidence: <b style="color:var(--accent)">{{CONFIDENCE}}</b></div>
+      <div class="meta">Attack type: {{ATTACK_TYPE}}</div>
+    </div>
+  </div>
+
+  <!-- ============ 1. EXEC SUMMARY ============ -->
+  <section>
+    <h2><span class="num">1</span>Executive Summary</h2>
+    <p>{{SUMMARY_P1}}</p>
+    <p>{{SUMMARY_P2}}</p>
+    <p class="muted">⚠️ {{SUMMARY_WARNING}}</p>
+  </section>
+
+  <!-- ============ 2. KEY METRICS ============ -->
+  <section>
+    <h2><span class="num">2</span>Key Metrics</h2>
+    <div class="cards">
+      {{KEY_METRICS_CARDS}}
+      <!-- Card template (per item):
+      <div class="card"><div class="k">Metric name</div><div class="v" style="color:var(--ok)">value</div><div class="s">description</div></div>
+      Color: --ok green / --warn yellow / --accent red
+      -->
+    </div>
+  </section>
+
+  <!-- ============ 3. EVIDENCE ============ -->
+  <section>
+    <h2><span class="num">3</span>Key Evidence Chain</h2>
+
+    <h3>3.1 Evidence Overview</h3>
+    <table>
+      <tr><th>Evidence</th><th>Finding</th><th>Severity</th></tr>
+      {{EVIDENCE_OVERVIEW_ROWS}}
+      <!-- Row template: <tr><td>evidence name</td><td>finding (may contain <code>)</td><td><span class="tag-b t-red">CRITICAL</span></td></tr>
+          Severity: t-red CRITICAL/HIGH / t-yellow MEDIUM / t-green CLEAN -->
+    </table>
+
+    {{EVIDENCE_SECTIONS}}
+    <!-- One subsection per decisive evidence, optional template:
+    <h3>3.x Decisive Evidence X — {{title}}</h3>
+    <div class="docquote"><div class="h">{{title}}</div><pre>{{quoted original}}</pre></div>
+    <table><tr><th>Item</th><th>Value</th><th>Assessment</th></tr>{{rows}}</table>
+    <div class="shot"><img src="{{screenshot filename}}" alt="..."><div class="cap">{{screenshot caption}}</div></div>
+    -->
+  </section>
+
+  <!-- ============ 4. ATTACK CHAIN ============ -->
+  <section>
+    <h2><span class="num">4</span>Attack Chain Reconstruction (Trust Chain)</h2>
+    <div class="chain">
+      {{CHAIN_NODES}}
+      <!-- Node template:
+      <div class="node"><div class="n-title">① node name</div><div class="n-detail">detail</div></div>
+      <div class="arrow">→</div>
+      Key nodes use class="node hot" (red) / class="node mid" (yellow)
+      -->
+    </div>
+    <h3>Trust Chain Break-Point Analysis</h3>
+    <table>
+      <tr><th>Node</th><th>Trust Endorsement</th><th>Actual Identity</th><th>Break Point</th></tr>
+      {{TRUST_BREAK_ROWS}}
+    </table>
+  </section>
+
+  <!-- ============ 5. MITRE ============ -->
+  <section>
+    <h2><span class="num">5</span>MITRE ATT&amp;CK Mapping</h2>
+    <table>
+      <tr><th>ID</th><th>Technique</th><th>Observed in this attack</th></tr>
+      {{MITRE_ROWS}}
+    </table>
+  </section>
+
+  <!-- ============ 6. IOCS ============ -->
+  <section>
+    <h2><span class="num">6</span>IOCs (Indicators of Compromise)</h2>
+    {{IOC_ITEMS}}
+    <!-- Item template:
+    <div class="ioc"><span class="type">type</span><span class="val">value</span><span class="badge b-red">label</span></div>
+    Badge color: b-red malicious / b-yellow carrier·suspicious / b-cyan informational
+    -->
+  </section>
+
+  <!-- ============ 7. UNVERIFIED ============ -->
+  <section>
+    <h2><span class="num">7</span>Unverified Items</h2>
+    <table class="unverified">
+      <tr><th>Unverified Item</th><th>Reason</th><th>Risk Impact</th></tr>
+      {{UNVERIFIED_ROWS}}
+      <!-- <tr><td>item</td><td>reason</td><td>🔴 high / 🟡 medium / 🟢 low — description</td></tr> -->
+    </table>
+  </section>
+
+  <!-- ============ 8. SOCIAL ENGINEERING ============ -->
+  <section>
+    <h2><span class="num">8</span>Social Engineering Tactic Analysis</h2>
+    <table>
+      <tr><th>Tactic</th><th>Observed</th></tr>
+      {{SOCIAL_ENG_ROWS}}
+    </table>
+  </section>
+
+  <!-- ============ 9. ACTIONS ============ -->
+  <section>
+    <h2><span class="num">9</span>Recommended Actions</h2>
+    <ol class="actions">
+      {{ACTION_ITEMS}}
+      <!-- <li><b>Action title</b>: detailed description.</li> -->
+    </ol>
+  </section>
+
+  <div class="footer">
+    FoxIR · Phishing Email Analysis Report · {{REPORT_DATE}} · Based on {{ANALYSIS_METHODS}}
+  </div>
+
+</div>
+</body>
+</html>

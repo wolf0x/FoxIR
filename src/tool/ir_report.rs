@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::fs;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use chrono::Utc;
 
 use super::browser_cdp::{self, BrowserSession};
 use super::Tool;
@@ -202,8 +201,8 @@ impl Tool for IrReportTool {
         let low = summary["low"].as_u64().unwrap_or(0);
         let total = findings_arr.len();
 
-        let now = Utc::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y-%m-%d %H:%M:%S %:z").to_string();
         let file_ts = now.format("%Y%m%d_%H%M%S").to_string();
 
         // Determine output paths based on format

@@ -19,29 +19,21 @@
 5. **Quote paths that contain spaces**  
    Example: `"C:\Program Files\Git\bin\git.exe"`
 
-### Local Paths (adjust to the actual environment)
+6. **Never chain commands with `&&` in PowerShell** — use `;` to separate statements,
+   or split them into separate calls.
 
-- Git: `"C:\Program Files\Git\bin\git.exe"`
-- Python: `"%USERPROFILE%\AppData\Local\Programs\Python\Python312\python.exe"`
-- Node: `"C:\Program Files\nodejs\node.exe"`
+### Local Paths (adjust to the actual environment)
 - Workspace: `%USERPROFILE%\.RustAgent\workspace`
 - Output: `%USERPROFILE%\.RustAgent\workspace\output`
+- Tools: `%USERPROFILE%\.RustAgent\workspace\tools`
 
 ### Output Artifacts
 
 **All produced files must be written to the `output/` directory** with descriptive names:
 
-- Report: `output/ir_report_2026-08-07_suspicious_process.html`
+- Report: `output/troubleshooting_report_2026-08-07_outlook_crash.html`
 - Screenshot: `output/screenshot_desktop_2026-08-07_143022.png`
-- Analysis result: `output/yara_scan_results_2026-08-07.json`
+- Analysis result: `output/event_log_analysis_2026-08-07.json`
 
 **When referencing artifacts, use the full path returned by the tool** (already
 normalized to forward slashes). Do not shorten to the bare filename.
-
-## Local Environment Notes
-
-_Add your environment-specific configuration here:_
-- SSH hosts: (to be configured)
-- Camera name: (to be configured)
-- Voice preference: (to be configured)
-- Other: (to be configured)

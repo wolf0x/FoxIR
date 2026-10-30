@@ -8,6 +8,7 @@ pub mod grants;
 pub mod install;
 pub mod unpack;
 pub mod align;
+pub mod builtin;
 pub use self::types::{RankedSkill, SkillListingStrategy};
 
 use std::path::{Path, PathBuf};

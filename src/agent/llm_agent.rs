@@ -46,6 +46,12 @@ pub fn is_ir_collection_batch(tool_calls: &[crate::model::ToolCallDelta]) -> boo
         })
 }
 
+/// Per-file character cap for workspace files (AGENTS.md / SOUL.md / TOOLS.md /
+/// MEMORY.md / USER.md) injected into the system prompt. 20k aligns with the
+/// OpenClaw bootstrap default; oversized files are cut in the prompt only —
+/// the note tells the model to pull the full text via `file_read`.
+const WORKSPACE_FILE_MAX_CHARS: usize = 20_000;
+
 /// 传输层截断（流被传输错误切断）后的补救决定。
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamCutRecovery {
@@ -1149,7 +1155,13 @@ Right: ```json\n{{\"name\": \"app_launch\", ...}}\n```\n\
   Do not add follow-up narration like \"now let me verify\" or \"let me double-check\" unless the user asks.\n\
 - **Do NOT announce what you are about to do.** Just do it. If you need to call a tool, emit the tool call \
   directly. Explain results AFTER the tool returns, not before. Announcing an action and then stopping is \
-  the single most common failure mode here — never separate the promise from the call.\n\n\
+  the single most common failure mode here — never separate the promise from the call.\n\
+- **Narration is welcome — never just an empty promise.** Everything above forbids *announcing an action and then \
+  not taking it*; it does NOT forbid short human commentary. After a tool returns, DO speak naturally in 1-2 \
+  first-person sentences about what you just saw, what it means, and what you'll do next (e.g. \"连接拉完了，\
+  过滤掉本地回环后按网段分类看，一共 33 条外联，都能对上厂商\"). This running commentary is how the user follows \
+  your work — keep it concise and always backed by a real result you just got. Never narrate a step you have not \
+  actually done.\n\n\
 ## CRITICAL: You Have Long-Term Memory\n\
 This assistant is connected to a LOCAL MEMORY STORE (SQLite). Past conversations with this user are persisted and \
 injected into your context as SYSTEM messages labeled **[Memory Context]** or **[Memory Recall]**.\n\
@@ -1274,7 +1286,9 @@ to create a TODO list BEFORE starting work. THEN process the items STRICTLY ONE 
 2. Each work round processes EXACTLY ONE item, in list order 0,1,2,... — never multiple items per round.\n\
    a. Mark that item 'in_progress' via `todo_update` action='update' (index = its position).\n\
    b. Do ONLY that item's work, then stop that round.\n\
-   c. Mark it 'completed' via `todo_update` action='update'.\n\
+   c. Mark it 'completed' via `todo_update` action='update' — and in that SAME round, add one or two plain \
+   sentences summarizing what this item actually found or concluded, before opening the next one. The TASKS panel \
+   shows the state flip; your narration is what tells the user what it MEANT.\n\
 3. Start item N+1 ONLY after item N is 'completed'. Never skip ahead or reorder.\n\
 4. If an item is blocked/impossible, or its per-item timeout (see Current TASKS) is exceeded, mark it \
 'cancelled' (or the watchdog auto-marks it 'skipped') and continue to the next item.\n\
@@ -1293,13 +1307,14 @@ the status changes to the very end.\n\n\
   comment on how it relates to previous tasks or the TODO list (no \"this is a different/new task\", \
   no \"I will return to the list later\").\n\
 - Never mention task-list mechanics to the user (TODO / task list / progress syncing). Task status \
-  is shown on the user's TASKS panel — you never need to announce it.\n\
+  is shown on the user's TASKS panel — you never need to announce it. This bans META narration only \
+  (\"I'm updating the task list\", \"item 2 is now complete\"); the per-step RESULT commentary above (what you \
+  found) is still expected and encouraged.\n\
 Example:\n\
 ```json\n{\"name\": \"todo_update\", \"arguments\": {\"action\": \"set\", \"items\": [\n  {\"description\": \"Check disk space\", \"status\": \"pending\"},\n  {\"description\": \"List large files\", \"status\": \"pending\"},\n  {\"description\": \"Generate cleanup report\", \"status\": \"pending\"}\n]}}\n```\n"
         );
 
         // ── Workspace Configuration Files ──
-        const MAX_FILE_CHARS: usize = 8000;
         let workspace = &self.workspace_dir;
         if !workspace.is_empty() {
             let config_files = [
@@ -1315,11 +1330,13 @@ Example:\n\
                 if self.two_tier_memory && *filename == "MEMORY.md" {
                     continue;
                 }
-                if let Some((content, was_truncated)) = Self::read_workspace_file(workspace, filename, MAX_FILE_CHARS) {
+                if let Some((content, was_truncated)) = Self::read_workspace_file(workspace, filename, WORKSPACE_FILE_MAX_CHARS) {
                     let mut section = format!("\n## {} ({})\n", description, filename);
                     section.push_str(&content);
                     if was_truncated {
-                        section.push_str("\n*[Note: This file was auto-truncated due to size. Keep it concise to save tokens.]*");
+                        section.push_str(&format!(
+                            "\n*[Note: {filename} was truncated at {WORKSPACE_FILE_MAX_CHARS} chars for the system prompt — use the `file_read` tool to read the full file.]*"
+                        ));
                     }
                     section.push('\n');
                     injected.push(section);
@@ -1354,9 +1371,10 @@ The following files are loaded from your workspace. They define your behavior, p
 ## Memory projection (read-only)\n\
 - Deep durable facts are projected to MEMORY.md; view it to see what is currently\n\
   preserved. Edit facts with `deep_memory`, not by editing that file.\n"
+                    .to_string()
             } else {
                 // Two-tier disabled → legacy MEMORY.md behavior (status quo).
-                "\n# Memory System\n\
+                format!("\n# Memory System\n\
 You have two layers of memory:\n\n\
 ## Automatic Memory (memory.db — SQLite)\n\
 - Every conversation is automatically persisted\n\
@@ -1367,14 +1385,15 @@ You have two layers of memory:\n\n\
 - Automatically injected into your system prompt each session\n\
 - Use `memory_md` tool with action 'write_memory' to update (overwrite with new content)\n\
 - Use `memory_md` tool with action 'read_memory' to read current content\n\
-- Keep it concise and well-organized — it is loaded every session (truncated at 8000 chars)\n\
+- Keep it concise and well-organized — it is loaded every session (truncated at {} chars)\n\
 - Only write things worth remembering long-term — user preferences, key decisions, project conventions\n\n\
 ## Guidelines\n\
 - When you notice patterns or lasting preferences from conversations, distill them into MEMORY.md\n\
 - MEMORY.md is curated — quality over quantity\n\
-- The automatic SQLite memory handles day-to-day recall; MEMORY.md is for lasting insights\n"
+- The automatic SQLite memory handles day-to-day recall; MEMORY.md is for lasting insights\n",
+                    WORKSPACE_FILE_MAX_CHARS)
             };
-            prompt.push_str(memory_system_note);
+            prompt.push_str(&memory_system_note);
             // ── Computer Use (GUI Control) Routing ──
             prompt.push_str(
                 "\n## Computer Use (GUI Control) Tools\n\
@@ -1615,7 +1634,7 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
                 if content.trim().is_empty() {
                     return None;
                 }
-                let truncated = content.len() > max_chars;
+                let truncated = content.chars().count() > max_chars;
                 let result = if truncated {
                     content.chars().take(max_chars).collect::<String>()
                 } else {
@@ -1714,7 +1733,7 @@ impl Agent for LlmAgent {
         // the system prompt + history prefix stays byte-identical across
         // runs and provider prefix caching can hit.
         let mut state_core = String::new();
-        let today = chrono::Local::now().format("%Y-%m-%d (%A)").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d (%A), UTC%:z").to_string();
         let lang_rule = self.resolve_language_rule(user_message);
         state_core.push_str(&format!(
             "**Current date: {today}**\n\n## LANGUAGE RULE (STRICT - THIS message)\n{lang_rule}\n"
