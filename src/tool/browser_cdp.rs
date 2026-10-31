@@ -32,6 +32,7 @@ use chromiumoxide::cdp::browser_protocol::target::{GetTargetsParams, TargetId, T
 use chromiumoxide::page::Page;
 use chromiumoxide::{Element, Handler};
 use serde_json::{json, Value};
+use crate::tool::display_url;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -167,18 +168,6 @@ fn slice_text(full: &str, offset: usize, max: usize, output_dir: &str, file_name
 /// `/workspace/{*path}` 服务的是整个 workspace，而 `ctx.output_dir()` 在 Expert/managed
 /// run 里指向 `managed/<contract>/round_NN/`，并不等于 `workspace/output` —— 硬编码前缀
 /// 会让模型贴出来的图片链接 404。所以由真实落盘路径反推。
-fn display_url(path: &Path, workspace_dir: &str) -> String {
-    if let (Ok(ws), Ok(p)) = (
-        std::fs::canonicalize(workspace_dir),
-        std::fs::canonicalize(path),
-    ) {
-        if let Ok(rel) = p.strip_prefix(&ws) {
-            return format!("/workspace/{}", rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    path.to_string_lossy().to_string()
-}
-
 /// 截图落在哪：**永远**是这一轮 run 的 output 目录，调用方给的 `path` 只取文件名。
 ///
 /// 证据去哪儿由 `ToolContext::output_dir()` 说了算，不由模型传参说了算：传
@@ -1822,10 +1811,12 @@ impl BrowserCdpTool {
                 page.save_screenshot(params, &path)
                     .await
                     .map_err(|e| format!("Screenshot failed: {}", e))?;
+                let url = display_url(&path, &self.session.workspace_dir);
                 Ok(json!({
                     "success": true,
                     "action": "screenshot",
-                    "url": display_url(&path, &self.session.workspace_dir),
+                    "url": url,
+                    "markdown": crate::tool::markdown_image(&url),
                     "path": path.to_string_lossy()
                 }))
             }

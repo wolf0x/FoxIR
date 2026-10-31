@@ -108,10 +108,14 @@ impl Tool for CuScreenshotTool {
         let filepath = output_dir.join(&filename);
         std::fs::write(&filepath, &result.data).map_err(|e| format!("Failed to save screenshot: {}", e))?;
 
+        // URL 由文件实际落点推导：Expert 的轮次产物不在 workspace/output 下，
+        // 写死前缀会让链接 404（聊天里表现为裂图）。
+        let url = crate::tool::display_url(&filepath, &ctx.workspace_dir);
         Ok(json!({
             "status": "ok",
             "path": filepath.to_string_lossy(),
-            "url": format!("/workspace/output/{}", filename),
+            "url": url,
+            "markdown": crate::tool::markdown_image(&url),
             "width": result.width,
             "height": result.height,
             "mime_type": result.mime_type,

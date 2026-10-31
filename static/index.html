@@ -4570,7 +4570,30 @@ function normalizeMediaUrls(html){
     // Rewrite any absolute http(s)://host[:port]/workspace/... or /output/... used in an
     // img src / a href back to a same-origin relative path. Guards against the model (or
     // a tool) hardcoding host:port, which breaks the image/link when served off localhost.
-    return html.replace(/(src|href)(\s*=\s*)(["'])https?:\/\/[^"'\s>]*?\/((?:workspace|output)\/[^"']*)\3/gi,'$1$2$3/$4$3');
+    var out=html.replace(/(src|href)(\s*=\s*)(["'])https?:\/\/[^"'\s>]*?\/((?:workspace|output)\/[^"']*)\3/gi,'$1$2$3/$4$3');
+    // The prompt already tells the model to paste the tool's returned `url`, but it still
+    // writes bare file names (`en-01-cover.png`) and drive-absolute paths
+    // (`C:/Users/…/output/a.jpg`) often enough to matter — both resolve against the web
+    // origin and 404, which renders as a broken image. Screenshots and exported artifacts
+    // always land under the workspace output dir, so map anything the browser cannot
+    // resolve there instead of leaving a dead link.
+    return out.replace(/(src|href)(\s*=\s*)(["'])([^"'>]+)\3/gi,function(all,attr,eq,q,raw){
+      var v=raw.trim();
+      // Already usable: any scheme (http:, data:, mailto:), a fragment, or a root-absolute
+      // path we serve. Leave these exactly as they are. Two letters minimum before the
+      // colon, otherwise a Windows drive root (`C:/…`) would pass as a scheme.
+      if(/^(?:[a-z][a-z0-9+.-]{1,}:|#|\/)/i.test(v))return all;
+      var p=v.replace(/%5c/gi,'/').replace(/\\/g,'/').replace(/^\.\//,'');
+      if(/^[a-z]:/i.test(p)){
+        var i=p.indexOf('/workspace/');
+        p=i>=0?p.slice(i+1):p.slice(p.lastIndexOf('/')+1);
+        return attr+eq+q+(p.indexOf('workspace/')===0?'/'+p:'/workspace/output/'+p)+q;
+      }
+      // Bare or relative name: only prefix it when it looks like a file, so plain words in
+      // an href never turn into a bogus request.
+      if(!/[^/]+\.(?:png|jpe?g|gif|webp|bmp|svg|ico|pdf|html?|md|txt|json|csv|tsv|ya?ml|xml|zip|7z|rar|docx?|xlsx?|pptx?|py|js|ts|rs|go|sh|ps1|bat|sql|exe|dll|evtx|pcap|eml)$/i.test(p))return all;
+      return attr+eq+q+'/workspace/output/'+p+q;
+    });
   }catch(e){return html;}
 }
 function renderMd(text){
@@ -4582,9 +4605,11 @@ function renderMd(text){
     // 方案A: 转义孤立 `~`，避免 Hive 案例里用 `~` 做字段分隔时被误判成删除线；
     // 成对的 `~~...~~`（真正的 Markdown 删除线）仍保留。
     var escT=text.replace(/(^|[^~])~(?!~)/g,'$1\\~');
-    return normalizeMediaUrls(sanitizeHtml(marked.parse(escT)))
+    // 先规范化再净化：sanitizeHtml 会把 `C:/…` 这类它不认识的协议整段 src 剥掉，
+    // 规范化跑在后面就没东西可修了（表现为图片不显示，而不是裂图）。
+    return sanitizeHtml(normalizeMediaUrls(marked.parse(escT)))
   }catch(e){}}
-  return normalizeMediaUrls(sanitizeHtml(renderMdFallback(text)));
+  return sanitizeHtml(normalizeMediaUrls(renderMdFallback(text)));
 }
 function renderMdFallback(text){
   text=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n');

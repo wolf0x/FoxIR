@@ -570,6 +570,32 @@ pub fn resolve_binary(name: &str, workspace_dir: &str) -> String {
 }
 
 
+/// 截图/导出类工具共用的 markdown 片段：`url` 原样使用，alt 取文件名。
+///
+/// 让模型整段复制即可，不需要自己拼路径 —— 它历史上 5/8 次会拼成浏览器解析不了的
+/// 裸文件名或盘符绝对路径（前端 `normalizeMediaUrls` 已加兜底，但源头少一次犯错更好）。
+pub fn markdown_image(url: &str) -> String {
+    let alt = url.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or("image");
+    format!("![{alt}]({url})")
+}
+
+/// 工作区内的文件转成前端能取到的 URL：工作区内 → `/workspace/<相对路径>`，
+/// 工作区外原样返回盘符路径（前端拿不到，但至少不撒谎）。
+///
+/// 所有"产物落在磁盘上、要在聊天里显示或点开"的工具都必须走这一个函数，
+/// 否则会出现"文件确实写了、链接却 404"的裂图。
+pub fn display_url(path: &std::path::Path, workspace_dir: &str) -> String {
+    if let (Ok(ws), Ok(p)) = (
+        std::fs::canonicalize(workspace_dir),
+        std::fs::canonicalize(path),
+    ) {
+        if let Ok(rel) = p.strip_prefix(&ws) {
+            return format!("/workspace/{}", rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +660,16 @@ mod tests {
         assert!(!e.contains(&"file_write".to_string()), "allow_exec must not admit file_write");
         let both = reg.write_exec_names(true, true);
         assert!(both.contains(&"file_write".to_string()) && both.contains(&"shell_exec".to_string()));
+    }
+
+    /// 截图类工具必须回一段可直接粘贴的 markdown：模型自己拼路径的历史错误率是 5/8
+    /// （写成裸文件名或盘符绝对路径，浏览器按 origin 解析后 404，聊天里表现为破图）。
+    #[test]
+    fn markdown_image_uses_the_tool_url_verbatim_with_the_filename_as_alt() {
+        assert_eq!(
+            markdown_image("/workspace/output/en-01-cover.png"),
+            "![en-01-cover.png](/workspace/output/en-01-cover.png)"
+        );
+        assert_eq!(markdown_image("a.png"), "![a.png](a.png)");
     }
 }

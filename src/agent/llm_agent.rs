@@ -1053,7 +1053,7 @@ them up in a greeting reply — task status lives on the user's TASKS panel, not
              stays signed in for later sessions; using it needs no extra authorization or confirmation. \
              If a page fails to load or a launch error mentions the profile, call `probe` first and pass its \
              findings to the user instead of retrying blindly. \
-             For screenshots: use the returned `url` field (e.g. `/workspace/output/xxx.png`) in markdown image syntax `![desc](url)` to display. NEVER use local file paths.\n".to_string()
+             For screenshots: paste the returned `markdown` field verbatim (it is already `![name](/workspace/output/xxx.png)`); if you must build the link yourself, use the `url` field exactly as given. NEVER write a bare file name, a drive-absolute path, or any path you composed.\n".to_string()
         } else {
             String::new()
         };
@@ -1412,7 +1412,7 @@ You may have desktop control capabilities (cu_* tools). Use them ONLY when CLI t
 - File operations (use file_read/file_write/file_list)\n\
 - Browser automation (use a browser tool or the active browser skill)\n\
 - Process/service management (use sys_process, sys_service)\n\n\
-**Screenshot workflow:** cu_screenshot returns a URL. Use markdown `![desc](url)` to display it.\n",
+**Screenshot workflow:** cu_screenshot returns a `markdown` snippet — paste it verbatim to display the image; never compose the path yourself.\n",
             );
         }
 
