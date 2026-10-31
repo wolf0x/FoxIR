@@ -34,7 +34,7 @@
 - 新增 7 条单测。Hindsight 四条：值只来自 `config.toml`；`api_key` 密文落盘且读回为明文；缺端点或缺 key 时停用；默认构造不含端点与凭据。（TDD 轨迹：这四条先写成红——失败原因正是"load 返回了内置端点/内置 key"，随后才改实现。）
 - Vision 三条：默认值必须为 `true`；显式 `false` 不得被新默认翻转；`models.json` 往返持久化保持两侧取值。
 - `cargo test --lib` **535 passed / 0 failed / 20 ignored**。
-- 前端归一化：`output/js_tests/test_normalize_media.mjs` 从 `static/index.html` 抽出真实函数体跑 **19 用例全绿**（含日志里 4 种真实错法与 9 条"必须原样不动"）。TDD 轨迹：先 8 红 10 绿，实现后 18/18；浏览器端到端又抓到 `marked` 把反斜杠转义成 `%5C` 的漏网用例，补测后 19/19。
+- 前端归一化：`tests/js/normalize_media_urls.mjs`（`node tests/js/normalize_media_urls.mjs`）从 `static/index.html` 抽出真实函数体跑 **19 用例全绿**（含日志里 4 种真实错法与 9 条"必须原样不动"）。TDD 轨迹：先 8 红 10 绿，实现后 18/18；浏览器端到端又抓到 `marked` 把反斜杠转义成 `%5C` 的漏网用例，补测后 19/19。
 - 渲染顺序修正经浏览器实测确认：`C:/…` 写法在旧顺序下会被 `sanitizeHtml` 连 `src` 一起剥掉（图片完全不显示），改序后正确归一。
 - 端到端（隔离实例，端口 7795，`output/` 放一张真实 PNG）：`![Cover](en-01-cover.png)`、`C:/…/workspace/output/x.jpg`、`C:%5CUsers%5C…`、`D:/shots/shot.png` 四种写法渲染后均为 `/workspace/output/<文件>`；`/workspace/…`、`data:`、无扩展名链接保持原样不动；改写后的 URL 实际加载成功（`naturalWidth=32`）。对照组：直接请求 `/en-01-cover.png` 返回 **404**，正是裂图成因。
 - `cargo build --release` 通过；`/api/health` 返回 `"version":"1.0.26"`；产物字节扫描确认 **不含**原内置端点与凭据（两项均 0 命中）。
